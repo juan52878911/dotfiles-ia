@@ -18,7 +18,7 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 
 ```nix
 # flake.nix de los dotfiles
-inputs.ia-config.url = "path:/Users/<usuario>/Documents/GitHub/ia-config";   # o github:… cuando esté publicado
+inputs.ia-config.url = "git+file:///Users/<usuario>/Documents/GitHub/ia-config";   # o github:… cuando esté publicado (path: falla: su hash incluye .git)
 
 # home.nix
 imports = [ ia-config.homeManagerModules.default ];
