@@ -1,0 +1,29 @@
+{
+  "_doc": "Lo que ia-config garantiza en ~/.claude/settings.json. fusionar-settings.py lo añade sin pisar el resto (Nod, Orbit y Claude Code también escriben ahí).",
+  "permisos": {
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -f:*)",
+      "Bash(sudo rm:*)",
+      "Bash(mkfs:*)",
+      "Bash(diskutil eraseDisk:*)",
+      "Bash(diskutil eraseVolume:*)",
+      "Read(~/.ssh/id_*)",
+      "Read(~/.aws/credentials)",
+      "Read(~/.gnupg/**)"
+    ],
+    "quitar_de_allow": [
+      "Bash(bash:*)",
+      "Bash(sh:*)",
+      "Bash(zsh:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit", "command": "python3 ~/.claude/hooks/damage-control.py" },
+      { "matcher": "Bash", "command": "python3 ~/.claude/hooks/no-cat-grande.py" }
+    ]
+  }
+}
