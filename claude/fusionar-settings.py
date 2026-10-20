@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fusiona settings-base.json en ~/.claude/settings.json (y limpia settings.local.json) sin pisar nada más.
 Idempotente: añade las reglas deny y los hooks que falten, quita de allow los comodines peligrosos y solo
-escribe si algo cambia (con copia .bak-ia-config la primera vez que toca cada fichero).
+escribe si algo cambia (con copia .bak-dotfiles-ia la primera vez que toca cada fichero).
 Uso: fusionar-settings.py [--seco]"""
 import json, os, shutil, sys
 
@@ -24,9 +24,9 @@ def guardar(p, d, antes):
     if seco:
         print(f"cambiaría {p}")
         return True
-    if os.path.exists(p) and not os.path.exists(p + ".bak-ia-config"):
-        shutil.copy2(p, p + ".bak-ia-config")
-    tmp = p + ".tmp-ia-config"
+    if os.path.exists(p) and not os.path.exists(p + ".bak-dotfiles-ia"):
+        shutil.copy2(p, p + ".bak-dotfiles-ia")
+    tmp = p + ".tmp-dotfiles-ia"
     with open(tmp, "w") as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
         f.write("\n")

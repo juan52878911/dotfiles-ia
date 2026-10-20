@@ -1,4 +1,4 @@
-# ia-config
+# dotfiles-ia
 
 Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subagentes y las reglas que deben estar siempre en `settings.json`. Los dotfiles (`~/dotfiles`) lo consumen como input del flake.
 
@@ -11,27 +11,27 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 | `claude/agents/` | Subagentes, cada uno con su modelo (Sonnet o Haiku; Opus queda para la sesión principal). |
 | `claude/settings-base.json` | Lo que se garantiza en `~/.claude/settings.json`: reglas `deny`, hooks y comodines que se quitan de `allow`. |
 | `claude/fusionar-settings.py` | Fusiona lo anterior sin pisar lo que escriben Claude Code, Nod u Orbit. Idempotente. |
-| `nix/modulo.nix` | Módulo de home-manager (`programs.ia-config`). |
+| `nix/modulo.nix` | Módulo de home-manager (`programs.dotfiles-ia`). |
 | `tests/probar-damage-control.py` | Casos de prueba del hook. |
 
 ## Uso con home-manager
 
 ```nix
 # flake.nix de los dotfiles
-inputs.ia-config.url = "git+file:///Users/<usuario>/Documents/GitHub/ia-config";   # o github:… cuando esté publicado (path: falla: su hash incluye .git)
+inputs.dotfiles-ia.url = "git+file:///Users/<usuario>/Documents/GitHub/dotfiles-ia";   # o github:… cuando esté publicado (path: falla: su hash incluye .git)
 
 # home.nix
-imports = [ ia-config.homeManagerModules.default ];
-programs.ia-config = {
+imports = [ dotfiles-ia.homeManagerModules.default ];
+programs.dotfiles-ia = {
   enable = true;
-  checkout = "/Users/<usuario>/Documents/GitHub/ia-config";   # editable sin rebuild
+  checkout = "/Users/<usuario>/Documents/GitHub/dotfiles-ia";   # editable sin rebuild
 };
 ```
 
 ## Reglas locales (no versionadas)
 
 Hosts de producción, rutas de clientes o cualquier cosa de empresa van en
-`~/.config/ia-config/damage-control.local.json`, que el hook lee si existe:
+`~/.config/dotfiles-ia/damage-control.local.json`, que el hook lee si existe:
 
 ```json
 { "preguntar": [["\\bssh\\s+[^;&|\\n]*\\bmi-servidor-prod\\b", "producción"]],

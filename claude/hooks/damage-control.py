@@ -30,7 +30,7 @@ PREGUNTAR = [
 
 # Reglas propias de tus máquinas (hosts de producción, rutas de clientes…): fuera del repo, en un JSON local
 # {"bloquear": [[regex, motivo], …], "preguntar": [[regex, motivo], …]}.
-LOCAL = os.path.expanduser(os.environ.get("DAMAGE_CONTROL_LOCAL", "~/.config/ia-config/damage-control.local.json"))
+LOCAL = os.path.expanduser(os.environ.get("DAMAGE_CONTROL_LOCAL", "~/.config/dotfiles-ia/damage-control.local.json"))
 try:
     with open(LOCAL) as f:
         _extra = json.load(f)
