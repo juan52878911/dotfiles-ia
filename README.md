@@ -18,7 +18,7 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 
 ```nix
 # flake.nix de los dotfiles
-inputs.dotfiles-ia.url = "git+file:///Users/<usuario>/Documents/GitHub/dotfiles-ia";   # o github:… cuando esté publicado (path: falla: su hash incluye .git)
+inputs.dotfiles-ia.url = "github:juan52878911/dotfiles-ia";   # en local: git+file:///ruta/al/clon (path: no, su hash incluye .git)
 
 # home.nix
 imports = [ dotfiles-ia.homeManagerModules.default ];

@@ -11,7 +11,7 @@ casos = [
     (B, 'ssh lab uptime', 'pasar'), (B, 'git branch -D feat', 'preguntar'),
     (B, 'git checkout -- .', 'preguntar'), (B, 'git status', 'pasar'), (B, 'docker volume prune', 'preguntar'),
     (B, 'ls -la && git log --oneline -5', 'pasar'), (B, 'git push origin feat-x', 'pasar'),
-    ('Write', '~/.ssh/config', 'bloquear'), ('Edit', '/Users/juanbedoya/Documents/x.md', 'pasar'),
+    ('Write', '~/.ssh/config', 'bloquear'), ('Edit', '~/Documents/x.md', 'pasar'),
 ]
 fallos = 0
 for tool, val, esperado in casos:
