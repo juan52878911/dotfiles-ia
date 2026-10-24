@@ -1,0 +1,17 @@
+# Image for nodes with `runner = "docker"`: each job runs `claude` inside a throw-away container.
+# The Claude Code version is pinned so every node behaves the same (delega doctor reports drift).
+#   docker build -f nodes/Dockerfile.worker --build-arg CLAUDE_VERSION=<version> -t delega-worker .
+FROM python:3.13-slim
+ARG CLAUDE_VERSION
+RUN test -n "$CLAUDE_VERSION" || (echo "pass --build-arg CLAUDE_VERSION=<version>" >&2; false)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git curl ca-certificates nodejs npm \
+ && rm -rf /var/lib/apt/lists/*
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+ && claude --version
+RUN useradd -m worker
+USER worker
+WORKDIR /home/worker
+ENV PATH="/home/worker/.local/bin:${PATH}"
+# Credentials and the work dir are mounted by delega at run time: nothing secret lives in the image.
+ENTRYPOINT ["python3"]

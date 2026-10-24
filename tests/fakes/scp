@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Fake scp for tests: `alias:path` maps to $FAKE_NODE_HOME/path (relative) or the absolute path.
+Every transfer is logged to $FAKE_NODE_HOME/.scp.log (src → dst) so tests can check what travelled."""
+import os
+import shutil
+import sys
+
+OPTS_WITH_VALUE = {"-o", "-P", "-i", "-F", "-J", "-c", "-l", "-S"}
+
+
+def main():
+    home = os.environ["FAKE_NODE_HOME"]
+    paths, args, i = [], sys.argv[1:], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and len(a) > 1:
+            i += 2 if a in OPTS_WITH_VALUE else 1
+            continue
+        paths.append(a)
+        i += 1
+    if len(paths) != 2:
+        print("fake scp: need src and dst", file=sys.stderr)
+        return 1
+
+    def real(p):
+        if ":" in p and not p.startswith("/") and not p.startswith("."):
+            host, path = p.split(":", 1)
+            if host.startswith("down"):
+                print(f"ssh: connect to host {host}: No route to host", file=sys.stderr)
+                raise SystemExit(255)
+            path = os.path.expanduser(path.replace("~", home, 1)) if path.startswith("~") else path
+            return path if os.path.isabs(path) else os.path.join(home, path)
+        return p
+
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, ".scp.log"), "a") as f:
+        f.write(f"{paths[0]}\t{paths[1]}\n")
+    src, dst = real(paths[0]), real(paths[1])
+    if not os.path.exists(src):
+        print(f"scp: {paths[0]}: No such file or directory", file=sys.stderr)
+        return 1
+    if os.path.isdir(dst):
+        dst = os.path.join(dst, os.path.basename(src))
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    shutil.copy(src, dst)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

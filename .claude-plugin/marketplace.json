@@ -1,0 +1,11 @@
+{
+  "name": "delega",
+  "owner": { "name": "delega contributors" },
+  "plugins": [
+    {
+      "name": "delega",
+      "source": "./",
+      "description": "Orchestration playbook and CLI for running Claude Code workers with hard caps and a budget."
+    }
+  ]
+}

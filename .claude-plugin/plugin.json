@@ -1,0 +1,8 @@
+{
+  "name": "delega",
+  "version": "0.1.0",
+  "description": "Orchestrate Claude Code workers on your other accounts and machines, with hard caps, a daily budget and a two-way channel.",
+  "license": "Apache-2.0",
+  "keywords": ["orchestration", "delegation", "claude-code", "workers", "budget"],
+  "skills": "./skills"
+}
