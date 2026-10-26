@@ -13,6 +13,7 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 | `claude/fusionar-settings.py` | Fusiona lo anterior sin pisar lo que escriben Claude Code, Nod u Orbit. Idempotente. |
 | `nix/modulo.nix` | Módulo de home-manager (`programs.dotfiles-ia`). |
 | `tests/probar-damage-control.py` | Casos de prueba del hook. |
+| `delega/` | Orquestador de trabajadores de Claude Code en otras cuentas y máquinas (topes, presupuesto, cupo, auditoría). Genérico y sin datos personales: la configuración vive fuera, en `~/.config/delega`. Ver `delega/README.md`. |
 
 ## Uso con home-manager
 
