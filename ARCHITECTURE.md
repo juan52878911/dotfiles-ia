@@ -34,7 +34,18 @@ commands) and is reached through `delega <command>` (`src/delega/__main__.py`).
   (`adc_path`, refresh-token check without printing it), `"env"` (`var`), `"command"`
   (`check = [argv]`, exit 0 = ok). `fix_hint` is printed when the check fails.
 - **Project** = `[projects."owner/repo"]` matched against the `origin` remote: `policy.*`
-  overrides (e.g. `budget.day_usd`), `verify = [commands]`, `branch_prefixes`.
+  overrides (e.g. `budget.day_usd`), `verify = [commands]`, `branch_prefixes`, `databases.<name>`.
+- **Database** = `[projects."owner/repo".databases.<name>]`: `engine` (postgres, mariadb, mysql, redis,
+  mongo, sqlite), `version`, `database`, `volume` (default `db-<repo>-<name>`), `attach = "always"|"ask"`,
+  `mode = "auto"|"golden"|"volume"`, `env = {VAR = "{url}"}` ({host} {port} {user} {password} {database}
+  {url} {path}), `node`. Only on kindling nodes (`--db` elsewhere is refused). The dump lives in a kindling
+  **volume** (`dump.<ext>.part-*` + `MANIFEST`, written once by `delega db volume create|refresh`, never
+  mounted read-write after); a **seed sandbox** `delega-seed-<volume>` mounts it read-only and sleeps
+  frozen; jobs copy the parts VM to VM through the host and `delega-db` (`src/delega/data/dbctl.sh`, run
+  as root in the VM) restores them on the VM's own disk. A **data golden** `<golden>-db` (`delega golden db`)
+  is the golden with the databases restored and running, frozen: `mode = "auto"` clones it while it holds
+  the same databases, the volumes' sha256 match and the base golden is not newer; otherwise it restores
+  from the volume and says why. Restored templates cannot take new disks, hence the copy instead of a mount.
 - **Policy** keys (dotted under `[policy]`, see `config.DEFAULTS`): `job.max_min`,
   `job.max_turns`, `job.max_usd`, `job.grace_s`, `stall_s`, `answer_wait_s`,
   `resume_max_min`, `max_local_jobs`, `expected_hours`, `node.max_load_pct`,
@@ -56,7 +67,7 @@ the channel files after the job ends, `fetch.log`, `waiter.pid` (pid of the loca
 waiting for a remote job).
 
 `meta` is `KEY=VALUE` lines, later wins (`util.read_meta`, `util.add_meta`). Keys:
-`NODE` (node name or `local`), `CHANNEL` (local: absolute path of the channel dir; remote: path
+`NODE` (node name or `local`), `VM`, `GOLDEN`, `DBS` (`name:volume@sha,…`), `DB_MODE`, `CHANNEL` (local: absolute path of the channel dir; remote: path
 relative to the node's `$HOME`), `BRANCH`, `BASE` (sha the job started from), `OWNER`
 (orchestrator label), `PROFILE`, `ACCOUNT` (verified email), `PROJECT`, `ZONE` (comma-separated
 globs), `CLAUDE_VERSION`, `DELEGA_VERSION`, `PYZ_SHA`, `BUNDLE_SHA`, `CONFIG_SHA`, `SESSION`,
@@ -66,7 +77,11 @@ mapped on read.
 Other state files: `sessions.jsonl` (`{session_id, node, worktree, branch, profile, job}`; also
 read legacy `sesiones.tsv`: `session_id\thost\twt\tbranch`), `audit.jsonl` (append-only,
 `{ts, event, job, profile, account, node, branch, base, project, owner, cost_usd, ...}` with
-events `launch`, `end`, `resume`, `handoff`, `integrate`, `refused`), `limits.tsv` (quota
+events `launch`, `end`, `resume`, `handoff`, `integrate`, `refused`, `scan`, `db_volume`, `golden_build`,
+`golden_db`, `golden_rm`, `sandbox_up|freeze|thaw|rm|save`; kindling launches carry `vm`, `golden`,
+`dbs = [{name, engine, volume, sha, mode, check}]`), `kindling.json` (what delega made on each kindling host:
+`volumes` {node/volume: sha256, bytes, format, engine, updated}, `goldens` {node/name: built, base, dbs},
+`sandboxes`), `limits.tsv` (quota
 history; legacy `limite.tsv`), `queue.jsonl`, `.select.lock/` (node selection lock dir).
 
 ### Channel dir (where the worker runs: local job dir, or `~/<workdir>/<jobs_subdir>/<id>/` on a node)
@@ -83,6 +98,7 @@ history; legacy `limite.tsv`), `queue.jsonl`, `.select.lock/` (node selection lo
 | `results.jsonl` | broker | `{ts, result, is_error, cost_usd}` per result |
 | `summary.json` | broker at END | `{session_id, rc, model, duration_min, messages, tools, alerts, cost_usd, cap, start, end}` |
 | `forbidden.txt` | launch (optional) | terms redacted from notices/progress |
+| `context.md` | launch → broker | the job's facts (id, node, VM, golden, profile, account, caps, budget, branch, databases and the rules for real data); appended to the worker's system prompt |
 | `notify` | broker | executable the worker calls: `notify milestone "<text>"` |
 | `rc` | broker | exit code |
 
@@ -106,7 +122,7 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
   `say <channel> <text>`, `status <channel>`, `watch <channel> [label] [--all]`, `limits <channel…>`,
   `metrics <channel>`. Env: `DELEGA_JOB_MAX_MIN`, `DELEGA_JOB_MAX_TURNS`, `DELEGA_JOB_MAX_USD`,
   `DELEGA_JOB_GRACE_S`, `DELEGA_STALL_S`, `DELEGA_ANSWER_WAIT_S`, `DELEGA_LEASE_RENEW_S`,
-  `DELEGA_LOCALE`. Removes `CLAUDE_*`/`ANTHROPIC_*` from the child env **except**
+  `DELEGA_LOCALE`. Appends the channel's `context.md` to the system prompt after the protocol. Removes `CLAUDE_*`/`ANTHROPIC_*` from the child env **except**
   `CLAUDE_CONFIG_DIR` and those listed in `DELEGA_KEEP_ENV` (legacy `ORQ_CONSERVAR`).
 - `nodes`: `probe(cfg, node, profile, requires=()) -> dict` with
   `{ok, reason, fix, email, mem_mb, disk_gb, load_pct, containers, claude_version, pyz_sha,
@@ -127,7 +143,8 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
 - `launch`: `main(argv)` = `delega run <repo> <brief> [--node auto|local|<n>] [--profile p]
   [--requires c]… [--resume sid [--force-resume]] [--mode m] [--model m] [--worktree n]
   [--branch b] [--owner o] [--cap-min n] [--cap-usd n] [--cap-turns n] [--zone glob]…
-  [--no-lint] [--over-budget] [--allow-version-skew]`. `lint_brief(text, locale) -> [missing]`,
+  [--db name|all]… [--db-mode auto|golden|volume] [--no-lint] [--over-budget] [--allow-version-skew]`.
+  Exports `DELEGA_JOB_ID`, `DELEGA_NODE`, `DELEGA_PROFILE`, `DELEGA_BRANCH` (and the databases' variables). `lint_brief(text, locale) -> [missing]`,
   `zones_from_brief(text) -> [globs]`.
 - `quota`: `limits_from_channels(dirs) -> [records]`, `capacity(cfg, profile) -> dict`; CLI
   `quota [--profile p] [--hours h]`.
@@ -142,8 +159,17 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
   then the project's `verify` commands in a temporary worktree.
 - `kindling`: `probe(cfg, node, profile, requires)` (same shape as `nodes.probe`), `create`, `destroy`,
   `push_head`, `make_worktree`, `fetch_branch`, `start_worker`, `read_token`.
+- `databases`: `specs(cfg, project)`, `select(cfg, project, wanted)`, `env(dbs)`, `kindling_node(cfg, profile,
+  dbs, node_opt)`, `plan(cfg, node, golden, dbs, mode) -> (mode, image, why)`, `attach(cfg, node, vm, dbs, mode)
+  -> [records]`, `volume_load(cfg, node, spec, source, kind, fmt, size, refresh)`, `bake(cfg, node, golden, dbs)`;
+  CLI `db [--node n] ls | volume create|refresh <name> --from-host|--from-host-cmd|--from-file|--from-cmd … | volume rm <name> --yes`.
+- `golden`: CLI `golden build [repo] [--engines …] [--dry-run]` (runs `nodes/kindling/golden.sh` with the node's and
+  profile's settings and the project's engines), `golden db [repo] [--db n]…`, `golden ls`, `golden rm <name> --yes`.
+- `sandbox`: CLI `sandbox up <name> [repo] [--db n]… [--ttl 30m] [--egress allowlist|none|internet]`, `exec <name> [--root]
+  -- cmd`, `shell`, `env`, `freeze|thaw|rm <name>…`, `save <name> <template>`, `ls`. VMs are `sb-<name>`.
+- `context`: `render(…) -> str`, `write(job_dir, text)`, `job_env(job_id, node, profile, branch)`.
 - `sync`: CLI `sync [--profile p] [--tar file] [node…]`: tar the profile's `node_bundle` (CLAUDE.md, hooks/,
-  agents/, settings.json) into the node's `~/.claude` (or its `config_dirs[profile]`). A `home/` dir in the bundle is unpacked relative to `$HOME`;
+  agents/, skills/, rules/, commands/, output-styles/, settings.json, plus `bundle_skills` dirs) into the node's `~/.claude` (or its `config_dirs[profile]`). A `home/` dir in the bundle is unpacked relative to `$HOME`;
   the profile's `bundle_post_sync = ["cmd", …]` run on the node after unpacking (e.g. to merge settings.json).
   A rendered node-rules section is appended to CLAUDE.md; credential-like files are never sent; `--dry-run` lists what would go.
 - `audit`: `record(cfg, event, **fields)`; CLI `audit [job|branch]`.
@@ -155,3 +181,6 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
 `python3 -m unittest discover -s tests` (stdlib unittest). `tests/fakes/claude` emits
 stream-json and is driven by env vars (see the file). `tests/fakes/ssh` and `tests/fakes/scp`
 run commands locally under a temporary `$HOME` so the remote flow can be tested end to end.
+`tests/fakes/kling-bin/kling` fakes machines (one cloned from a golden at a time, any number of loaders and
+sandboxes), volumes, snapshots, templates and `cp`/`exec` with path mapping; `fake-dbctl` stands for
+`delega-db` and `split` for GNU split.

@@ -68,11 +68,19 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
      from a golden image with the repo's dependencies already installed, with egress limited to an
      allowlist, and deleted at the end. Good for isolated, parallel work that needs no containers or
      services; no `--resume` (the VM is gone: use `handoff`) and no `--requires`. When the repo's
-     dependencies change, rebuild the golden (`nodes/kindling/golden.sh`).
+     dependencies change, rebuild the golden (`delega golden build`).
+   - `--db <name>` (kindling only): the job gets a throwaway copy of a database the project declares
+     (`[projects."…".databases.<name>]`), cloned from the data golden (`delega golden db`, ~1 s) or restored
+     from the dump volume (`delega db volume create|refresh`). Use `templates/<locale>/brief-db.md` and,
+     for the order, `order-db.md`; close with `closing.md`. The worker is told what it may read and what it
+     may never copy (fixtures, commits, notices, report). Creating or refreshing a volume with real data
+     needs {owner}'s OK and the dump they choose; never paste data into logs, briefs or reports.
    - Only **HEAD** travels to a node: commit first. The worker uses branch `delega/<id>` (or
      `--branch`); when it ends, the branch comes home and is scanned against the forbidden terms.
-   - Nodes carry the profile's rules (agents, hooks, CLAUDE.md). New node or changed rules:
-     `delega sync [node]`.
+   - Nodes carry the profile's rules (agents, hooks, skills, rules, CLAUDE.md, plus `bundle_skills`).
+     New node or changed rules: `delega sync [node]`; kindling: `delega golden build` again.
+   - Every worker gets the job's facts in its system prompt (`context.md`: id, node, VM, golden, profile,
+     account, caps, budget, branch, databases) and `DELEGA_JOB_ID|NODE|PROFILE|BRANCH` in its environment.
 3. **Launch** with `run_in_background: true` (you are notified at the end; do not poll):
    `delega run <repo> <brief> --node auto [--requires c] [--cap-min N] [--cap-usd N] [--cap-turns N] [--zone glob] [--model m]`.
    Right after, arm **one** monitor: `delega watch` (only your running jobs); re-arm it only if it
@@ -196,7 +204,10 @@ cuts between turns, minutes and messages cut at any time.
 | `delega integrate <repo> <branch> [--into main]` | Merge dry run + verify commands |
 | `delega queue add\|ls` · `delega tick [--adopt]` | Queue with priorities |
 | `delega sync [--profile p] [--tar file] [node…]` | Rules bundle to the nodes (or to a tar for a golden) |
-| `delega audit [job\|branch]` | Provenance from the audit log |
+| `delega audit [job\|branch]` | Provenance from the audit log (VM, golden, volumes and sha too) |
+| `delega db ls` · `db volume create\|refresh <name> --from-host-cmd "…"` · `db volume rm <name> --yes` | Dump volumes on the kindling host |
+| `delega golden build [repo]` · `golden db [repo]` · `golden ls` · `golden rm <name> --yes` | Golden images (plain / with the databases loaded) |
+| `delega sandbox up <name> [repo] [--db n]` · `exec <name> -- cmd` · `shell` · `env` · `freeze\|thaw\|rm` · `save <name> <tpl>` · `ls` | Dev microVMs |
 | `delega metrics start\|stop\|report` | Resources, tokens and times |
 
 Policy keys (all under `[policy]`, overridable per profile/project or with `DELEGA_<KEY>`):

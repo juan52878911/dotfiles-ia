@@ -64,7 +64,10 @@ To add a machine, run `nodes/linux.sh` on it (or `nodes/windows-wsl/` for a Wind
 | `queue` / `tick` | queue briefs with priorities; launch them when quota, budget and capacity allow |
 | `integrate` | `git merge-tree` dry run into a target branch, then the project's `verify` commands |
 | `sync` | push the profile's rules bundle (CLAUDE.md, hooks, agents, settings) to nodes |
-| `audit` | provenance of a job or branch |
+| `audit` | provenance of a job or branch (volume, golden, VM, cost included) |
+| `db` | throwaway copies of a project's databases for kindling jobs: `volume create\|refresh\|rm`, `ls` |
+| `golden` | kindling golden images: `build` (rules bundle + the project's DB engines), `db` (databases loaded and frozen), `ls`, `rm` |
+| `sandbox` | dev microVMs on kindling: `up`, `exec`, `shell`, `env`, `freeze`, `thaw`, `save`, `rm`, `ls` |
 | `metrics` | tokens, time per activity and node resources of finished jobs |
 
 The module contracts and file formats are in [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -78,18 +81,50 @@ The module contracts and file formats are in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `[general]` | `locale` (`en`\|`es`), `owner_name`, `state_dir`, `default_profile` |
 | `[policy]` | `job.max_min`, `job.max_turns`, `job.max_usd`, `job.grace_s`, `stall_s`, `answer_wait_s`, `resume_max_min`, `max_local_jobs`, `expected_hours`, `node.max_load_pct`, `node.min_disk_gb`, `node.min_mem_mb`, `node.reserve_mb_per_job`, `permission_mode.default`/`.deny`, `budget.day_usd`, `quota.window_5h_pct`, `quota.weekly_pct`, `lint.require`, `lease.renew_s`/`.stale_s` |
 | `[profiles.<p>]` | `owner = "self"` (required), `launcher`, `config_dir`, `identity.expect_email` / `.expect_email_domain`, `repo_match`, `git`, `model`, `nodes`, `compute`, `forbidden_terms_file`, `forbidden_engines`, `node_bundle`, `bundle_post_sync`, `policy.*` |
-| `[nodes.<n>]` | `ssh`, `max_jobs`, `min_disk_gb`, `profiles`, `workdir`, `jobs_subdir`, `python`, `runner` (`host`\|`docker`\|`kindling`), `config_dirs`, `docker_image`; kindling: `golden`, `vm_home`, `vm_user`, `vm_repo`, `golden_base_ref`, `egress_allow`, `token_command`, `token_env`, `account`, `keep_vm` |
+| `[nodes.<n>]` | `ssh`, `max_jobs`, `min_disk_gb`, `profiles`, `workdir`, `jobs_subdir`, `python`, `runner` (`host`\|`docker`\|`kindling`), `config_dirs`, `docker_image`; kindling: `golden`, `vm_home`, `vm_user`, `vm_repo`, `golden_base_ref`, `egress_allow`, `token_command`, `token_env`, `account`, `keep_vm`, `loader_image`, `golden_extra`, `golden_apt`, `golden_disk`, `golden_mem`, `claude_version` |
 | `[compute.<c>]` | `kind` (`gcp-adc`\|`env`\|`command`), its parameters, `fix_hint` |
-| `[projects."owner/repo"]` | `verify`, `branch_prefixes`, `policy.*` |
+| `[projects."owner/repo"]` | `verify`, `branch_prefixes`, `policy.*`, `databases.<name>` (`engine`, `version`, `database`, `volume`, `attach`, `mode`, `env`, `node`) |
 
 Every policy value resolves in this order: environment variable `DELEGA_<KEY>` → profile → project →
 global `[policy]` → built-in default.
 
-`sync` ships the profile's `node_bundle` directory: `CLAUDE.md`, `hooks/`, `agents/`, `settings.json`
-go to the node's `~/.claude` (or `config_dirs[profile]`); a `home/` directory is unpacked relative to
+`sync` ships the profile's `node_bundle` directory: `CLAUDE.md`, `hooks/`, `agents/`, `skills/`, `rules/`,
+`commands/`, `output-styles/`, `settings.json` (plus the skill dirs listed in `bundle_skills`) go to the node's `~/.claude` (or `config_dirs[profile]`); a `home/` directory is unpacked relative to
 `$HOME`; `bundle_post_sync = ["cmd", …]` run on the node afterwards (e.g. to merge `settings.json`).
 A node-rules section (caps, shared-machine limits, no client data, never bypass hooks) is appended to
 `CLAUDE.md`. Credentials are never sent.
+
+## Databases in kindling jobs
+
+A project can give its kindling jobs a **throwaway copy of its real database** without the data
+leaving the kindling host:
+
+```toml
+[projects."acme/api".databases.main]
+engine = "postgres"        # postgres | mariadb | mysql | redis | mongo | sqlite
+version = "16"             # mysql and mongo need a full version (8.4.6, 7.0.14)
+database = "app"
+# volume = "db-api-main"   # default db-<repo>-<name>
+# attach = "always"        # every kindling job gets it; default: only with --db main
+# env = { DATABASE_URL = "{url}" }   # default per engine: PG*, MYSQL_*, REDIS_URL, MONGODB_URI, SQLITE_PATH
+```
+
+1. `delega golden build` bakes the repo's golden with those engines and `delega-db` (and the rules bundle).
+2. `delega db volume create main --from-host-cmd "pg_dump -Fc …"` (or `--from-host <file on the host>`;
+   `--from-file`/`--from-cmd` stream from this machine through ssh, never writing it) puts the dump in a
+   kindling volume, in 48 MiB parts, verified by sha256. `refresh` keeps a volume snapshot for undo.
+3. `delega golden db` (optional) bakes `<golden>-db` with the databases restored and running, frozen.
+4. `delega run <repo> <brief> --db main` clones the data golden (about a second) or, if it is missing or
+   stale, restores the dump from the volume inside the job's VM (through a frozen read-only seed sandbox).
+   The worker gets the connection variables and the rules for real data in its context; egress stays the
+   node's allow-list; the branch, notices and report go through the forbidden-terms scan; `delega audit`
+   records volume, sha, golden and VM.
+
+Measured on a 4-vCPU host with a synthetic 85 MB `pg_dump -Fc` (5 M rows): restore from the volume
+≈ 31 s per job (4 s copy + 26 s `pg_restore`); data golden ≈ 0.6–1.5 s per job, baked once in ≈ 1 min.
+
+`delega sandbox up dev --db main` gives the same environment for interactive work outside a job; it
+freezes itself after `--ttl` and the next `exec` thaws it in milliseconds; `sandbox save` turns it into a template.
 
 ## Terms of use
 
