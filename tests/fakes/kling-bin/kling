@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """Fake kling for tests (runs on the fake node through tests/fakes/ssh).
 
-One VM at a time: `run -from G` copies $FAKE_KLING_GOLDENS/G into $FAKE_KLING_VMHOME (the VM's
-home, same absolute path the node config gives as vm_home). `exec` only passes the variables
-named with -e from the host environment, like the real one. Calls are logged to $HOME/.kling.log.
+Machines are files in $HOME/.kling-vms/<name> (JSON: mounts, frozen) with a root dir <name>.root/.
+`run -from G` also copies $FAKE_KLING_GOLDENS/G into $FAKE_KLING_VMHOME (the VM's home, same absolute
+path the node config gives as vm_home): one cloned VM at a time. Inside a VM, absolute paths map to its
+root dir, except the home and the mounted volumes ($HOME/.kling-volumes/<name>). `exec` only passes the
+variables named with -e from the host environment, like the real one, and runs tests/fakes/kling-bin/
+fake-dbctl wherever the command says /usr/local/bin/delega-db. `save` copies a cloned VM back as a golden.
+Calls are logged to $HOME/.kling.log.
 """
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 
 home = os.environ["HOME"]
 reg = os.path.join(home, ".kling-vms")
+vols = os.path.join(home, ".kling-volumes")
 vmhome = os.environ["FAKE_KLING_VMHOME"]
+goldens = os.environ.get("FAKE_KLING_GOLDENS", os.path.join(home, ".kling-goldens"))
+DBCTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-dbctl")
 
 
 def log(*a):
@@ -20,58 +29,244 @@ def log(*a):
         f.write(" ".join(a) + "\n")
 
 
-def path(p):
-    return p.split(":", 1)[1] if ":" in p and not p.startswith("/") else p
+def vm_file(n):
+    return os.path.join(reg, n)
 
 
-def main(a):
-    log(*a)
-    os.makedirs(reg, exist_ok=True)
-    cmd = a[0]
-    if cmd == "ps":
-        print("ID NAME STATE")
-        for n in sorted(os.listdir(reg)):
-            print(f"x {n} running")
-        return 0
-    if cmd == "run":
-        name, image = a[a.index("-name") + 1], a[a.index("-from") + 1]
-        src = os.path.join(os.environ["FAKE_KLING_GOLDENS"], image)
+def vm_info(n):
+    try:
+        with open(vm_file(n)) as f:
+            return json.loads(f.read() or "{}")
+    except (OSError, ValueError):
+        return None if not os.path.exists(vm_file(n)) else {}
+
+
+def vm_save(n, info):
+    with open(vm_file(n), "w") as f:
+        json.dump(info, f)
+
+
+def root(n):
+    return vm_file(n) + ".root"
+
+
+def vmap(n, p):
+    """Path p inside machine n, as a path on this host."""
+    info = vm_info(n) or {}
+    if info.get("home") and (p == vmhome or p.startswith(vmhome + "/")):
+        return p
+    for m, vol in (info.get("mounts") or {}).items():
+        if p == m or p.startswith(m + "/"):
+            return os.path.join(vols, vol) + p[len(m):]
+    return root(n) + p
+
+
+def vargs(n, s):
+    """Absolute paths inside a command string, mapped (best effort: what delega uses)."""
+    s = s.replace("/usr/local/bin/delega-db", DBCTL)
+    return re.sub(r"(?<![\w./-])(/tmp/delega-seed|/seed|/var/lib/delega-db)\b", lambda m: vmap(n, m.group(1)), s)
+
+
+def flag(a, name, default=None):
+    return a[a.index(name) + 1] if name in a else default
+
+
+def mounts(a):
+    out = {}
+    for i, x in enumerate(a):
+        if x == "-volume":
+            parts = a[i + 1].split(":")
+            out[parts[1] if len(parts) > 1 and parts[1].startswith("/") else "/data"] = parts[0]
+    return out
+
+
+def create(a):
+    name = flag(a, "-name")
+    for m, v in mounts(a).items():
+        if not os.path.isdir(os.path.join(vols, v)):
+            print(f"kling: no volume {v}", file=sys.stderr)
+            return 1
+    info = {"mounts": mounts(a), "frozen": False}
+    if "-from" in a:
+        image = flag(a, "-from")
+        src = os.path.join(goldens, image)
         if not os.path.isdir(src):
             print(f"kling: no golden {image}", file=sys.stderr)
             return 1
         shutil.rmtree(vmhome, ignore_errors=True)
         shutil.copytree(src, vmhome, symlinks=True)
-        open(os.path.join(reg, name), "w").close()
-        print(f"{name} ready")
-        return 0
-    if cmd == "rm":
-        if os.path.exists(os.path.join(reg, a[1])):
-            os.remove(os.path.join(reg, a[1]))
+        info.update(home=True, image=image)
+        shutil.rmtree(root(name), ignore_errors=True)
+        if os.path.isdir(src + ".root"):
+            shutil.copytree(src + ".root", root(name), symlinks=True)
+    os.makedirs(root(name), exist_ok=True)
+    vm_save(name, info)
+    print(name if "-q" in a else f"{name} ready")
+    return 0
+
+
+def remove(names):
+    for n in names:
+        info = vm_info(n)
+        if info is None:
+            continue
+        if info.get("home"):
             shutil.rmtree(vmhome, ignore_errors=True)
+        os.remove(vm_file(n))
+        shutil.rmtree(root(n), ignore_errors=True)
+    return 0
+
+
+def side(p):
+    if p == "-":
+        return None, None
+    if ":" in p and not p.startswith("/"):
+        n, path = p.split(":", 1)
+        return n, path
+    return "", p
+
+
+def cp(src, dst):
+    sn, sp = side(src)
+    dn, dp = side(dst)
+    for n in (sn, dn):
+        if n and vm_info(n) is None:
+            print(f"kling: no vm {n}", file=sys.stderr)
+            return 1
+    data = sys.stdin.buffer.read() if sn is None else open(vmap(sn, sp) if sn else sp, "rb").read()
+    if dn is None:
+        sys.stdout.buffer.write(data)
+        return 0
+    out = vmap(dn, dp) if dn else dp
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(data)
+    print(f"{dst}  {len(data)}B")
+    return 0
+
+
+def exec_(a):
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
+    cwd, i, vm = None, 1, None
+    while a[i] != "--":
+        if a[i] == "-e":
+            k, _, v = a[i + 1].partition("=")
+            env[k] = v if _ else os.environ.get(k, "")
+            i += 2
+        elif a[i] in ("-w", "-timeout", "-t"):
+            if a[i] == "-w":
+                cwd = a[i + 1]
+            i += 2
+        elif a[i] == "-i":
+            i += 1
+        else:
+            vm = a[i]
+            i += 1
+    info = vm_info(vm)
+    if info is None:
+        print(f"kling: no vm {vm}", file=sys.stderr)
+        return 1
+    info["frozen"] = False
+    vm_save(vm, info)
+    env["FAKE_VM_ROOT"] = root(vm)
+    argv = [vargs(vm, x) for x in a[i + 1:]]
+    cwd = vmap(vm, cwd) if cwd else (vmhome if info.get("home") else root(vm))
+    os.makedirs(cwd, exist_ok=True)
+    return subprocess.run(argv, cwd=cwd, env=env).returncode
+
+
+def main(a):
+    log(*a)
+    os.makedirs(reg, exist_ok=True)
+    os.makedirs(vols, exist_ok=True)
+    cmd = a[0]
+    if cmd == "ps":
+        names = sorted(n for n in os.listdir(reg) if not n.endswith(".root"))
+        if "-q" not in a:
+            print("ID NAME STATE")
+        for n in names:
+            st = "frozen" if (vm_info(n) or {}).get("frozen") else "running"
+            print(n if "-q" in a else f"x {n} {st}")
+        return 0
+    if cmd == "run":
+        return create(a)
+    if cmd == "rm":
+        return remove([x for x in a[1:] if not x.startswith("-")])
+    if cmd in ("freeze", "thaw"):
+        for n in a[1:]:
+            info = vm_info(n)
+            if info is None:
+                print(f"kling: no vm {n}", file=sys.stderr)
+                return 1
+            info["frozen"] = cmd == "freeze"
+            vm_save(n, info)
         return 0
     if cmd == "cp":
-        shutil.copy(path(a[1]), path(a[2]))
-        return 0
+        return cp(a[1], a[2])
     if cmd == "exec":
-        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
-        cwd, i = vmhome, 1
-        while a[i] != "--":
-            if a[i] == "-e":
-                k, _, v = a[i + 1].partition("=")
-                env[k] = v if _ else os.environ.get(k, "")
-                i += 2
-            elif a[i] == "-w":
-                cwd = a[i + 1]
-                i += 2
-            elif a[i] == "-timeout":
-                i += 2
-            else:
-                vm = a[i]
-                i += 1
-        if not os.path.exists(os.path.join(reg, vm)):
-            print(f"kling: no vm {vm}", file=sys.stderr)
+        return exec_(a)
+    if cmd == "save":
+        rest = [x for x in a[1:] if not x.startswith("-")]
+        n, name = rest
+        if not (vm_info(n) or {}).get("home"):
+            print(f"kling: {n} cannot be saved here", file=sys.stderr)
             return 1
-        return subprocess.run(a[i + 1:], cwd=cwd, env=env).returncode
+        dst = os.path.join(goldens, name)
+        if os.path.exists(dst) and "-replace" not in a:
+            print(f"kling: template {name} exists", file=sys.stderr)
+            return 1
+        for s, d in ((vmhome, dst), (root(n), dst + ".root")):
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.copytree(s, d, symlinks=True)
+        print(f"{name}  template")
+        return 0
+    if cmd == "template":
+        names = sorted(x for x in os.listdir(goldens) if not x.endswith(".root")) if os.path.isdir(goldens) else []
+        if a[1] == "ls":
+            if "-q" not in a:
+                print("NAME IMAGE")
+            for x in names:
+                print(x if "-q" in a else f"{x} node22")
+            return 0
+        if a[1] == "rm":
+            for x in a[2:]:
+                if not x.startswith("-"):
+                    shutil.rmtree(os.path.join(goldens, x), ignore_errors=True)
+                    shutil.rmtree(os.path.join(goldens, x + ".root"), ignore_errors=True)
+            return 0
+    if cmd == "sandbox":
+        if a[1] == "create":
+            return create(a)
+        if a[1] == "ls":
+            for n in sorted(n for n in os.listdir(reg) if not n.endswith(".root")):
+                print(n)
+            return 0
+        if a[1] == "rm":
+            return remove([x for x in a[2:] if not x.startswith("-")])
+    if cmd == "volume":
+        sub, rest = a[1], [x for x in a[2:] if not x.startswith("-")]
+        if sub == "create":
+            p = os.path.join(vols, rest[0])
+            if os.path.exists(p):
+                print(f"kling: volume {rest[0]} exists", file=sys.stderr)
+                return 1
+            os.makedirs(os.path.join(p, "lost+found"))
+            return 0
+        if sub == "ls":
+            names = sorted(x for x in os.listdir(vols) if "@" not in x)
+            print(json.dumps([{"name": x} for x in names]) if "-json" in a else "\n".join(names))
+            return 0
+        if sub == "snapshot":
+            shutil.copytree(os.path.join(vols, rest[0]), os.path.join(vols, f"{rest[0]}@{rest[1]}"))
+            return 0
+        if sub == "rm":
+            for x in rest:
+                shutil.rmtree(os.path.join(vols, x), ignore_errors=True)
+                if "-snapshots" in a:
+                    for y in os.listdir(vols):
+                        if y.startswith(x + "@"):
+                            shutil.rmtree(os.path.join(vols, y))
+            return 0
     return 2
 
 

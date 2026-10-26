@@ -32,6 +32,8 @@ def main(argv):
     open(os.path.join(chan, "progress.log"), "a").write(f"{now()}\tSTART\t{os.path.basename(brief)}\n")
     jw("stub.json", {"argv": cmd, "cwd": os.getcwd(), "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"),
                      "env": {k: v for k, v in os.environ.items() if k.startswith("DELEGA_")},
+                     "db_env": {k: v for k, v in os.environ.items()
+                                if k.startswith(("PG", "MYSQL_", "REDIS_", "MONGODB_", "SQLITE_")) or k == "DATABASE_URL"},
                      "oauth_token_set": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))})
     end = time.time() + float(os.environ.get("STUB_SLEEP", "0"))
     while time.time() < end:

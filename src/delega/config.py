@@ -61,6 +61,9 @@ class ConfigError(Exception):
     pass
 
 
+DB_ENGINES = ("postgres", "mariadb", "mysql", "redis", "mongo", "sqlite")   # see databases.ENGINES
+
+
 def expand(p):
     return os.path.expanduser(os.path.expandvars(p)) if isinstance(p, str) else p
 
@@ -130,6 +133,12 @@ class Config:
         for name, n in self.nodes.items():
             if not n.get("ssh"):
                 raise ConfigError(f"node '{name}': missing ssh = \"<alias in ~/.ssh/config>\"")
+        for key, pr in self.projects.items():
+            for db, d in ((pr or {}).get("databases") or {}).items():
+                if not isinstance(d, dict) or d.get("engine") not in DB_ENGINES:
+                    raise ConfigError(f"project '{key}' database '{db}': engine = one of {', '.join(DB_ENGINES)}")
+                if d.get("node") and d["node"] not in self.nodes:
+                    raise ConfigError(f"project '{key}' database '{db}': unknown node '{d['node']}'")
 
     # ── general ─────────────────────────────────────────────────────────────
     @property

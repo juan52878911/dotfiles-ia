@@ -23,6 +23,9 @@ COMMANDS = {
     "integrate": ("integrate", "dry-run merge of a job branch and run the project's verify commands"),
     "sync":      ("sync",      "push the profile's rules bundle (CLAUDE.md, hooks, agents) to nodes"),
     "audit":     ("audit",     "provenance of a job or branch from the append-only audit log"),
+    "db":        ("databases", "throwaway copies of a project's databases for kindling jobs (volumes from dumps)"),
+    "golden":    ("golden",    "build and list kindling golden images (plain and with the databases loaded)"),
+    "sandbox":   ("sandbox",   "dev microVMs on kindling: up, exec, shell, freeze, thaw, save, rm"),
     "metrics":   ("metrics",   "tokens, time and node resources of finished jobs"),
     "version":   (None,        "print the version"),
 }

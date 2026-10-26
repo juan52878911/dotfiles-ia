@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Fake GNU split for tests (macOS split has no --filter): split -b SIZE -a N --filter=CMD - PREFIX."""
+import itertools
+import os
+import string
+import subprocess
+import sys
+
+a = sys.argv[1:]
+size = a[a.index("-b") + 1]
+n = int(size[:-1]) * {"k": 1 << 10, "m": 1 << 20, "g": 1 << 30}[size[-1].lower()] if size[-1].isalpha() else int(size)
+width = int(a[a.index("-a") + 1]) if "-a" in a else 2
+filt = next(x.split("=", 1)[1] for x in a if x.startswith("--filter="))
+n = int(os.environ.get("FAKE_SPLIT_BYTES", n))
+prefix = a[-1]
+names = ("".join(p) for p in itertools.product(string.ascii_lowercase, repeat=width))
+while True:
+    chunk = sys.stdin.buffer.read(n)
+    if not chunk:
+        break
+    r = subprocess.run(["sh", "-c", filt], input=chunk, env={**os.environ, "FILE": prefix + next(names)})
+    if r.returncode:
+        sys.exit(r.returncode)

@@ -125,6 +125,15 @@ def protocol(notify, caps, grace_s, loc=None):
     return t("protocol.text", loc=loc, notify=notify, caps=caps, grace=max(1, int(grace_s // 60)))
 
 
+def job_context(ch):
+    """The job's context.md (node, profile, caps, budget, databases) written by launch, if any."""
+    try:
+        with open(ch.p("context.md"), encoding="utf-8") as f:
+            return "\n\n" + f.read().strip()
+    except OSError:
+        return ""
+
+
 NOTIFY_SH = '#!/bin/sh\nPYTHONPATH="{root}${{PYTHONPATH:+:$PYTHONPATH}}" exec "{py}" -m delega broker notify "{ch}" "$@"\n'
 
 
@@ -178,7 +187,7 @@ def cmd_run(chdir, brief, command):
     caps_txt = t("broker.caps_text", min=f"{max_min:g}", turns=max_turns, usd=f"{max_usd:g}")
     command = command + ["--input-format", "stream-json", "--output-format", "stream-json",
                          "--verbose", "--replay-user-messages",
-                         "--append-system-prompt", protocol(notify, caps_txt, grace_s)]
+                         "--append-system-prompt", protocol(notify, caps_txt, grace_s) + job_context(ch)]
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=open(ch.p("stderr.log"), "a"), text=True, env=env)
     open_ = [True]

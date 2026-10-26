@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import config as _config
-from . import jobs, kindling, nodes, remote, util
+from . import context, databases, jobs, kindling, nodes, remote, util
 from .i18n import t
 
 REFUSED_RC = 2
@@ -351,7 +351,8 @@ def _finish(cfg, job_dir, meta, node, poll_s):
         record_session(cfg, sid, meta["NODE"], meta.get("WORKTREE", ""), branch, profile["name"], job_id_of(job_dir))
     _audit(cfg, "end", job=job_id_of(job_dir), profile=profile["name"], account=meta.get("ACCOUNT"),
            node=meta["NODE"], branch=branch, base=meta.get("BASE"), project=meta.get("PROJECT"),
-           owner=meta.get("OWNER"), cost_usd=summ.get("cost_usd", summ.get("total_cost_usd")), rc=rc)
+           owner=meta.get("OWNER"), cost_usd=summ.get("cost_usd", summ.get("total_cost_usd")), rc=rc,
+           vm=meta.get("VM") or None, golden=meta.get("GOLDEN") or None, dbs=meta.get("DBS") or None)
     hits = False
     if branch and repo_dir and os.path.isdir(repo_dir):
         if node.get("vm"):
@@ -364,7 +365,11 @@ def _finish(cfg, job_dir, meta, node, poll_s):
             last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", branch], capture_output=True,
                                   text=True).stdout.strip()
             print(t("launch.branch.fetched", branch=branch, last=last))
-            hits = _report_scan(repo_dir, branch, meta.get("BASE"), _terms(profile.get("forbidden_terms_file")))
+            terms = _terms(profile.get("forbidden_terms_file"))
+            hits = _report_scan(repo_dir, branch, meta.get("BASE"), terms)
+            _audit(cfg, "scan", job=job_id_of(job_dir), branch=branch, node=meta["NODE"],
+                   result="hits" if hits else "clean" if terms else "no_terms",
+                   dbs=meta.get("DBS") or None)
         else:
             print(t("launch.branch.fetch_failed", branch=branch, log=os.path.join(job_dir, "fetch.log")))
     print_summary(job_dir, rc)
@@ -421,6 +426,12 @@ def build_parser():
     ap.add_argument("--zone", action="append", default=[], metavar="GLOB",
                     help="files this job may touch (repeatable); default: the brief's `## Zone` section, else "
                     "the whole repo. Refused when a live job of the same repo overlaps")
+    ap.add_argument("--db", action="append", default=[], metavar="NAME",
+                    help="kindling only: a throwaway copy of this project database inside the job's VM (repeatable, "
+                    "or all); those declared attach = \"always\" come anyway")
+    ap.add_argument("--db-mode", choices=("auto", "golden", "volume"),
+                    help="golden: clone the data golden (databases already loaded); volume: restore from the "
+                    "dump volume; auto (default): golden while it is fresh")
     ap.add_argument("--no-lint", action="store_true", help="skip the brief checks (done-when, cap, report)")
     ap.add_argument("--over-budget", action="store_true", help="launch even if the daily budget is spent")
     ap.add_argument("--allow-version-skew", action="store_true",
@@ -444,6 +455,8 @@ class Launch:
         self.job_dir = None
         self.started = False
         self.vm = None          # kindling: node dict with the job's microVM, once created
+        self.dbs = []           # database specs the job gets (kindling only)
+        self.budget = (0.0, 0.0)
 
     # -- helpers
     def fail(self, e):
@@ -498,6 +511,7 @@ class Launch:
         spent, limit = _spend_total(cfg, today), float(pol("budget.day_usd"))
         if not a.over_budget and spent >= limit:
             raise Refused(8, t("launch.err.budget", spent=f"{spent:.2f}", limit=f"{limit:.2f}"))
+        self.budget = (spent, limit)
         # 4. brief lint
         if not a.resume and not a.no_lint:
             missing = lint_brief(brief_text, cfg.locale, pol("lint.require"))
@@ -514,8 +528,18 @@ class Launch:
         hits = _scan_text(brief_text, terms)
         if hits:
             raise Refused(9, t("launch.err.forbidden", n=len(hits)))
-        # 7. resume guard + node affinity
+        # 7. databases: only on kindling, the data never leaves its host
+        try:
+            self.dbs = databases.select(cfg, project, a.db)
+        except databases.DbError as e:
+            raise Refused(REFUSED_RC, str(e))
+        # 8. resume guard + node affinity
         prev, node_opt = None, a.node
+        if a.db and not a.resume:
+            try:
+                node_opt = databases.kindling_node(cfg, profile, self.dbs, node_opt)
+            except databases.DbError as e:
+                raise Refused(REFUSED_RC, str(e))
         if a.resume:
             prev = find_session(cfg, a.resume)
             if prev and prev.get("node"):
@@ -575,6 +599,12 @@ class Launch:
                                   None if node else a.worktree)
         util.add_meta(self.job_dir, ACCOUNT=account, CLAUDE_VERSION=p.get("claude_version") or "",
                       DELEGA_VERSION=_version(), RESUMED="1" if a.resume else "")
+        if self.dbs and a.db and not kindling.is_kindling(node):
+            raise Refused(REFUSED_RC, t("launch.err.db_not_kindling", node=node_name))
+        if not kindling.is_kindling(node):
+            self.dbs = []       # attach = "always" means every kindling job of the project
+        caps = dict(caps, **context.job_env(job_id, node_name, profile,
+                                            a.branch or ("" if node is None else f"delega/{job_id}")))
         if node is None:
             return self._run_local(profile, project, repo_dir, account, caps, argv_claude, repo)
         if kindling.is_kindling(node):
@@ -610,6 +640,7 @@ class Launch:
             env["PYTHONPATH"] = pkg + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
         util.add_meta(self.job_dir, CHANNEL=chan, WORKTREE=repo_dir)
         self._forbidden_file(profile, chan)
+        self._context(profile, project, "local", a.branch or "", account, caps)
         job_id = jobs.job_id(self.job_dir)
         _audit(cfg, "launch", job=job_id, profile=profile["name"], account=account, node="local",
                branch=a.branch or "", base=util.read_meta(self.job_dir).get("BASE"), project=project,
@@ -629,6 +660,12 @@ class Launch:
                cost_usd=summ.get("cost_usd", summ.get("total_cost_usd")), rc=rc)
         print_summary(self.job_dir, rc)
         return rc
+
+    def _context(self, profile, project, node_label, branch, account, caps, **kw):
+        meta = util.read_meta(self.job_dir)
+        text = context.render(jobs.job_id(self.job_dir), profile, account, node_label, branch, meta.get("BASE"),
+                              project, [z for z in meta.get("ZONE", "").split(",") if z], caps, self.budget, **kw)
+        return context.write(self.job_dir, text)
 
     def _forbidden_file(self, profile, chan, node=None):
         path = profile.get("forbidden_terms_file")
@@ -660,6 +697,9 @@ class Launch:
         if os.path.exists(os.path.join(self.job_dir, "forbidden.txt")):
             remote.must(remote.scp_to(node, os.path.join(self.job_dir, "forbidden.txt"), f"{chan}/forbidden.txt"),
                         "upload forbidden.txt")
+        caps = dict(caps, DELEGA_BRANCH=branch)
+        remote.must(remote.scp_to(node, self._context(profile, project, name, branch, account, caps),
+                                  f"{chan}/context.md"), "upload context.md")
         run_sh = build_run_sh(node, profile, caps, chan, wt, argv_claude)
         local_sh = os.path.join(self.job_dir, "run.sh")
         with open(local_sh, "w") as f:
@@ -683,12 +723,31 @@ class Launch:
         if not _is_git(repo_dir):
             raise Refused(REFUSED_RC, t("launch.err.not_git", path=repo_dir))
         token = kindling.read_token(node)
-        vm, image = kindling.vm_name(job_id), kindling.golden(node, repo)
-        util.add_meta(self.job_dir, VM=vm)
+        vm, golden = kindling.vm_name(job_id), kindling.golden(node, repo)
+        image, db_mode, why = golden, None, ""
+        if self.dbs:
+            try:
+                db_mode, image, why = databases.plan(cfg, node, golden, self.dbs, a.db_mode)
+            except databases.DbError as e:
+                raise Refused(REFUSED_RC, str(e))
+            if why:
+                print(t("launch.db_fallback", why=why))
+        util.add_meta(self.job_dir, VM=vm, GOLDEN=image)
         node = dict(node, vm=vm)
+        t0 = time.time()
         kindling.create(node, vm, image)
         self.vm = node
-        t0 = time.time()
+        dbrecs = []
+        if self.dbs:
+            try:
+                dbrecs = databases.attach(cfg, node, vm, self.dbs, db_mode)
+            except databases.DbError as e:
+                raise Refused(5, str(e))
+            caps = dict(caps, **databases.env(self.dbs))
+            util.add_meta(self.job_dir, DBS=",".join(f"{r['name']}:{r['volume']}@{r['sha']}" for r in dbrecs),
+                          DB_MODE=db_mode)
+            for r in dbrecs:
+                print(t("launch.db_ready", name=r["name"], engine=r["engine"], mode=r["mode"], s=r["s"], check=r["check"]))
         rv = remote.ssh(node, " ".join(shlex.quote(x) for x in nodes.launcher_for(profile, node) + ["--version"]))
         m = re.search(r"\d+\.\d+(\.\d+)?", rv.stdout or "")
         vv = m.group(0) if m else None
@@ -710,7 +769,10 @@ class Launch:
         if os.path.exists(os.path.join(self.job_dir, "forbidden.txt")):
             remote.must(remote.scp_to(node, os.path.join(self.job_dir, "forbidden.txt"), f"{chan}/forbidden.txt"),
                         "upload forbidden.txt")
-        caps = dict(caps, DELEGA_KEEP_ENV=kindling.keep_env(node))
+        caps = dict(caps, DELEGA_KEEP_ENV=kindling.keep_env(node), DELEGA_BRANCH=branch)
+        ctx = self._context(profile, project, node["name"], branch, node.get("account", ""), caps, vm=vm, image=image,
+                            egress=node.get("egress_allow", kindling.DEFAULT_EGRESS), dbs=self.dbs, db_mode=db_mode)
+        remote.must(remote.scp_to(node, ctx, f"{chan}/context.md"), "upload context.md")
         local_sh = os.path.join(self.job_dir, "run.sh")
         with open(local_sh, "w") as f:
             f.write(build_run_sh(node, profile, caps, chan, wt, argv_claude))
@@ -718,7 +780,9 @@ class Launch:
         print(t("launch.kindling_ready", vm=vm, image=image, s=int(time.time() - t0)))
         meta = util.read_meta(self.job_dir)
         _audit(cfg, "launch", job=job_id, profile=profile["name"], account=meta.get("ACCOUNT"), node=node["name"],
-               branch=branch, base=meta.get("BASE"), project=project, owner=meta.get("OWNER"), vm=vm)
+               branch=branch, base=meta.get("BASE"), project=project, owner=meta.get("OWNER"), vm=vm, golden=image,
+               dbs=[{k: r[k] for k in ("name", "engine", "volume", "sha", "mode", "check")} for r in dbrecs] or None,
+               db_fallback=why or None)
         remote.must(kindling.start_worker(node, chan, token), "start worker")
         token = None
         self.started = True

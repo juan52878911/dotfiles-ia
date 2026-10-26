@@ -99,3 +99,14 @@ def build_pyz(dest):
     with open(dest, "wb") as f:
         f.write(data)
     return hashlib.sha256(data).hexdigest()[:12]
+
+
+def common_options(ap, names):
+    """Add --<name> options to a parser and return a parent for its subcommands, so they are accepted
+    before or after the subcommand (`delega golden --node n build` = `delega golden build --node n`)."""
+    import argparse
+    parent = argparse.ArgumentParser(add_help=False)
+    for n in names:
+        ap.add_argument("--" + n)
+        parent.add_argument("--" + n, default=argparse.SUPPRESS)
+    return parent

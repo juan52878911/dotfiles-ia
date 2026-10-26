@@ -1,7 +1,8 @@
 """sync: push the profile's rules bundle to its nodes so remote workers behave like local ones.
 
-The bundle dir (profile `node_bundle`) may hold CLAUDE.md, hooks/, agents/, settings.json (all go
-to the node's ~/.claude, or config_dirs[profile]) and home/ (unpacked relative to $HOME). A node
+The bundle dir (profile `node_bundle`) may hold CLAUDE.md, hooks/, agents/, skills/, rules/, commands/,
+output-styles/, settings.json (all go to the node's ~/.claude, or config_dirs[profile]) and home/ (unpacked
+relative to $HOME). The profile's `bundle_skills = [dirs]` add the orchestrator's own skills. A node
 rules section rendered from the message catalog is appended to CLAUDE.md. After unpacking, the
 profile's `bundle_post_sync` commands run on the node (e.g. to merge settings.json).
 Credentials are never sent: they are filtered out of the staging tree, whatever the bundle holds."""
@@ -17,7 +18,7 @@ import tempfile
 from . import config, i18n
 
 BEGIN, END = "<!-- delega:node-rules:begin -->", "<!-- delega:node-rules:end -->"
-ITEMS = ("CLAUDE.md", "hooks", "agents", "settings.json")
+ITEMS = ("CLAUDE.md", "hooks", "agents", "skills", "rules", "commands", "output-styles", "settings.json")
 NEVER_SEND = (".credentials.json", "*credentials*", ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
               "application_default_credentials.json", ".netrc", "*.token", ".git")
 
@@ -67,6 +68,12 @@ def stage(cfg, prof, dest_dir):
     for item in ITEMS:
         if os.path.exists(os.path.join(bundle, item)):
             _copy_tree(os.path.join(bundle, item), os.path.join(dest_dir, "claude", item), skipped)
+    for sk in prof.get("bundle_skills") or []:       # the orchestrator's own skills, by path
+        src = config.expand(sk).rstrip("/")
+        if os.path.isfile(os.path.join(src, "SKILL.md")):
+            _copy_tree(src, os.path.join(dest_dir, "claude", "skills", os.path.basename(src)), skipped)
+        else:
+            skipped.append(sk + " (no SKILL.md)")
     if os.path.isdir(os.path.join(bundle, "home")):
         _copy_tree(os.path.join(bundle, "home"), os.path.join(dest_dir, "home"), skipped)
     claude_md = os.path.join(dest_dir, "claude", "CLAUDE.md")

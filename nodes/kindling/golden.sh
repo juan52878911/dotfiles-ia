@@ -11,6 +11,9 @@
 # VM_USER (worker) · VM_REPO (wt) · BASE_REF (delega-base): must match the node config
 # EXTRA: optional script run as VM_USER in ~/VM_REPO after the base setup (install dependencies…)
 # APT_EXTRA: more apt packages for the image (e.g. "build-essential libpq-dev")
+# DB_ENGINES: database engines to install, "engine[:version] …" (postgres:16 mariadb mysql:8.4.6 redis
+#   mongo:7.0.14 sqlite), with delega-db to run them; `delega golden build` takes them from the project
+# DELEGA: delega command (default: delega on PATH) · VM_DISK (16G) · VM_MEM (4G)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,21 +26,21 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5 "$KHOST")
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"; "${SSH[@]}" "rm -rf /tmp/$VM" || true' EXIT
 echo "== rules and repo ($(git -C "$REPO" rev-parse --short HEAD))"
-delega sync ${DELEGA_PROFILE:+--profile "$DELEGA_PROFILE"} --tar "$tmp/rules.tar"
+${DELEGA:-delega} sync ${DELEGA_PROFILE:+--profile "$DELEGA_PROFILE"} --tar "$tmp/rules.tar"
 git -C "$REPO" bundle create -q "$tmp/repo.bundle" HEAD
 # kling cp moves at most 64 MiB per file: the bundle goes in pieces.
 (cd "$tmp" && split -b 48m repo.bundle repo.bundle. && rm repo.bundle)
-cp "$HERE/provision.sh" "$tmp/"
+cp "$HERE/provision.sh" "$tmp/" && cp "$HERE/../../src/delega/data/dbctl.sh" "$tmp/"
 [[ -z "${EXTRA:-}" ]] || cp "$EXTRA" "$tmp/extra.sh"
 "${SSH[@]}" "mkdir -p /tmp/$VM" && scp -q "$tmp"/* "$KHOST:/tmp/$VM/"
 
 echo "== build microVM $VM"
-"${SSH[@]}" "kling run -name $VM -image node22 -cpus 4 -mem 4G -disk 16G -egress internet -allow-exec -wait-ready" | tail -1
+"${SSH[@]}" "kling run -name $VM -image node22 -cpus 4 -mem ${VM_MEM:-4G} -disk ${VM_DISK:-16G} -egress internet -allow-exec -wait-ready" | tail -1
 "${SSH[@]}" "kling exec $VM -- mkdir -p /tmp/in && for f in /tmp/$VM/*; do kling cp \$f $VM:/tmp/in/\$(basename \$f) >/dev/null; done"
 q() { printf '%q' "$1"; }
 "${SSH[@]}" "kling exec -timeout 50m -e CLAUDE_VERSION=$(q "$CLAUDE_VERSION") \
   -e GIT_EMAIL=$(q "${GIT_EMAIL:-$(git -C "$REPO" config user.email)}") -e GIT_NAME=$(q "${GIT_NAME:-$(git -C "$REPO" config user.name)}") \
-  -e VM_USER=$(q "${VM_USER:-worker}") -e VM_REPO=$(q "${VM_REPO:-wt}") -e BASE_REF=$(q "${BASE_REF:-delega-base}") -e APT_EXTRA=$(q "${APT_EXTRA:-}") \
+  -e VM_USER=$(q "${VM_USER:-worker}") -e VM_REPO=$(q "${VM_REPO:-wt}") -e BASE_REF=$(q "${BASE_REF:-delega-base}") -e APT_EXTRA=$(q "${APT_EXTRA:-}") -e DB_ENGINES=$(q "${DB_ENGINES:-}") \
   $VM -- bash /tmp/in/provision.sh"
 
 echo "== golden $NAME"

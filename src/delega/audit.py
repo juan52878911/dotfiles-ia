@@ -70,11 +70,19 @@ def select(records, key=None):
             key == r.get("branch") or str(r.get("branch", "")).endswith("/" + key)]
 
 
+def _compact(v):
+    """dbs = [{name, volume, sha, mode, …}] as name:volume@sha(mode),…"""
+    if isinstance(v, list):
+        return ",".join(f"{d.get('name')}:{d.get('volume')}@{d.get('sha', '')}" + (f"({d['mode']})" if d.get("mode") else "")
+                        for d in v if isinstance(d, dict))
+    return str(v)
+
+
 def format_record(r):
     extra = {k: v for k, v in r.items() if k not in ("ts", "event") + FIELDS}
     head = f"{r.get('ts', '?')}  {r.get('event', '?'):<9}"
     bits = [f"{k}={r[k]}" for k in FIELDS if k in r]
-    bits += [f"{k}={util.short(v, 60)}" for k, v in extra.items()]
+    bits += [f"{k}={_compact(v) if k == 'dbs' else util.short(v, 60)}" for k, v in extra.items()]
     return head + "  " + " ".join(bits)
 
 

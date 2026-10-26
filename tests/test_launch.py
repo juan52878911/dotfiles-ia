@@ -400,7 +400,7 @@ class RemoteRunTests(LaunchCase):
         self.assertIn("no forbidden terms", out)
         self.assertIn("RC=0", out)
         self.assertIn("final report", out)
-        self.assertEqual([e for e, _ in self.events], ["launch", "end"])
+        self.assertEqual([e for e, _ in self.events], ["launch", "end", "scan"])
         self.assertEqual(self.events[0][1]["node"], "box")
         sess = [json.loads(l) for l in open(os.path.join(self.state, "sessions.jsonl"))]
         self.assertEqual((sess[0]["node"], sess[0]["worktree"], sess[0]["branch"]),
@@ -537,7 +537,7 @@ class RemoteRunTests(LaunchCase):
         self.assertTrue(os.path.exists(os.path.join(d, "summary.json")))
         self.assertEqual(sh("git", "-C", self.repo, "log", "--format=%s", "-1", meta["BRANCH"]), "stub work")
         self.assertEqual(jobs.live_counts(cfg), {})
-        self.assertEqual([e for e, _ in self.events], ["end"])   # the first process died before its end record
+        self.assertEqual([e for e, _ in self.events], ["end", "scan"])   # the first process died before its end record
         self.assertEqual(jobs.adopt(cfg, d), 0)                  # already closed: nothing to do
 
 
