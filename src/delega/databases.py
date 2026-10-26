@@ -81,7 +81,7 @@ def specs(cfg, project):
                      "database": d.get("database") or name,
                      "volume": d.get("volume") or f"db-{_slug(project.split('/')[-1])}-{_slug(name)}",
                      "attach": d.get("attach", "ask"), "mode": d.get("mode", "auto"),
-                     "env": d.get("env") or DEFAULT_ENV[e], "node": d.get("node")}
+                     "env": d.get("env") or DEFAULT_ENV[e], "node": d.get("node"), "profile": d.get("profile")}
     seen = {}
     for s in out.values():
         for var in s["env"]:
@@ -101,6 +101,16 @@ def select(cfg, project, wanted):
         if w not in sp:
             raise DbError(t("db.err.unknown", name=w, project=project or "-", known=", ".join(sp) or "-"))
     return [s for n, s in sp.items() if n in wanted or s["attach"] == "always"]
+
+
+def check_profile(cfg, repo_dir, profile, dbs):
+    """A database only goes to jobs of the account its project belongs to: its `profile`, else the profile
+    whose repo_match takes the repo. Raises DbError otherwise (no copies of one account's data elsewhere)."""
+    owner = None
+    for s in dbs:
+        owner = s.get("profile") or owner or cfg.profile_for(repo_dir)
+        if owner != profile:
+            raise DbError(t("db.err.profile", name=s["name"], owner=owner, profile=profile))
 
 
 def values(spec):
@@ -153,14 +163,23 @@ def state_path(cfg):
     return os.path.join(cfg.state_dir, "kindling.json")
 
 
+def hkey(node):
+    """Volumes, templates and sandboxes belong to the kindling host, whichever node (account) reaches it."""
+    return remote.alias(remote.host_node(node))
+
+
 def load_state(cfg):
     try:
         with open(state_path(cfg), encoding="utf-8") as f:
             st = json.load(f)
     except (OSError, ValueError):
         st = {}
-    st.setdefault("volumes", {})
-    st.setdefault("goldens", {})
+    for sec in ("volumes", "goldens", "sandboxes"):
+        st.setdefault(sec, {})
+        for key in list(st[sec]):          # records from before: keyed by node name
+            node, _, name = key.partition("/")
+            if node in cfg.nodes and cfg.nodes[node].get("ssh") and cfg.nodes[node]["ssh"] != node:
+                st[sec].setdefault(f"{cfg.nodes[node]['ssh']}/{name}", st[sec].pop(key))
     return st
 
 
@@ -175,7 +194,7 @@ def save_state(cfg, st):
 def note_golden(cfg, node, name, **fields):
     with audit.locked(state_path(cfg) + ".lock"):
         st = load_state(cfg)
-        st["goldens"][f"{node['name']}/{name}"] = dict(fields, built=int(time.time()))
+        st["goldens"][f"{hkey(node)}/{name}"] = dict(fields, built=int(time.time()))
         save_state(cfg, st)
 
 
@@ -191,7 +210,7 @@ def plan(cfg, node, golden, dbs, mode=None):
         return "volume", golden, ""
     st = load_state(cfg)
     dg = data_golden(golden)
-    rec = st["goldens"].get(f"{node['name']}/{dg}")
+    rec = st["goldens"].get(f"{hkey(node)}/{dg}")
     why = ""
     if not rec:
         why = t("db.why.no_golden", golden=dg)
@@ -199,10 +218,10 @@ def plan(cfg, node, golden, dbs, mode=None):
         why = t("db.why.other_dbs", golden=dg, dbs=", ".join(sorted(rec.get("dbs", {}))))
     else:
         for s in dbs:
-            vol = st["volumes"].get(f"{node['name']}/{s['volume']}") or {}
+            vol = st["volumes"].get(f"{hkey(node)}/{s['volume']}") or {}
             if vol.get("sha256") and vol.get("sha256") != rec["dbs"][s["name"]]:
                 why = t("db.why.stale", golden=dg, volume=s["volume"])
-        base = st["goldens"].get(f"{node['name']}/{golden}") or {}
+        base = st["goldens"].get(f"{hkey(node)}/{golden}") or {}
         if not why and base.get("built", 0) > rec.get("built", 0):
             why = t("db.why.base_newer", golden=dg, base=golden)
     if not why and dg not in templates(node):
@@ -302,7 +321,7 @@ def attach(cfg, node, vm, dbs, mode):
             r = vm_exec(node, vm, f"sh -c {q(f'{VM_DBCTL} up {args} {src}; rc=$?; rm -rf {src}; exit $rc')}")
         _must(r, t("db.err.up", name=s["name"]))
         chk = _must(vm_exec(node, vm, f"{VM_DBCTL} check {args}", timeout=120), t("db.err.check", name=s["name"]))
-        vol = st["volumes"].get(f"{node['name']}/{s['volume']}") or {}
+        vol = st["volumes"].get(f"{hkey(node)}/{s['volume']}") or {}
         out.append({"name": s["name"], "engine": s["engine"], "volume": s["volume"], "mode": mode,
                     "sha": (vol.get("sha256") or "")[:12], "s": round(time.time() - t0, 1),
                     "check": _last(chk.stdout), "load": _last(r.stdout)})
@@ -371,7 +390,7 @@ def volume_load(cfg, node, spec, source, kind, fmt=None, size="4G", refresh=Fals
            "updated": int(time.time()), "project_db": spec["name"]}
     with audit.locked(state_path(cfg) + ".lock"):
         st = load_state(cfg)
-        st["volumes"][f"{node['name']}/{vol}"] = rec
+        st["volumes"][f"{hkey(node)}/{vol}"] = rec
         save_state(cfg, st)
     return rec
 
@@ -396,7 +415,7 @@ def bake(cfg, node, golden, dbs):
     finally:
         host(node, f"kling rm -f {q(vm)} >/dev/null 2>&1", timeout=120)
     st = load_state(cfg)
-    shas = {s["name"]: (st["volumes"].get(f"{node['name']}/{s['volume']}") or {}).get("sha256", "") for s in dbs}
+    shas = {s["name"]: (st["volumes"].get(f"{hkey(node)}/{s['volume']}") or {}).get("sha256", "") for s in dbs}
     note_golden(cfg, node, dg, base=golden, dbs=shas, volumes={s["name"]: s["volume"] for s in dbs},
                 s=round(time.time() - t0, 1))
     return dg, recs
@@ -419,7 +438,8 @@ def _spec_for(cfg, project, args):
     if not args.engine:
         raise DbError(t("db.err.unknown", name=args.name, project=project or "-", known=", ".join(sp) or "-"))
     return {"name": args.name, "engine": args.engine, "version": args.version or "", "database": args.name,
-            "volume": args.name, "attach": "ask", "mode": "auto", "env": DEFAULT_ENV[args.engine], "node": None}
+            "volume": args.name, "attach": "ask", "mode": "auto", "env": DEFAULT_ENV[args.engine], "node": None,
+            "profile": None}
 
 
 def main_db(argv):
@@ -474,7 +494,7 @@ def main_db(argv):
             _must(host(node, f"kling volume rm -f -snapshots {q(spec['volume'])}"), "volume rm")
             with audit.locked(state_path(cfg) + ".lock"):
                 st = load_state(cfg)
-                st["volumes"].pop(f"{node['name']}/{spec['volume']}", None)
+                st["volumes"].pop(f"{hkey(node)}/{spec['volume']}", None)
                 save_state(cfg, st)
             audit.record(cfg, "db_volume", action="rm", node=node["name"], volume=spec["volume"], project=project)
             return 0
@@ -498,7 +518,7 @@ def _ls(cfg, project, profile, node_opt):
     names = {s["volume"]: s for s in sp.values()}
     for vol in sorted(set(names) | {v for v in have if v.startswith("db-")}):
         s = names.get(vol)
-        rec = st["volumes"].get(f"{node['name']}/{vol}") or {}
+        rec = st["volumes"].get(f"{hkey(node)}/{vol}") or {}
         print(f"  {(s or {}).get('name', '-'):<12} {(s or {}).get('engine', rec.get('engine', '?')):<9} {vol:<28} "
               f"{'✓' if vol in have else '✗'} {rec.get('sha256', '')[:12]:<12} "
               f"{(str(round(rec['bytes'] / 1e6, 1)) + ' MB') if rec.get('bytes') else '':<10} "

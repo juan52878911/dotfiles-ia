@@ -531,6 +531,7 @@ class Launch:
         # 7. databases: only on kindling, the data never leaves its host
         try:
             self.dbs = databases.select(cfg, project, a.db)
+            databases.check_profile(cfg, repo_dir, profile["name"], self.dbs)
         except databases.DbError as e:
             raise Refused(REFUSED_RC, str(e))
         # 8. resume guard + node affinity

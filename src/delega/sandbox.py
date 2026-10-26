@@ -30,9 +30,7 @@ def vm_name(name):
 
 
 def _state(cfg):
-    st = databases.load_state(cfg)
-    st.setdefault("sandboxes", {})
-    return st
+    return databases.load_state(cfg)
 
 
 def _save(cfg, fn):
@@ -46,6 +44,7 @@ def up(cfg, profile, node, name, repo, a):
     vm = vm_name(name)
     project = cfg.project_for(repo) if repo else None
     dbs = databases.select(cfg, project, a.db) if a.db else []
+    databases.check_profile(cfg, repo, profile["name"], dbs)
     golden = a.golden or kindling.golden(node, remote.repo_name(repo) if repo else name)
     mode, image, why = ("volume", golden, "")
     if dbs:
@@ -74,7 +73,7 @@ def up(cfg, profile, node, name, repo, a):
         databases.host(node, f"kling rm -f {q(vm)} >/dev/null 2>&1")
         raise
     env = databases.env(dbs)
-    _save(cfg, lambda st: st["sandboxes"].__setitem__(f"{node['name']}/{vm}", {
+    _save(cfg, lambda st: st["sandboxes"].__setitem__(f"{databases.hkey(node)}/{vm}", {
         "image": image, "dbs": [s["name"] for s in dbs], "env": env, "branch": branch, "repo": repo,
         "created": int(time.time())}))
     audit.record(cfg, "sandbox_up", node=node["name"], vm=vm, golden=image, project=project, profile=profile["name"],
@@ -140,7 +139,7 @@ def main(argv):
             return up(cfg, profile, node, a.name, repo, a)
         if a.cmd in ("exec", "shell", "env"):
             vm = vm_name(a.name)
-            rec = _state(cfg)["sandboxes"].get(f"{node['name']}/{vm}") or {}
+            rec = _state(cfg)["sandboxes"].get(f"{databases.hkey(node)}/{vm}") or {}
             if a.cmd == "env":
                 for k, v in (rec.get("env") or {}).items():
                     print(f"{k}={v}")
@@ -157,7 +156,7 @@ def main(argv):
             sys.stdout.write(r.stdout)
             sys.stderr.write(r.stderr)
             if a.cmd == "rm":
-                _save(cfg, lambda st: [st["sandboxes"].pop(f"{node['name']}/{v}", None) for v in vms])
+                _save(cfg, lambda st: [st["sandboxes"].pop(f"{databases.hkey(node)}/{v}", None) for v in vms])
             audit.record(cfg, "sandbox_" + a.cmd, node=node["name"], vm=",".join(vms))
             return r.returncode
         if a.cmd == "save":
@@ -166,7 +165,7 @@ def main(argv):
             sys.stdout.write(r.stdout)
             sys.stderr.write(r.stderr)
             if r.returncode == 0:
-                rec = _state(cfg)["sandboxes"].get(f"{node['name']}/{vm}") or {}
+                rec = _state(cfg)["sandboxes"].get(f"{databases.hkey(node)}/{vm}") or {}
                 databases.note_golden(cfg, node, a.template, base=rec.get("image"), from_sandbox=vm)
                 audit.record(cfg, "sandbox_save", node=node["name"], vm=vm, golden=a.template)
             return r.returncode
@@ -176,7 +175,7 @@ def main(argv):
             w = line.split()
             if i == 0 or any(x.startswith(PREFIX) for x in w):
                 name = next((x for x in w if x.startswith(PREFIX)), "")
-                rec = st.get(f"{node['name']}/{name}") or {}
+                rec = st.get(f"{databases.hkey(node)}/{name}") or {}
                 extra = f"   {rec.get('image', '')} {','.join(rec.get('dbs') or [])}" if rec else ""
                 print(line + extra)
         return r.returncode

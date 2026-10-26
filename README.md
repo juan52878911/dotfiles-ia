@@ -83,7 +83,7 @@ The module contracts and file formats are in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `[profiles.<p>]` | `owner = "self"` (required), `launcher`, `config_dir`, `identity.expect_email` / `.expect_email_domain`, `repo_match`, `git`, `model`, `nodes`, `compute`, `forbidden_terms_file`, `forbidden_engines`, `node_bundle`, `bundle_post_sync`, `policy.*` |
 | `[nodes.<n>]` | `ssh`, `max_jobs`, `min_disk_gb`, `profiles`, `workdir`, `jobs_subdir`, `python`, `runner` (`host`\|`docker`\|`kindling`), `config_dirs`, `docker_image`; kindling: `golden`, `vm_home`, `vm_user`, `vm_repo`, `golden_base_ref`, `egress_allow`, `token_command`, `token_env`, `account`, `keep_vm`, `loader_image`, `golden_extra`, `golden_apt`, `golden_disk`, `golden_mem`, `claude_version` |
 | `[compute.<c>]` | `kind` (`gcp-adc`\|`env`\|`command`), its parameters, `fix_hint` |
-| `[projects."owner/repo"]` | `verify`, `branch_prefixes`, `policy.*`, `databases.<name>` (`engine`, `version`, `database`, `volume`, `attach`, `mode`, `env`, `node`) |
+| `[projects."owner/repo"]` | `verify`, `branch_prefixes`, `policy.*`, `databases.<name>` (`engine`, `version`, `database`, `volume`, `attach`, `mode`, `env`, `node`, `profile`) |
 
 Every policy value resolves in this order: environment variable `DELEGA_<KEY>` → profile → project →
 global `[policy]` → built-in default.
@@ -107,7 +107,12 @@ database = "app"
 # volume = "db-api-main"   # default db-<repo>-<name>
 # attach = "always"        # every kindling job gets it; default: only with --db main
 # env = { DATABASE_URL = "{url}" }   # default per engine: PG*, MYSQL_*, REDIS_URL, MONGODB_URI, SQLITE_PATH
+# profile = "work"         # only jobs of this account get a copy; default: the profile whose repo_match takes the repo
 ```
+
+Several accounts can share one kindling host: one node per account (same `ssh`, its own `token_command`
+and `golden` pattern). Volumes and goldens belong to the host; a database only goes to jobs of the account
+its project belongs to.
 
 1. `delega golden build` bakes the repo's golden with those engines and `delega-db` (and the rules bundle).
 2. `delega db volume create main --from-host-cmd "pg_dump -Fc …"` (or `--from-host <file on the host>`;

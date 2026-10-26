@@ -12,6 +12,8 @@ versioning: [SemVer](https://semver.org/).
   refresh keeps a snapshot); each job restores it inside its own VM from a frozen read-only seed sandbox,
   or clones a data golden with the databases loaded and frozen (`delega golden db`, ~1 s instead of
   ~30 s for 85 MB). `delega-db` (`src/delega/data/dbctl.sh`) installs, loads, starts and checks the engines.
+- Several accounts on one kindling host: one node per account (own token and golden names); `kindling.json`
+  is keyed by host; a database only reaches jobs of its project's profile (`databases.<name>.profile`).
 - `delega golden build|db|ls|rm` and `delega sandbox up|exec|shell|env|freeze|thaw|save|rm|ls` on kindling.
 - Workers get `context.md` in their system prompt (job id, node, VM, golden, profile, account, caps, budget,
   branch, databases and the rules for real data) and `DELEGA_JOB_ID|NODE|PROFILE|BRANCH` in their environment.

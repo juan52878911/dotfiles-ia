@@ -126,7 +126,7 @@ engine = "redis"
         self.assertNotIn(self.dump, manifest)          # where the dump came from is not recorded
         self.assertIn(sha[:12], out)
         st = json.load(open(os.path.join(self.state, "kindling.json")))
-        self.assertEqual(st["volumes"]["vm/db-api-main"]["sha256"], sha)
+        self.assertEqual(st["volumes"]["khost/db-api-main"]["sha256"], sha)
         ev = [f for e, f in self.events if e == "db_volume"]
         self.assertEqual(ev[0]["volume"], "db-api-main")
         self.assertEqual(ev[0]["action"], "create")
@@ -252,6 +252,17 @@ engine = "redis"
         rc, out, err = self.run_cli([self.repo, self.brief, "--db", "nope", "--node", "vm"])
         self.assertEqual(rc, 2, out + err)
         self.assertIn("nope", err)
+
+    def test_db_of_another_account_refused(self):
+        self.make_volume()
+        with open(self.cfg_path, "a") as f:
+            f.write('\n[profiles.other]\nowner = "self"\nlauncher = ["claude"]\n')
+        rc, out, err = self.run_cli([self.repo, self.brief, "--db", "main", "--node", "vm", "--profile", "other"])
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("belongs to profile 'work'", err)
+        self.assertNotIn("run -name delega-2", self.kling_log())     # no job VM (the loader made the volume)
+        rc, out, err = self.cli("sandbox", ["--node", "vm", "--profile", "other", "up", "x", self.repo, "--db", "main"])
+        self.assertEqual(rc, 5, out + err)
 
     def test_failed_db_start_destroys_vm(self):
         self.make_volume()

@@ -84,6 +84,9 @@ def main(argv):
             dbs = databases.select(cfg, project, a.db or ["all"])
             if not dbs:
                 raise databases.DbError(t("db.err.none", project=project or "-"))
+            databases.check_profile(cfg, repo, profile["name"], dbs)
+            if profile["name"] not in node["profiles"]:
+                raise databases.DbError(t("launch.err.node_profile", node=node["name"], profile=profile["name"]))
             g = a.golden or kindling.golden(node, remote.repo_name(repo))
             print(t("golden.baking", golden=databases.data_golden(g), dbs=", ".join(s["name"] for s in dbs)))
             t0 = time.time()
@@ -102,7 +105,7 @@ def main(argv):
                 raise databases.DbError(r.stderr.strip())
             with audit.locked(databases.state_path(cfg) + ".lock"):
                 st = databases.load_state(cfg)
-                st["goldens"].pop(f"{node['name']}/{a.name}", None)
+                st["goldens"].pop(f"{databases.hkey(node)}/{a.name}", None)
                 databases.save_state(cfg, st)
             audit.record(cfg, "golden_rm", node=node["name"], golden=a.name)
             return 0
@@ -143,7 +146,7 @@ def _ls(cfg, node):
     st = databases.load_state(cfg)
     for i, line in enumerate(r.stdout.rstrip().splitlines()):
         name = line.split()[0] if line.split() else ""
-        rec = st["goldens"].get(f"{node['name']}/{name}")
+        rec = st["goldens"].get(f"{databases.hkey(node)}/{name}")
         note = ""
         if i == 0:
             note = t("golden.ls_note")
@@ -159,11 +162,11 @@ def _ls(cfg, node):
 
 
 def _stale(st, node, rec):
-    base = st["goldens"].get(f"{node['name']}/{rec.get('base')}") or {}
+    base = st["goldens"].get(f"{databases.hkey(node)}/{rec.get('base')}") or {}
     if base.get("built", 0) > rec.get("built", 0):
         return True
     for n, sha in (rec.get("dbs") or {}).items():
-        v = st["volumes"].get(f"{node['name']}/{(rec.get('volumes') or {}).get(n)}") or {}
+        v = st["volumes"].get(f"{databases.hkey(node)}/{(rec.get('volumes') or {}).get(n)}") or {}
         if v.get("sha256") and v["sha256"] != sha:
             return True
     return False

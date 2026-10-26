@@ -38,7 +38,8 @@ commands) and is reached through `delega <command>` (`src/delega/__main__.py`).
 - **Database** = `[projects."owner/repo".databases.<name>]`: `engine` (postgres, mariadb, mysql, redis,
   mongo, sqlite), `version`, `database`, `volume` (default `db-<repo>-<name>`), `attach = "always"|"ask"`,
   `mode = "auto"|"golden"|"volume"`, `env = {VAR = "{url}"}` ({host} {port} {user} {password} {database}
-  {url} {path}), `node`. Only on kindling nodes (`--db` elsewhere is refused). The dump lives in a kindling
+  {url} {path}), `node`, `profile` (the account whose jobs may get it; default: the profile whose `repo_match`
+  takes the repo — any other profile is refused in run, sandbox and golden db). Only on kindling nodes (`--db` elsewhere is refused). The dump lives in a kindling
   **volume** (`dump.<ext>.part-*` + `MANIFEST`, written once by `delega db volume create|refresh`, never
   mounted read-write after); a **seed sandbox** `delega-seed-<volume>` mounts it read-only and sleeps
   frozen; jobs copy the parts VM to VM through the host and `delega-db` (`src/delega/data/dbctl.sh`, run
@@ -79,8 +80,9 @@ read legacy `sesiones.tsv`: `session_id\thost\twt\tbranch`), `audit.jsonl` (appe
 `{ts, event, job, profile, account, node, branch, base, project, owner, cost_usd, ...}` with
 events `launch`, `end`, `resume`, `handoff`, `integrate`, `refused`, `scan`, `db_volume`, `golden_build`,
 `golden_db`, `golden_rm`, `sandbox_up|freeze|thaw|rm|save`; kindling launches carry `vm`, `golden`,
-`dbs = [{name, engine, volume, sha, mode, check}]`), `kindling.json` (what delega made on each kindling host:
-`volumes` {node/volume: sha256, bytes, format, engine, updated}, `goldens` {node/name: built, base, dbs},
+`dbs = [{name, engine, volume, sha, mode, check}]`), `kindling.json` (what delega made on each kindling host, keyed by its ssh alias whichever node — account —
+reached it; records keyed by node name are migrated on read:
+`volumes` {host/volume: sha256, bytes, format, engine, updated}, `goldens` {node/name: built, base, dbs},
 `sandboxes`), `limits.tsv` (quota
 history; legacy `limite.tsv`), `queue.jsonl`, `.select.lock/` (node selection lock dir).
 

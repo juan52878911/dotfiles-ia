@@ -46,6 +46,7 @@
  "db.err.format": "format '{fmt}' is not a {engine} dump format (known: {known})",
  "db.err.no_kindling": "profile '{profile}' has no kindling node: the databases only run there",
  "db.err.none": "project {project} declares no databases ([projects.\"…\".databases.<name>])",
+ "db.err.profile": "database '{name}' belongs to profile '{owner}': a job of profile '{profile}' cannot get a copy (set profile = \"…\" in the declaration if that is intended)",
  "db.err.source_rc": "the dump command failed (rc={rc})",
  "db.err.unknown": "project {project} has no database '{name}' (declared: {known})",
  "db.err.up": "database {name} did not come up in the VM",

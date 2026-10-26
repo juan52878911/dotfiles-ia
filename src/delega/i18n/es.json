@@ -46,6 +46,7 @@
  "db.err.format": "'{fmt}' no es un formato de volcado de {engine} (conocidos: {known})",
  "db.err.no_kindling": "el perfil '{profile}' no tiene nodo kindling: las bases solo corren allí",
  "db.err.none": "el proyecto {project} no declara bases de datos ([projects.\"…\".databases.<nombre>])",
+ "db.err.profile": "la base '{name}' es del perfil '{owner}': un trabajo del perfil '{profile}' no puede recibir una copia (pon profile = \"…\" en la declaración si es a propósito)",
  "db.err.source_rc": "falló el comando del volcado (rc={rc})",
  "db.err.unknown": "el proyecto {project} no tiene la base '{name}' (declaradas: {known})",
  "db.err.up": "la base {name} no arrancó en la VM",
