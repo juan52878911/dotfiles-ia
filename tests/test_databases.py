@@ -178,7 +178,7 @@ engine = "redis"
         ctx = open(os.path.join(job, "context.md")).read()
         self.assertIn("postgresql://delega:delega@127.0.0.1:5432/app", ctx)
         self.assertIn("Never copy rows", ctx)
-        self.assertIn(os.path.basename(job)[:21], ctx)
+        self.assertIn("-".join(os.path.basename(job).split("-")[:3]), ctx)  # job id, whatever the pid length
         self.assertEqual(self.vol_digest(), before)
         meta = util.read_meta(job)
         self.assertEqual(meta["GOLDEN"], "claude-api")
