@@ -1,7 +1,7 @@
 """launch (`delega run`): start a worker on this machine or on a node, wait for it, bring the work back.
 
-Order of checks (nothing is spent before all of them pass): profile/project → permission mode →
-daily budget → brief lint → zones → forbidden terms → resume guard + node affinity → node
+Order of checks (nothing is spent before all of them pass): profile/project → role → permission mode →
+daily budget → brief lint (sections + lint.py rules) → zones → forbidden terms → resume guard + node affinity → node
 selection → local limit → identity → compute → version → run → collect → scan → summary.
 Exit codes: 2 invalid input/refused (lint, zones, mode, resume), 3 config, 4 wrong account,
 5 no capacity or node unavailable, 8 over budget, 9 forbidden terms; otherwise the worker's rc.
@@ -17,12 +17,12 @@ import sys
 import time
 
 from . import config as _config
-from . import context, databases, jobs, kindling, nodes, remote, util
+from . import context, databases, jobs, kindling, lint, nod, nodes, remote, util
 from .i18n import t
 
 REFUSED_RC = 2
 COPY_BACK = ["summary.json", "result.json", "results.jsonl", "state.json", "progress.log", "notices.jsonl",
-             "events.jsonl", "stderr.log", "inbox.jsonl", "rc"]
+             "events.jsonl", "stderr.log", "inbox.jsonl", "rc", "nod.jsonl"]
 
 
 class Refused(Exception):
@@ -67,17 +67,17 @@ def _audit(cfg, event, **fields):
 
 
 # ── brief: lint and zones ───────────────────────────────────────────────────
-LINT_PATTERNS = {   # English and Spanish wording; the same checks whatever the locale
-    "done": r"done when|definition of done|acceptance|success criteri|terminad|criterio|hecho cuando|aceptaci",
-    "cap": r"\bcap\b|\bbudget\b|at most|no more than|\bmax(imum)?\b|\btope\b|m[aá]ximo|presupuesto|no m[aá]s de",
-    "report": r"report|informe",
-}
-
-
 def lint_brief(text, locale="en", require=None):
     """Sections the brief lacks: a subset of ["done", "cap", "report"] (headings in English or Spanish)."""
-    require = require or ["done", "cap", "report"]
-    return [k for k in require if not re.search(LINT_PATTERNS[k], text, re.I)]
+    return lint.sections(text, require)
+
+
+def role_settings(cfg, profile, role):
+    """[roles.<role>] merged with the profile's roles.<role>; None if the role is not configured."""
+    base, own = (cfg.raw.get("roles") or {}).get(role), (profile.get("roles") or {}).get(role)
+    if base is None and own is None:
+        return None
+    return dict(base or {}, **(own or {}))
 
 
 def zones_from_brief(text):
@@ -293,7 +293,7 @@ def print_summary(job_dir, rc):
 RC_NOT_STARTED, RC_BROKER_LOST = 98, 97
 
 
-def wait_for_rc(cfg, node, chan, poll_s):
+def wait_for_rc(cfg, node, chan, poll_s, on_poll=None):
     """rc of the remote job. Never waits forever: if the broker shows no sign of life (no lease
     nor state file) within DELEGA_START_TIMEOUT_S → 98 (run.sh did not start); if its lease went
     stale without an rc (broker killed, node rebooted) → 97. Transient ssh failures are retried."""
@@ -302,6 +302,8 @@ def wait_for_rc(cfg, node, chan, poll_s):
     stale = float(cfg.policy("lease.stale_s"))
     t0 = time.time()
     while True:
+        if on_poll:
+            on_poll()
         if remote.ssh(node, f"test -f {q}/rc", timeout=30).returncode == 0:
             r = remote.ssh(node, f"cat {q}/rc", timeout=30)
             try:
@@ -338,13 +340,15 @@ def wait_and_finish(cfg, job_dir, poll_s=None):
 def _finish(cfg, job_dir, meta, node, poll_s):
     chan = meta["CHANNEL"]
     poll_s = float(os.environ.get("DELEGA_WAIT_POLL_S", 20)) if poll_s is None else poll_s
-    rc = wait_for_rc(cfg, node, chan, poll_s)
+    # the node cannot see this machine's Nod collector: its envelopes are pulled and forwarded from here
+    rc = wait_for_rc(cfg, node, chan, poll_s, on_poll=lambda: nod.pull_and_forward(cfg, job_dir, meta))
     for f in COPY_BACK:
         remote.scp_from(node, f"{chan}/{f}", job_dir + "/")
+    nod.forward(job_dir, meta, nod.job_terms(job_dir))
     util.add_meta(job_dir, END=int(time.time()))
     profile = cfg.profile(meta.get("PROFILE") or None)
-    summ = util.read_json(util.channel_file(job_dir, "summary.json"), {}) or util.read_json(
-        util.channel_file(job_dir, "result.json"), {}) or {}
+    summ = jobs.ensure_summary(job_dir, rc, None if rc not in (RC_NOT_STARTED, RC_BROKER_LOST)
+                               else {RC_NOT_STARTED: "not_started", RC_BROKER_LOST: "broker_lost"}[rc])
     sid = summ.get("session_id") or ""
     branch, repo_dir = meta.get("BRANCH", ""), meta.get("REPO_DIR", "")
     if sid and not meta.get("RESUMED"):
@@ -406,7 +410,12 @@ def build_parser():
     ap.add_argument("repo", help="git repository (or a folder inside it) the worker starts from")
     ap.add_argument("brief", help="file with the brief (see skills/delega/templates)")
     ap.add_argument("--node", default="auto", metavar="auto|local|NAME",
-                    help="where to run: auto picks the node with most free RAM (falls back to local)")
+                    help="where to run: auto tries the profile's auto_order (default: kindling, then host nodes by "
+                    "free RAM, then local)")
+    ap.add_argument("--heavy", action="store_true",
+                    help="heavy job (E2E with containers, benchmarks): --node auto skips kindling nodes")
+    ap.add_argument("--rebuild-golden", action="store_true",
+                    help="kindling: rebuild the repo golden first if its lockfile fingerprint differs from HEAD's")
     ap.add_argument("--profile", help="profile (account + policy); default: from repo_match, else the default profile")
     ap.add_argument("--requires", action="append", default=[], metavar="COMPUTE",
                     help="compute provider the job needs, as named in [compute.*] (repeatable)")
@@ -415,7 +424,9 @@ def build_parser():
                     help="resume even if the session has been idle longer than policy resume_max_min")
     ap.add_argument("--mode", help="permission mode for the worker (default: policy permission_mode.default; "
                     "modes in permission_mode.deny are refused)")
-    ap.add_argument("--model", help="model (default: the profile's model)")
+    ap.add_argument("--model", help="model (default: the role's model, else the profile's)")
+    ap.add_argument("--role", help="worker (default), reviewer, summarizer…: model and cost cap from [roles.<role>]; "
+                    "a role with require_cap_usd is refused without --cap-usd")
     ap.add_argument("--worktree", metavar="NAME", help="local runs only: passed to claude --worktree")
     ap.add_argument("--branch", help="branch the worker commits to (default delega/<id>); an existing branch "
                     "on the node is continued (handoff)")
@@ -432,7 +443,8 @@ def build_parser():
     ap.add_argument("--db-mode", choices=("auto", "golden", "volume"),
                     help="golden: clone the data golden (databases already loaded); volume: restore from the "
                     "dump volume; auto (default): golden while it is fresh")
-    ap.add_argument("--no-lint", action="store_true", help="skip the brief checks (done-when, cap, report)")
+    ap.add_argument("--no-lint", action="store_true",
+                    help="skip the brief checks (done-when, cap, report; branch, live run, text)")
     ap.add_argument("--over-budget", action="store_true", help="launch even if the daily budget is spent")
     ap.add_argument("--allow-version-skew", action="store_true",
                     help="allow a node whose claude MAJOR.MINOR differs from this machine's")
@@ -474,6 +486,11 @@ class Launch:
             return self.fail(Refused(3, str(e)))
         except remote.RemoteError as e:
             return self.fail(Refused(5, str(e)))
+        except Exception as e:   # a crash before the worker starts is still a refused launch for the audit
+            if not self.started:
+                _audit(self.cfg, "refused", job=jobs.job_id(self.job_dir) if self.job_dir else None,
+                       reason=f"{type(e).__name__}: {e}"[:200], rc=1)
+            raise
         finally:
             # A launch that dies before the worker starts must not look alive for hours.
             if self.job_dir and not self.started and os.path.isdir(self.job_dir):
@@ -498,6 +515,15 @@ class Launch:
         profile = cfg.profile(pname)
         project = cfg.project_for(repo_dir)
         pol = lambda k: cfg.policy(k, profile, project)
+        role = role_settings(cfg, profile, a.role or "worker")
+        if a.role and role is None:
+            raise Refused(REFUSED_RC, t("launch.err.role_unknown", role=a.role))
+        if role:
+            if role.get("require_cap_usd") and a.cap_usd is None:
+                raise Refused(REFUSED_RC, t("launch.err.role_cap", role=a.role or "worker"))
+            a.model = a.model or role.get("model")
+            if a.cap_usd is None and role.get("cap_usd") is not None:
+                a.cap_usd = float(role["cap_usd"])
         if a.branch and project:
             prefixes = cfg.projects[project].get("branch_prefixes")
             if prefixes and not any(a.branch.startswith(p) for p in prefixes):
@@ -517,6 +543,15 @@ class Launch:
             missing = lint_brief(brief_text, cfg.locale, pol("lint.require"))
             if missing:
                 raise Refused(REFUSED_RC, t("launch.err.lint", missing="; ".join(t("launch.lint." + m) for m in missing)))
+            found = lint.check_for(brief_text, cfg, profile, project, a.requires)
+            for level, code, params in found:
+                print(t("launch.lint_rule." + level, msg=t("lint." + code, **params)), file=sys.stderr)
+            if found:
+                _audit(cfg, "lint", profile=profile["name"], project=project,
+                       codes=[f"{lv}:{c}" for lv, c, _ in found])
+            errors = [c for lv, c, _ in found if lv == "error"]
+            if errors:
+                raise Refused(REFUSED_RC, t("launch.err.lint_rules", codes=", ".join(errors)))
         # 5. zones
         repo = remote.repo_name(repo_dir) if _is_git(repo_dir) else os.path.basename(repo_dir)
         zone = a.zone or zones_from_brief(brief_text)
@@ -572,7 +607,7 @@ class Launch:
         util.add_meta(self.job_dir, OWNER=owner, PROFILE=profile["name"], PROJECT=project or "", REPO=repo,
                       REPO_DIR=repo_dir, ZONE=",".join(zone), BASE=base, BRANCH=a.branch or "")
         # 8. node selection
-        node_name = self._choose_node(profile, node_opt, a.requires, prev)
+        node_name = self._choose_node(profile, node_opt, a.requires, prev, repo)
         # 9-11. identity, compute, version
         if node_name == "local":
             if not a.resume and jobs.live_counts(cfg, exclude=self.job_dir).get("local", 0) >= pol("max_local_jobs"):
@@ -613,7 +648,7 @@ class Launch:
         return self._run_remote(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude, prev)
 
     # -- node choice
-    def _choose_node(self, profile, node_opt, requires, prev):
+    def _choose_node(self, profile, node_opt, requires, prev, repo=None):
         cfg = self.cfg
         if node_opt == "local":
             name = "local"
@@ -623,7 +658,7 @@ class Launch:
             def record(choice):
                 util.add_meta(self.job_dir, NODE=choice)
             name = nodes.select(cfg, profile, requires, lambda: jobs.live_counts(cfg, exclude=self.job_dir),
-                                on_choice=record)
+                                on_choice=record, job={"repo": repo, "heavy": self.args.heavy})
             if name == "local":
                 print(t("launch.local_fallback"))
         util.add_meta(self.job_dir, NODE=name)
@@ -652,8 +687,7 @@ class Launch:
         self.started = True
         rc = subprocess.run(argv, cwd=repo_dir, env=env, stdin=subprocess.DEVNULL).returncode
         util.add_meta(self.job_dir, END=int(time.time()))
-        summ = util.read_json(util.channel_file(chan, "summary.json"), {}) or util.read_json(
-            util.channel_file(chan, "result.json"), {}) or {}
+        summ = jobs.ensure_summary(self.job_dir, rc)
         if summ.get("session_id") and not a.resume:
             record_session(cfg, summ["session_id"], "local", "", a.branch or "", profile["name"], job_id)
         _audit(cfg, "end", job=job_id, profile=profile["name"], account=account, node="local",
@@ -725,6 +759,11 @@ class Launch:
             raise Refused(REFUSED_RC, t("launch.err.not_git", path=repo_dir))
         token = kindling.read_token(node)
         vm, golden = kindling.vm_name(job_id), kindling.golden(node, repo)
+        try:
+            from . import golden as _golden
+            _golden.ensure_fresh(cfg, profile, node, project, repo_dir, golden, rebuild=a.rebuild_golden)
+        except databases.DbError as e:
+            raise Refused(5, str(e))
         image, db_mode, why = golden, None, ""
         if self.dbs:
             try:

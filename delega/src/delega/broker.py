@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from . import util
+from . import nod, util
 from .i18n import t
 from .util import append, channel_file, now, read_json, short, write_json
 
@@ -117,8 +117,11 @@ class Channel:
     def red(self, text):
         return redact(text, forbidden_terms(self.dir))
 
-    def event(self, tipo, text):
-        append(self.p("progress.log"), f"{now()}\t{tipo}\t{short(self.red(str(text)), 400)}")
+    def event(self, tipo, text, **nod_data):
+        """One progress.log line; NOTICE:*, ALERT:* and RESULT also go to the Nod bus (nod.jsonl)."""
+        terms = forbidden_terms(self.dir)
+        append(self.p("progress.log"), f"{now()}\t{tipo}\t{short(redact(str(text), terms), 400)}")
+        nod.from_progress(self.dir, tipo, str(text), nod_data, terms)
 
 
 def protocol(notify, caps, grace_s, loc=None):
@@ -373,7 +376,9 @@ def cmd_run(chdir, brief, command):
                 est["session_id"] = e.get("session_id") or est["session_id"]
                 if e.get("total_cost_usd") is not None:
                     est["cost_usd"] = e["total_cost_usd"]
-                ch.event("RESULT", shown.get("result", "") if not e.get("is_error") else f"error: {shown.get('result')}")
+                ch.event("RESULT", shown.get("result", "") if not e.get("is_error") else f"error: {shown.get('result')}",
+                         is_error=bool(e.get("is_error")), cost_usd=e.get("total_cost_usd"),
+                         session_id=est["session_id"])
                 if (est["cost_usd"] or 0) >= max_usd and not est["cap"]:
                     # A result was just delivered: ask nothing more, close here.
                     est["cap"], est["cap_ts"] = f"{est['cost_usd']:.2f} USD >= {max_usd:g}", None
@@ -447,6 +452,8 @@ def cmd_notify(chdir, kind, text):
     text = ch.red(text)
     append(ch.p("notices.jsonl"), json.dumps({"ts": now(), "kind": kind, "text": text}, ensure_ascii=False))
     ch.event(f"NOTICE:{kind}", text)
+    if kind in ("question", "blocker"):
+        nod.decision_request(ch.dir, kind, text, _env_num("DELEGA_ANSWER_WAIT_S", "900"), forbidden_terms(ch.dir))
     print(t("broker.notice_sent"))
     return 0
 

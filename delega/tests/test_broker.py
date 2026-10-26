@@ -1,3 +1,4 @@
+import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
 import contextlib
 import io
 import json

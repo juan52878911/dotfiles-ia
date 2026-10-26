@@ -1,3 +1,4 @@
+import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
 import platform
 import contextlib
 import io
@@ -85,7 +86,9 @@ class ProbeTests(LaunchCase):
         self.assertIn("RAM", nodes.probe(cfg, "box", "work")["reason"])
         cfg = self.cfg()
         cfg.policy_base["node"]["max_load_pct"] = -1
-        self.assertIn("load", nodes.probe(cfg, "box", "work")["reason"])
+        with mock.patch.dict(os.environ):  # the suite pins the limit by env so the host's load never decides
+            os.environ.pop("DELEGA_NODE_MAX_LOAD_PCT", None)
+            self.assertIn("load", nodes.probe(cfg, "box", "work")["reason"])
 
     def test_required_compute_failure_names_the_fix(self):
         r = nodes.probe(self.cfg(), "box", "work", ["broken"])
@@ -148,7 +151,7 @@ class ProbeTests(LaunchCase):
 
 
 def fake_probe(table):
-    def probe(cfg, node, profile, requires=()):
+    def probe(cfg, node, profile, requires=(), watch=()):
         name = node["name"] if isinstance(node, dict) else node
         return dict(table[name], node=name)
     return probe

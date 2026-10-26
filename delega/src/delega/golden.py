@@ -7,8 +7,14 @@
   delega golden db [repo] [--db NAME]… [--node N]
       the data golden `<golden>-db`: the golden with the project's databases restored and running, frozen.
   delega golden ls [--node N] · delega golden rm <name> --yes
+
+A repo golden carries a fingerprint: the sha256 of the lockfiles tracked at the HEAD it was baked from
+(`lockfp` in kindling.json, next to `built`). A kindling launch compares it with the HEAD it sends: on a
+mismatch it warns and, with `--rebuild-golden` or policy `golden.auto_rebuild`, rebuilds before cloning.
 """
 import argparse
+import fnmatch
+import hashlib
 import os
 import subprocess
 import sys
@@ -19,6 +25,70 @@ from .i18n import t
 
 ROOT = os.path.dirname(os.path.dirname(util.PKG_DIR))
 GOLDEN_SH = os.path.join(ROOT, "nodes", "kindling", "golden.sh")
+LOCKFILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "poetry.lock",
+             "uv.lock", "Pipfile.lock", "requirements*.txt", "go.sum", "Cargo.lock", "Gemfile.lock", "composer.lock",
+             "gradle.lockfile", "mix.lock", "pubspec.lock")
+
+
+def lock_fingerprint(repo_dir, rev="HEAD"):
+    """sha256 over (path, blob) of every lockfile tracked at `rev`, anywhere in the tree; "" if there is none
+    (or `rev` cannot be read). The blob ids come from git, so what counts is the commit, not the work tree."""
+    r = subprocess.run(["git", "-C", repo_dir, "ls-tree", "-r", rev], capture_output=True, text=True)
+    if r.returncode != 0:
+        return ""
+    h, n = hashlib.sha256(), 0
+    for line in sorted(r.stdout.splitlines()):
+        meta, _, path = line.partition("\t")
+        if any(fnmatch.fnmatch(os.path.basename(path), pat) for pat in LOCKFILES):
+            h.update(f"{path}\0{meta.split()[-1]}\n".encode())
+            n += 1
+    return h.hexdigest() if n else ""
+
+
+def _age(ts):
+    s = max(0, int(time.time() - (ts or 0)))
+    return f"{s // 86400}d" if s >= 86400 else f"{s // 3600}h" if s >= 3600 else f"{s // 60}m"
+
+
+def _yes(v):
+    return v is True or str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def run_script(repo, name, env):
+    """golden.sh (separate so tests can stand in for the real bake). Returns its exit code."""
+    return subprocess.run(["bash", GOLDEN_SH, repo, name], env={**os.environ, **env}).returncode
+
+
+def ensure_fresh(cfg, profile, node, project, repo_dir, name, rebuild=False, say=print):
+    """Compare the golden's lockfile fingerprint with HEAD's. Returns "fresh" | "unknown" (not built by
+    delega, or before fingerprints) | "stale" (warned, not rebuilt) | "rebuilt". Raises DbError if the
+    rebuild fails. `rebuild` = --rebuild-golden; policy golden.auto_rebuild does the same."""
+    rec = databases.load_state(cfg)["goldens"].get(f"{databases.hkey(node)}/{name}")
+    want = lock_fingerprint(repo_dir)
+    have = (rec or {}).get("lockfp")
+    if rec and have is not None and have == want:
+        return "fresh"
+    rebuild = rebuild or _yes(cfg.policy("golden.auto_rebuild", profile, project, default=False))
+    if have is None and not rebuild:
+        say(t("kindling.golden_unknown", golden=name, fix=f"delega golden build --node {node['name']}"))
+        return "unknown"
+    if have is not None:
+        say(t("kindling.golden_stale", golden=name, have=(have or "-")[:12], want=(want or "-")[:12],
+              fix=f"delega golden build --node {node['name']}"))
+    audit.record(cfg, "golden_stale", node=node["name"], golden=name, have=have, want=want, rebuild=bool(rebuild))
+    if not rebuild:
+        return "stale"
+    # one rebuild per golden: a launch that waited here finds it fresh and goes on
+    with audit.locked(os.path.join(cfg.state_dir, f".golden-{databases.hkey(node)}-{name}.lock")):
+        rec = databases.load_state(cfg)["goldens"].get(f"{databases.hkey(node)}/{name}")
+        if rec and rec.get("lockfp") == want:
+            return "fresh"
+        say(t("kindling.golden_rebuilding", golden=name))
+        rc = _build(cfg, profile, node, project, repo_dir,
+                    argparse.Namespace(name=name, engines=None, dry_run=False), say=say)
+    if rc != 0:
+        raise databases.DbError(t("kindling.golden_rebuild_failed", golden=name, rc=rc))
+    return "rebuilt"
 
 
 def _node(cfg, profile, name):
@@ -115,7 +185,7 @@ def main(argv):
         return 5
 
 
-def _build(cfg, profile, node, project, repo, a):
+def _build(cfg, profile, node, project, repo, a, say=print):
     if not os.path.exists(GOLDEN_SH):
         raise databases.DbError(t("golden.err.no_script", path=GOLDEN_SH))
     name = a.name or kindling.golden(node, remote.repo_name(repo))
@@ -123,19 +193,21 @@ def _build(cfg, profile, node, project, repo, a):
     if not env["CLAUDE_VERSION"]:
         raise databases.DbError(t("golden.err.claude_version"))
     shown = " ".join(f"{k}={v}" for k, v in env.items() if v)
-    print(t("golden.building", name=name, node=node["name"], env=shown))
+    say(t("golden.building", name=name, node=node["name"], env=shown))
     if a.dry_run:
         return 0
     t0 = time.time()
-    rc = subprocess.run(["bash", GOLDEN_SH, repo, name], env={**os.environ, **env}).returncode
+    fp = lock_fingerprint(repo)
+    rc = run_script(repo, name, env)
     if rc != 0:
         return rc
     head = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     databases.note_golden(cfg, node, name, repo_head=head, engines=env["DB_ENGINES"], claude=env["CLAUDE_VERSION"],
-                          profile=profile["name"])
+                          profile=profile["name"], lockfp=fp)
     audit.record(cfg, "golden_build", node=node["name"], golden=name, profile=profile["name"], base=head,
-                 engines=env["DB_ENGINES"] or None, claude=env["CLAUDE_VERSION"], s=round(time.time() - t0, 1))
-    print(t("golden.built", name=name, s=int(time.time() - t0)))
+                 engines=env["DB_ENGINES"] or None, claude=env["CLAUDE_VERSION"], lockfp=fp,
+                 s=round(time.time() - t0, 1))
+    say(t("golden.built", name=name, s=int(time.time() - t0)))
     return 0
 
 
@@ -153,10 +225,13 @@ def _ls(cfg, node):
         elif rec:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(rec.get("built", 0)))
             if rec.get("dbs"):
-                note = t("golden.ls_db", when=when, base=rec.get("base"), dbs=", ".join(rec["dbs"]),
+                note = t("golden.ls_db", when=when, age=_age(rec.get("built")), base=rec.get("base"), dbs=", ".join(rec["dbs"]),
                          fresh=t("golden.fresh") if not _stale(st, node, rec) else t("golden.stale"))
             else:
-                note = t("golden.ls_plain", when=when, head=rec.get("repo_head", "?"), engines=rec.get("engines") or "-")
+                fp = rec.get("lockfp")
+                note = t("golden.ls_plain", when=when, age=_age(rec.get("built")), head=rec.get("repo_head", "?"),
+                         engines=rec.get("engines") or "-",
+                         fp=fp[:12] if fp else t("golden.no_locks") if fp == "" else t("golden.no_fp"))
         print(f"{line}   {note}".rstrip())
     return 0
 

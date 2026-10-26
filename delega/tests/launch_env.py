@@ -1,5 +1,6 @@
 """Shared fixture for the launch/nodes/jobs tests: a throw-away config, state dir, git repo, fake
 node home (tests/fakes/ssh and scp execute under it) and a fake `claude` launcher."""
+import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
 import contextlib
 import io
 import os
@@ -94,13 +95,15 @@ class LaunchCase(unittest.TestCase):
             "DELEGA_SSH": os.path.join(FAKES, "ssh"), "DELEGA_SCP": os.path.join(FAKES, "scp"),
             "DELEGA_BROKER_CMD": f"{sys.executable} {os.path.join(FAKES, 'stub_broker.py')}",
             "DELEGA_LOCALE": "en", "DELEGA_WAIT_POLL_S": "0.2", "DELEGA_WATCH_POLL_S": "0.1",
-            "DELEGA_OWNER": "tester", "DELEGA_NODE_MIN_DISK_GB": "0", "PYTHONPATH": os.path.join(ROOT, "src"),
+            "DELEGA_OWNER": "tester", "DELEGA_NODE_MIN_DISK_GB": "0",
+            "DELEGA_NODE_MAX_LOAD_PCT": "100000",  # never the host's real load
+            "PYTHONPATH": os.path.join(ROOT, "src"),
         }
         p = mock.patch.dict(os.environ, env)
         p.start()
         self.addCleanup(p.stop)
         for k in ("DELEGA_PROFILE", "FAKE_EMAIL", "FAKE_VERSION", "FAKE_VERSION_REMOTE", "STUB_SLEEP",
-                  "STUB_COMMIT_TEXT", "STUB_RC", "DELEGA_JOB_MAX_MIN"):
+                  "STUB_COMMIT_TEXT", "STUB_RC", "DELEGA_JOB_MAX_MIN", "STUB_NOD_QUESTION", "STUB_NO_SUMMARY"):
             os.environ.pop(k, None)
         self.events = []
         self.patch_collaborators()

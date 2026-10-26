@@ -148,11 +148,13 @@ def check_profile(cfg, prof, repo):
 
 
 def main(argv):
-    profile, repo, a = None, None, list(argv)
+    profile, repo, batch, a = None, None, None, list(argv)
     while a:
         x = a.pop(0)
         if x == "--profile" and a:
             profile = a.pop(0)
+        elif x == "--batch" and a and a[0].isdigit():
+            batch = int(a.pop(0))
         elif x in ("-h", "--help"):
             print(i18n.t("doctor.usage"))
             return 0
@@ -175,6 +177,9 @@ def main(argv):
             names = [cfg.profile_for(repo)]
         else:
             names = list(cfg.profiles)
+        if batch is not None:
+            from . import preflight
+            return max(preflight.batch(cfg, cfg.profile(n), batch, repo) for n in names)
         failed = sum(check_profile(cfg, cfg.profile(n), repo) for n in names)
     except config.ConfigError as e:
         print(e, file=sys.stderr)

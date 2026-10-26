@@ -81,6 +81,12 @@ def live_vms(node):
                if any(w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS) for w in line.split()))
 
 
+def has_golden(node, repo):
+    """Whether the host has this repo's golden (`kling template ls -q`); False if it does not answer."""
+    r = remote.ssh(remote.host_node(node), "kling template ls -q", timeout=30)
+    return r.returncode == 0 and golden(node, repo) in r.stdout.split()
+
+
 def probe(cfg, node, profile, requires=()):
     """Contract dict of nodes.probe for a kindling host: reachable, room for one more VM, no compute."""
     res = {"ok": False, "reason": "", "fix": "", "kind": "", "email": node.get("account") or "",

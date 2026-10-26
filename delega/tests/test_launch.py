@@ -1,3 +1,4 @@
+import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
 import json
 import os
 import re
@@ -343,7 +344,7 @@ class LocalRunTests(LaunchCase):
         text = launch.build_parser().format_help()
         for opt in ("--node", "--profile", "--requires", "--resume", "--force-resume", "--mode", "--model",
                     "--worktree", "--branch", "--owner", "--cap-min", "--cap-usd", "--cap-turns", "--zone",
-                    "--no-lint", "--over-budget", "--allow-version-skew"):
+                    "--no-lint", "--over-budget", "--allow-version-skew", "--role"):
             self.assertIn(opt, text)
         r = subprocess.run([sys.executable, "-m", "delega", "run", "--help"], capture_output=True, text=True,
                            env={**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")})

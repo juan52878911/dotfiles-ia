@@ -1,14 +1,15 @@
 """audit: append-only provenance log (<state_dir>/audit.jsonl) and its reader.
 
 Every event is one JSON line: {ts, event, job, profile, account, node, branch, base,
-project, owner, cost_usd, ...}. Events: launch, end, resume, handoff, integrate, refused."""
+project, owner, cost_usd, ...}. Events: launch, end, resume, handoff, integrate, refused, …
+launch, end and refused also go to the Nod bus (nod.from_audit: job.launch, job.end, job.alert kind=refused)."""
 import contextlib
 import fcntl
 import json
 import os
 import sys
 
-from . import config, i18n, util
+from . import config, i18n, nod, util
 
 FIELDS = ("job", "profile", "account", "node", "branch", "base", "project", "owner", "cost_usd")
 
@@ -45,7 +46,17 @@ def record(cfg, event, **fields):
                 fcntl.flock(f, fcntl.LOCK_UN)
     except OSError as e:
         print(i18n.t("audit.write_failed", err=e), file=sys.stderr)
+    if rec["event"] in nod.AUDIT_TYPES:
+        try:
+            nod.from_audit(cfg, {**rec, "owner": rec.get("owner") or _owner()})
+        except Exception as e:      # noqa: BLE001 — the bus is best effort, the audit line is what counts
+            print(i18n.t("nod.emit_failed", err=e), file=sys.stderr)
     return rec
+
+
+def _owner():
+    from . import jobs
+    return jobs.owner_label()
 
 
 def read(cfg):

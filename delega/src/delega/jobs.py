@@ -117,9 +117,57 @@ def live_counts(cfg, exclude=None):
     return out
 
 
-def close_job(job_dir, reason=None):
-    if not util.read_meta(job_dir).get("END"):
-        util.add_meta(job_dir, END=int(time.time()), **({"END_REASON": reason} if reason else {}))
+def close_job(job_dir, reason=None, cfg=None, rc=None):
+    """Mark the job ended and make sure it has a summary.json. With cfg, also audit `end` with its cost
+    (only for jobs that launched: a launch that failed was already audited as refused)."""
+    meta = util.read_meta(job_dir)
+    if meta.get("END"):
+        return
+    util.add_meta(job_dir, END=int(time.time()), **({"END_REASON": reason} if reason else {}))
+    summ = ensure_summary(job_dir, rc, reason)
+    if cfg is not None and meta.get("ACCOUNT") is not None and reason != "launch_failed":
+        from . import audit
+        audit.record(cfg, "end", job=job_id(job_dir), profile=meta.get("PROFILE") or None,
+                     node=meta.get("NODE"), branch=meta.get("BRANCH") or None, project=meta.get("PROJECT") or None,
+                     owner=meta.get("OWNER"), cost_usd=summ.get("cost_usd"), rc=summ.get("rc"), reason=reason)
+
+
+def ensure_summary(job_dir, rc=None, reason=None):
+    """summary.json of a job, written from state.json / result.json when the broker could not write it
+    (cap cut by a kill, start failure, broker lost, adopt): spend, audit and chrono need one per job.
+    The synthetic one carries `synthetic: <reason>`. Returns the summary."""
+    chan = util.read_meta(job_dir).get("CHANNEL") or job_dir
+    dirs = [job_dir] + ([chan] if chan.startswith("/") and chan != job_dir else [])
+    for d in dirs:
+        summ = util.read_json(util.channel_file(d, "summary.json"))
+        if summ:
+            if d != job_dir:
+                util.write_json(os.path.join(job_dir, "summary.json"), summ)
+            return summ
+    st, res = {}, {}
+    for d in dirs:
+        st = st or util.read_json(util.channel_file(d, "state.json"), {}) or {}
+        res = res or util.read_json(util.channel_file(d, "result.json"), {}) or {}
+    st = {_LEGACY_STATE.get(k, k): v for k, v in st.items()}
+    if rc is None:
+        try:
+            rc = int(slurp(util.channel_file(job_dir, "rc")).strip())
+        except (OSError, ValueError):
+            rc = st.get("rc")
+    start = st.get("start")
+    cost = st.get("cost_usd") if st.get("cost_usd") is not None else res.get("total_cost_usd")
+    summ = {"session_id": st.get("session_id") or res.get("session_id"), "rc": rc, "model": st.get("model"),
+            "duration_min": round((time.time() - start) / 60, 1) if isinstance(start, (int, float)) else None,
+            "messages": st.get("turns", res.get("num_turns")), "tools": st.get("tools"), "alerts": st.get("alerts"),
+            "cost_usd": cost, "cap": st.get("cap"),
+            "start": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start)) if isinstance(start, (int, float))
+            else None, "end": util.now(), "synthetic": reason or "no_summary"}
+    util.write_json(os.path.join(job_dir, "summary.json"), summ)
+    return summ
+
+
+_LEGACY_STATE = {"coste_usd": "cost_usd", "turnos": "turns", "herramientas": "tools", "alertas": "alerts",
+                 "modelo": "model", "inicio": "start", "tope": "cap"}
 
 
 def reconcile(cfg):
@@ -134,7 +182,7 @@ def reconcile(cfg):
             if _is_remote(meta) and not _pid_alive(_read_pid(os.path.join(d, "waiter.pid"))):
                 out.append((d, "orphan"))
             continue
-        close_job(d, "dead")
+        close_job(d, "dead", cfg)
         out.append((d, "closed"))
     return out
 
@@ -293,12 +341,24 @@ class _Watcher:
         self.seen = set()
         self.done_ = False
         self.consumed = 0
+        self.pulled = 0.0
+
+    def _pull_nod(self):
+        """A remote job without its waiter: forward its Nod envelopes from here (the waiter does it otherwise)."""
+        meta = util.read_meta(self.dir)
+        if meta.get("END") or not _is_remote(meta) or _pid_alive(_read_pid(os.path.join(self.dir, "waiter.pid"))):
+            return
+        if time.time() - self.pulled >= float(os.environ.get("DELEGA_NOD_PULL_S", 10)):
+            self.pulled = time.time()
+            from . import nod
+            nod.pull_and_forward(self.cfg, self.dir, meta)
 
     def emit(self, typ, text):
         self.out(f"[{self.label}] {typ} {util.short(text, 200)}")
 
     def poll(self):
         """Process new progress.log lines. Returns True when the job is over."""
+        self._pull_nod()
         text = read_channel(self.cfg, self.dir, "progress.log") or ""
         lines = text.splitlines()
         for l in lines[self.consumed:]:
@@ -342,8 +402,12 @@ def main_watch(argv):
     ap.add_argument("job", nargs="*")
     ap.add_argument("--all", action="store_true", help="every orchestrator's jobs, not only yours")
     ap.add_argument("--from-start", action="store_true", help="include events older than the last minute")
+    ap.add_argument("--bus", action="store_true", help="one line per delega event of the Nod bus (events.jsonl) "
+                    "for your jobs, all of them, until interrupted: a single Monitor instead of one per job")
     args = ap.parse_args(argv)
     cfg = _config.load()
+    if args.bus:
+        return watch_bus(cfg, args.all, args.from_start)
     if args.job:
         try:
             dirs = [resolve(cfg, j) for j in args.job]
@@ -356,6 +420,23 @@ def main_watch(argv):
             print(t("jobs.watch.none", owner=owner_label()))
             return 0
     return watch(cfg, dirs, args.from_start)
+
+
+def _bus_remote_jobs(cfg, everything):
+    """Live remote jobs in scope whose waiter is gone: watch --bus pulls their envelopes itself."""
+    out = []
+    for d in _scope(cfg, everything):
+        meta = util.read_meta(d)
+        if not meta.get("END") and _is_remote(meta) and not _pid_alive(_read_pid(os.path.join(d, "waiter.pid"))):
+            out.append(d)
+    return out
+
+
+def watch_bus(cfg, everything=False, from_start=False, out=None, poll_s=None, stop=None):
+    from . import nod
+    owner = None if everything else owner_label()
+    return nod.watch_bus(cfg, owner, from_start, out=out, poll_s=poll_s, stop=stop,
+                         remote_jobs=lambda: _bus_remote_jobs(cfg, everything))
 
 
 # ── adopt ───────────────────────────────────────────────────────────────────

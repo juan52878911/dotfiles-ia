@@ -1,4 +1,5 @@
 """kindling runner: one ephemeral microVM per job, driven through tests/fakes/kling-bin."""
+import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
 import os
 import subprocess
 import sys
@@ -11,7 +12,8 @@ from delega import util
 TOKEN = "tok-s3cret-123"
 
 
-class Kindling(LaunchCase):
+class KindlingCase(LaunchCase):
+    """A kindling node `vm` on the fake host, with golden claude-api one commit behind the repo."""
     def setUp(self):
         self.vmhome = None
         super().setUp()
@@ -51,6 +53,8 @@ account = "dev@example.com (token)"
         p = os.path.join(self.node_home, ".kling.log")
         return open(p).read() if os.path.exists(p) else ""
 
+
+class Kindling(KindlingCase):
     def test_job_runs_in_vm_and_branch_comes_back(self):
         os.environ["STUB_COMMIT_TEXT"] = "done in vm"
         rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k1"])

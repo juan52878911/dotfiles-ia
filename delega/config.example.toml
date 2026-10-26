@@ -20,6 +20,22 @@ quota.window_5h_pct = 70      # subscription windows: keep below these
 quota.weekly_pct = 90
 node.max_load_pct = 80
 node.min_disk_gb = 20
+# Brief lint (delega/src/delega/lint.py): "error" refuses the launch, "warn" prints, "off" skips.
+lint.branch = "error"         # a branch named in the brief must match branch_pattern / branch_prefixes
+lint.live = "warn"            # AI-provider run without --requires or the profile's env_file path
+lint.text = "warn"            # "original brief" not attached, absolute time without expiry rule, script without path
+# lint.live_keywords = ['\bvertex\b', '\ben vivo\b']   # regexes; default: common AI providers and "live run"
+
+# Model and cost cap per role (`delega run --role R`; without --role the worker role applies).
+# --model and --cap-usd win over these. A profile may override with [profiles.X.roles.R].
+[roles.worker]                # implement, tests
+model = "sonnet"
+[roles.reviewer]              # bounded read-only review / architect: one per epic
+model = "opus"                # or "claude-fable-5-1"
+require_cap_usd = true        # refused without an explicit --cap-usd (e.g. --cap-usd 15)
+[roles.summarizer]            # scout, summaries, scoring
+model = "haiku"
+cap_usd = 1
 
 # A profile is one account. owner = "self" is mandatory: delega only runs accounts that are
 # assigned to you and used only by you. Jobs never move between profiles.
@@ -31,14 +47,25 @@ repo_match = { git_remote = "github.com[:/]example-org/" }
 git = { user_name = "Alex Doe", user_email = "alex@example.com" }
 model = "sonnet"
 forbidden_terms_file = "~/.config/delega/work/forbidden.txt"   # client names, never in commits
+env_file = "~/.config/delega/work/api.env"                     # lint: a live run must cite it or use --requires
 node_bundle = "~/.config/delega/work/bundle"                   # CLAUDE.md, hooks/, agents/ for nodes
 # `delega sync` unpacks the bundle into the node's ~/.claude (or config_dirs): CLAUDE.md, hooks/, agents/,
 # settings.json. A home/ directory inside the bundle is unpacked relative to $HOME instead.
+# Suggested hooks/ (from dotfiles-ia claude/hooks, registered in the bundle's settings.json):
+# damage-control.py, no-cat-grande.py, delega-scan.py (forbidden terms before commit/push/PR) and
+# delega-pr-gate.py (no `gh pr create` from delega/* or orq/* without a clean `delega integrate`).
 # Commands run on the node after unpacking (e.g. to merge settings.json):
 bundle_post_sync = ["python3 ~/.local/share/example/merge-settings.py"]
-nodes = ["buildbox"]
+nodes = ["sandbox", "buildbox"]
+# --node auto tries these groups in turn: runners (kindling | host | docker) or node names; `local`
+# (this machine) is always the last resort. Kindling takes jobs without --requires or --heavy whose repo
+# has a golden. This is the default:
+# auto_order = ["kindling", "host", "docker", "local"]
+# Declared compute is also watched: a node where it is `expired` is skipped even without --requires.
 compute = ["vertex"]
 policy.budget.day_usd = 100
+# Rebuild a repo golden before launching when its lockfiles changed (default: warn only):
+# policy.golden.auto_rebuild = true
 
 [compute.vertex]
 kind = "gcp-adc"
@@ -53,7 +80,7 @@ profiles = ["work"]
 config_dirs = { work = "~/.claude-work" }
 
 # One ephemeral microVM per job on a kindling host (golden built with nodes/kindling/golden.sh).
-# Only explicit `--node sandbox` uses it unless you add it to a profile's `nodes`.
+# --node auto uses it (first, by default) only when it is in a profile's `nodes`.
 [nodes.sandbox]
 ssh = "kling-host"
 runner = "kindling"
@@ -69,4 +96,5 @@ account = "me@example.com (token)"
 [projects."example-org/api"]
 verify = ["npm run typecheck", "npm test -- --run"]
 branch_prefixes = ["feature/", "fix/", "delega/"]
+# branch_pattern = '^(feature|fix|chore)/'   # the repo hook's regex, if stricter than the prefixes
 policy.budget.day_usd = 60

@@ -8,6 +8,9 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 |---|---|
 | `claude/hooks/damage-control.py` | Suelo de seguridad (patrón *damage-control* de IndyDevDan): bloquea lo irreversible (`rm -rf` amplio, `git push --force`, `reset --hard`, `DROP`, borrado de discos, `curl \| sh`, escrituras en `~/.ssh`…) y pregunta antes de lo delicado (`git branch -D`, `terraform destroy`, `docker prune`…). |
 | `claude/hooks/no-cat-grande.py` | Impide volcar ficheros grandes enteros al contexto. |
+| `claude/hooks/delega-scan.py` | Antes de `git commit`, `git push` o un `gh` que publica, pasa `delega scan` por lo que sale y bloquea si hay términos prohibidos del perfil. |
+| `claude/hooks/delega-pr-gate.py` | Bloquea `gh pr create` desde `delega/*` u `orq/*` sin un `delega integrate` correcto de esa rama en su sha actual. |
+| `claude/hooks/modelo-orquestador.py` | Avisa al arrancar si una sesión orquestadora de delega usa un modelo `[1m]`. |
 | `claude/agents/` | Subagentes, cada uno con su modelo (Sonnet o Haiku; Opus queda para la sesión principal). |
 | `claude/settings-base.json` | Lo que se garantiza en `~/.claude/settings.json`: reglas `deny`, hooks y comodines que se quitan de `allow`. |
 | `claude/fusionar-settings.py` | Fusiona lo anterior sin pisar lo que escriben Claude Code, Nod u Orbit. Idempotente. |

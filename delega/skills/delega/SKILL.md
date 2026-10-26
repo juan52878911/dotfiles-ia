@@ -38,7 +38,10 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
 1. `delega doctor <repo>`: identity per profile and node, compute credentials, disk and load, version
    drift, quota, today's spend, forbidden-terms file, bundle. Every ✗ comes with the exact fix command:
    fix it **now** (credentials expiring in the middle of the night cost hours). Whatever needs {owner}
-   (logins), ask for it in a single message with the commands doctor printed.
+   (logins), ask for it in a single message with the commands doctor printed. Before each **batch** of
+   N jobs, `delega doctor --batch N <repo>`: per node disk, load, RAM, account, declared compute (ADC…),
+   claude version, `kling ps` and the repo golden; it says whether the batch fits and logs every refused
+   node to the audit (`refused`, scope node).
 2. `order.md` from `templates/<locale>/order.md`, agreed with {owner}: one deliverable, a **frozen**
    acceptance criterion (with a hash), a single baseline, a budget (hours, account $, paid compute
    USD), what is out of scope and which decisions are theirs. Without it, launch nothing (criteria
@@ -52,23 +55,32 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
 
 1. **Brief** from `templates/<locale>/brief.md`, self-contained: the worker does not see this
    conversation. `delega run` rejects a brief without a done criterion, a cap or a closing report
-   (`--no-lint` only for tests). What worked: a hypothesis and how to refute it, a numeric success
+   (`--no-lint` only for tests), and then runs three deterministic rules (policy `lint.branch`,
+   `lint.live`, `lint.text`: `error`, `warn` or `off`): a branch the brief names must match the project's
+   `branch_pattern` (default: its `branch_prefixes`); a run against an AI provider needs `--requires` or the
+   profile's `env_file` path in the brief; and a warning for an "original/previous brief" not attached, an
+   absolute time with no rule for when it has passed, and a script named without a path. What worked: a hypothesis and how to refute it, a numeric success
    **and stop** criterion, a minutes cap, "offline first, no paid compute", and a branch prefix the
    repo's hooks accept (read the hooks first).
 2. **Where it runs** (`--node`):
-   - `--node auto` (default for anything that uses resources: containers, test databases, suites,
-     benchmarks) picks, among the profile's nodes, the one with free RAM, the right identity,
-     enough disk, load under the limit and a free slot (`max_jobs`). If none qualifies, it runs
-     locally (up to `max_local_jobs`). `delega nodes` shows their state.
-   - `--requires <compute>` if the job calls an external paid provider: the chosen node must pass
-     that compute check.
+   - `--node auto` (the default) tries the profile's `auto_order` group by group (default
+     `kindling → host → docker → local`): **kindling first** for isolated work (no `--requires`, not
+     `--heavy`, the repo has a golden), then host nodes by free RAM, and this machine only as the last
+     resort (up to `max_local_jobs`). A node also needs the right identity, enough disk, load under the
+     limit, a free slot (`max_jobs`) and no declared compute `expired` (an expired ADC excludes the node
+     even for jobs that do not require Vertex). `delega nodes` shows their state, the fix for each
+     refused node and the order.
+   - `--requires <compute>` if the job calls an external paid provider (Vertex…): the chosen node must
+     pass that compute check, so it goes to a host node. `--heavy` for E2E suites with containers and
+     benchmarks: also a host node.
    - `--node local` for what needs local tools, a browser, uncommitted files, or push/PR (nodes have
      no git hosting credentials).
    - `--node <kindling node>` (`runner = "kindling"`): the job runs in an ephemeral microVM cloned
      from a golden image with the repo's dependencies already installed, with egress limited to an
      allowlist, and deleted at the end. Good for isolated, parallel work that needs no containers or
-     services; no `--resume` (the VM is gone: use `handoff`) and no `--requires`. When the repo's
-     dependencies change, rebuild the golden (`delega golden build`).
+     services; no `--resume` (the VM is gone: use `handoff`) and no `--requires`. The golden records
+     the sha256 of the repo's lockfiles; when HEAD's differ, the launch warns, and `--rebuild-golden` (or
+     policy `golden.auto_rebuild = true`) rebuilds it first. `delega golden ls` shows fingerprint and age.
    - `--db <name>` (kindling only): the job gets a throwaway copy of a database the project declares
      (`[projects."…".databases.<name>]`), cloned from the data golden (`delega golden db`, ~1 s) or restored
      from the dump volume (`delega db volume create|refresh`). Use `templates/<locale>/brief-db.md` and,
@@ -78,11 +90,13 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
    - Only **HEAD** travels to a node: commit first. The worker uses branch `delega/<id>` (or
      `--branch`); when it ends, the branch comes home and is scanned against the forbidden terms.
    - Nodes carry the profile's rules (agents, hooks, skills, rules, CLAUDE.md, plus `bundle_skills`).
-     New node or changed rules: `delega sync [node]`; kindling: `delega golden build` again.
+     New node or changed rules: `delega sync [node]`; kindling: `delega golden build` again. The bundle's
+     `hooks/` should carry dotfiles-ia's `damage-control.py`, `no-cat-grande.py`, `delega-scan.py` and
+     `delega-pr-gate.py` (registered in its `settings.json`), so workers on nodes stop at the same gates.
    - Every worker gets the job's facts in its system prompt (`context.md`: id, node, VM, golden, profile,
      account, caps, budget, branch, databases) and `DELEGA_JOB_ID|NODE|PROFILE|BRANCH` in its environment.
 3. **Launch** with `run_in_background: true` (you are notified at the end; do not poll):
-   `delega run <repo> <brief> --node auto [--requires c] [--cap-min N] [--cap-usd N] [--cap-turns N] [--zone glob] [--model m]`.
+   `delega run <repo> <brief> --node auto [--requires c] [--heavy] [--rebuild-golden] [--cap-min N] [--cap-usd N] [--cap-turns N] [--zone glob] [--role r] [--model m]`.
    Right after, arm **one** monitor: `delega watch` (only your running jobs); re-arm it only if it
    expires **while you still have live jobs**. It emits `NOTICE:milestone|blocker|question`,
    `ALERT:stall|loop|errors|no_answer|undelivered|cap|cap_cut|dead`, `RESULT` and `END`.
@@ -178,7 +192,12 @@ cuts between turns, minutes and messages cut at any time.
   `forbidden_terms_file`; real corpora stay outside the repo from day one. Scan local work before publishing.
 - **Paid external compute**: offline first; before each live round, a declared number of calls and a
   maximum USD per round.
-- **Model** of the workers: the profile's default; a larger model only for a bounded review with a cap.
+- **Model per role** (`[roles.*]`, `--role`): worker = Sonnet (the default role); reviewer = Opus or Fable,
+  read-only, always with `--cap-usd` (the role sets `require_cap_usd`), one per epic; summarizer/scout = Haiku
+  with `--cap-usd 1`. Workers launch no subagents unless the brief allows it with a cap. You, the
+  orchestrator, run on Opus without `[1m]` (Sonnet for fewer than 4 briefs) and keep context under 300k.
+- **Before a PR**: `delega integrate <repo> <branch>` must end clean/verified on the branch's current sha;
+  the `delega-pr-gate` hook refuses `gh pr create` from `delega/*` or `orq/*` otherwise.
 - **Nodes**: load under the limit; never an E2E suite and a benchmark on the same node; enough RAM and disk.
 - **Guards**: neither orchestrator nor worker bypasses hooks or classifier blocks; send a `blocker`
   and let {owner} decide.
@@ -194,7 +213,8 @@ cuts between turns, minutes and messages cut at any time.
 | Command | For |
 |---|---|
 | `delega doctor [repo] [--profile p]` | Pre-flight checklist with fixes |
-| `delega nodes [--requires c]` | State of the nodes |
+| `delega doctor --batch N [repo]` | Node preconditions before a batch; refused nodes to the audit |
+| `delega nodes [--requires c]` | State of the nodes, exact fixes and the `--node auto` order |
 | `delega quota [--profile p] [--hours h]` | How many workers fit |
 | `delega spend [day\|all] [--by profile\|project\|owner]` | Cost and budget |
 | `delega run <repo> <brief> [options]` | Launch |
@@ -212,7 +232,7 @@ cuts between turns, minutes and messages cut at any time.
 
 Policy keys (all under `[policy]`, overridable per profile/project or with `DELEGA_<KEY>`):
 `job.max_min`, `job.max_turns`, `job.max_usd`, `job.grace_s`, `stall_s`, `answer_wait_s`,
-`resume_max_min`, `max_local_jobs`, `expected_hours`, `node.*`, `budget.day_usd`, `quota.*`, `lint.require`, `lease.*`.
+`resume_max_min`, `max_local_jobs`, `expected_hours`, `node.*`, `budget.day_usd`, `quota.*`, `lint.require`, `lint.branch|live|text`, `lint.live_keywords`, `lease.*`.
 
 Files of each job live in `<state_dir>/<id>-<repo>/` (on a node, `~/<workdir>/jobs/<id>/`): `meta`,
 `brief.md`, `inbox.jsonl`, `notices.jsonl`, `progress.log`, `state.json`, `events.jsonl`, `result.json`,

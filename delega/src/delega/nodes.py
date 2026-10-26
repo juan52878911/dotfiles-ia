@@ -155,9 +155,16 @@ def launcher_for(profile, node):
     return list(profile["launcher"])
 
 
-def _probe_args(cfg, profile, node, requires):
+def _probe_args(cfg, profile, node, requires, watch=()):
     return {"launcher": launcher_for(profile, node), "workdir": (node or {}).get("workdir", "delega"),
-            "config_dir": config_dir_for(profile, node), "requires": _compute_defs(cfg, profile, requires)}
+            "config_dir": config_dir_for(profile, node),
+            "requires": _compute_defs(cfg, profile, list(requires or ()) + list(watch or ()))}
+
+
+def watched(profile, requires=()):
+    """Compute the profile declares but the job does not require: a node where one of them is `expired`
+    (a login gone stale, e.g. ADC) is excluded anyway — jobs there end up needing it."""
+    return [c for c in profile.get("compute") or [] if c not in (requires or ())]
 
 
 def _login_fix(profile, node, alias_):
@@ -180,9 +187,10 @@ def _identity_problem(profile, email):
     return None
 
 
-def evaluate(cfg, profile, node, raw, requires=(), resources=True, remote_node=True):
+def evaluate(cfg, profile, node, raw, requires=(), resources=True, remote_node=True, watch=()):
     """Turn a raw probe result into the contract dict with ok/reason/fix.
-    `kind` says what failed: unreachable | claude | identity | resources | compute | ok."""
+    `kind` says what failed: unreachable | claude | identity | resources | compute | ok.
+    Required compute must be ok; watched compute only fails the node when it is `expired`."""
     res = dict(raw or {})
     res.setdefault("compute", {})
     a = remote.alias(node) if node else None
@@ -219,24 +227,26 @@ def evaluate(cfg, profile, node, raw, requires=(), resources=True, remote_node=T
             return fail("resources", "load", t("nodes.fix.load"), load=raw["load_pct"],
                         max=pj("node.max_load_pct"))
     for name, status in res["compute"].items():
-        if status != "ok":
+        need = name in (requires or ())
+        if status != "ok" and (need or status == "expired"):
             c = cfg.compute.get(name, {})
             hint = c.get("fix_hint") or t("nodes.fix.compute", name=name)
             fix = f"ssh -t {a} {shlex.quote(hint)}" if a else hint
-            return fail("compute", "compute", fix, name=name, status=status)
+            return fail("compute", "compute" if need else "compute_expired", fix, name=name, status=status)
     res.update(ok=True, kind="ok")
     return res
 
 
 # ── probes ──────────────────────────────────────────────────────────────────
-def probe(cfg, node, profile, requires=()):
-    """Probe a configured node for a profile. `node` = node dict (cfg.node(name)) or its name."""
+def probe(cfg, node, profile, requires=(), watch=()):
+    """Probe a configured node for a profile. `node` = node dict (cfg.node(name)) or its name.
+    `watch`: compute checked too, failing the node only when `expired` (see `watched`)."""
     node = cfg.node(node) if isinstance(node, str) else node
     profile = cfg.profile(profile) if isinstance(profile, str) else profile
     if node.get("runner") == "kindling":
         from . import kindling
-        return kindling.probe(cfg, node, profile, requires)
-    args = _probe_args(cfg, profile, node, requires)
+        return kindling.probe(cfg, node, profile, requires)     # nothing to expire inside a fresh VM
+    args = _probe_args(cfg, profile, node, requires, watch)
     py = node.get("python", "python3")
     inner = f"env DELEGA_PROBE={shlex.quote(json.dumps(args))} {shlex.quote(py)} -"
     r = remote.ssh(node, f"bash -lc {shlex.quote(inner)}", input=PROBE_PY, timeout=90)
@@ -246,17 +256,17 @@ def probe(cfg, node, profile, requires=()):
             raw = json.loads(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             raw = None
-    res = evaluate(cfg, profile, node, raw, requires)
+    res = evaluate(cfg, profile, node, raw, requires, watch=watch)
     res["node"] = node["name"]
     if raw is None and r.returncode == 0:
         res["reason"] = t("nodes.reason.bad_output", node=remote.alias(node))
     return res
 
 
-def local_probe(cfg, profile, requires=()):
+def local_probe(cfg, profile, requires=(), watch=()):
     """Same shape for this machine. Identity and compute gate it; local resources are reported only."""
     profile = cfg.profile(profile) if isinstance(profile, str) else profile
-    args = _probe_args(cfg, profile, None, requires)
+    args = _probe_args(cfg, profile, None, requires, watch)
     env = {**os.environ, "DELEGA_PROBE": json.dumps(args)}
     for k in [k for k in env if k.startswith(("CLAUDE_", "ANTHROPIC_")) and k != "CLAUDE_CONFIG_DIR"]:
         del env[k]
@@ -266,7 +276,7 @@ def local_probe(cfg, profile, requires=()):
         raw = json.loads(r.stdout.strip().splitlines()[-1])
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         raw = None
-    res = evaluate(cfg, profile, None, raw, requires, resources=False, remote_node=False)
+    res = evaluate(cfg, profile, None, raw, requires, resources=False, remote_node=False, watch=watch)
     res["node"] = "local"
     return res
 
@@ -324,37 +334,116 @@ class SelectLock:
             pass
 
 
-def select(cfg, profile, requires, live_counts, on_choice=None, say=print):
-    """Pick the node with most free RAM (minus reserve_mb_per_job per live job), within its max_jobs,
-    profile list and compute requirements. Returns a node name or "local".
+DEFAULT_AUTO_ORDER = ["kindling", "host", "docker", "local"]
+
+
+def auto_order(profile):
+    """Groups `--node auto` tries in turn: node names or runners (kindling | host | docker), and `local`.
+    Profile nodes no entry names are tried after the listed ones; `local` is always the last resort."""
+    order = list(profile.get("auto_order") or DEFAULT_AUTO_ORDER)
+    return order if "local" in order else order + ["local"]
+
+
+def _groups(cfg, profile):
+    pool = cfg.nodes_for(profile)
+    seen, out = set(), []
+    for entry in auto_order(profile):
+        if entry == "local":
+            rest = [n for n in pool if n["name"] not in seen]
+            if rest:
+                out.append(("other", rest))
+            out.append(("local", []))
+            break
+        g = [n for n in pool if n["name"] not in seen and entry in (n["name"], n.get("runner", "host"))]
+        seen |= {n["name"] for n in g}
+        if g:
+            out.append((entry, g))
+    return out
+
+
+def _kindling_skip(node, requires, job):
+    """Why a kindling node does not fit this job (None = it fits)."""
+    from . import kindling
+    if requires:
+        return t("nodes.skip.requires", requires=", ".join(requires))
+    if job.get("heavy"):
+        return t("nodes.skip.heavy")
+    repo = job.get("repo")
+    if repo and not kindling.has_golden(node, repo):
+        g = kindling.golden(node, repo)
+        return t("nodes.skip.no_golden", golden=g, fix=f"delega golden build --node {node['name']}")
+    return None
+
+
+def _refused(cfg, profile, name, r, stage):
+    """Node preconditions that failed go to the audit log, so infrastructure failures can be counted."""
+    from . import audit
+    try:
+        audit.record(cfg, "refused", scope="node", stage=stage, node=name, profile=profile["name"],
+                     kind=r.get("kind") or "", reason=(r.get("reason") or "")[:200], fix=r.get("fix") or "")
+    except OSError:
+        pass
+
+
+def select(cfg, profile, requires, live_counts, on_choice=None, say=print, job=None):
+    """Pick a node for a job, group by group in the profile's `auto_order` (default: kindling first, then
+    host and docker nodes, this machine last). Kindling takes jobs without --requires, not marked heavy,
+    whose repo has a golden. Within a group: hosts by most free RAM (minus reserve_mb_per_job per live
+    job), kindling by fewest live VMs; always within max_jobs. Nodes with a declared compute `expired`
+    are excluded too. Returns a node name or "local".
     live_counts: dict {node: n} or a callable returning it (called under the lock).
-    on_choice(name) runs under the lock, so the caller can record the choice before others select."""
+    job: {"repo": name, "heavy": bool}. on_choice(name) runs under the lock, so the caller can record
+    the choice before others select."""
     profile = cfg.profile(profile) if isinstance(profile, str) else profile
     reserve = cfg.policy("node.reserve_mb_per_job", profile)
     min_mem = cfg.policy("node.min_mem_mb", profile)
-    best, best_score = None, -1
+    job, requires = job or {}, list(requires or ())
+    watch = watched(profile, requires)
+    choice = None
     with SelectLock(cfg):
         live = live_counts() if callable(live_counts) else live_counts
-        for node in cfg.nodes_for(profile):
-            name = node["name"]
-            n = live.get(name, 0)
-            mx = node.get("max_jobs")
-            r = probe(cfg, node, profile, requires)
-            say(t("nodes.line", node=name, status=_status(r), live=n, max=mx if mx else "-"))
-            if not r["ok"]:
-                continue
-            if mx and n >= mx:
-                continue
-            score = (r.get("mem_mb") or 0) - n * reserve
-            if score >= min_mem and score > best_score:
-                best, best_score = name, score
-        choice = best or "local"
+        for group, members in _groups(cfg, profile):
+            if group == "local":
+                choice = "local"
+                break
+            best, best_score = None, None
+            for node in members:
+                name = node["name"]
+                n = live.get(name, 0)
+                mx = node.get("max_jobs")
+                if node.get("runner") == "kindling":
+                    why = _kindling_skip(node, requires, job)
+                    if why:
+                        say(t("nodes.line", node=name, status=t("nodes.skip", reason=why), live=n,
+                              max=mx if mx else "-"))
+                        continue
+                r = probe(cfg, node, profile, requires, watch=watch)
+                say(t("nodes.line", node=name, status=_status(r), live=n, max=mx if mx else "-"))
+                if not r["ok"]:
+                    _refused(cfg, profile, name, r, "select")
+                    continue
+                if mx and n >= mx:
+                    continue
+                if node.get("runner") == "kindling":
+                    score = -max(n, r.get("vms") or 0)
+                else:
+                    score = (r.get("mem_mb") or 0) - n * reserve
+                    if score < min_mem:
+                        continue
+                if best_score is None or score > best_score:
+                    best, best_score = name, score
+            if best:
+                choice = best
+                break
+        choice = choice or "local"
         if on_choice:
             on_choice(choice)
     return choice
 
 
 def _status(r):
+    if r.get("ok") and r.get("vms") is not None:
+        return t("nodes.ok_kindling", vms=r["vms"])
     if r.get("ok"):
         return t("nodes.ok", mem=r.get("mem_mb"), disk=r.get("disk_gb"), load=r.get("load_pct"),
                  containers=r.get("containers") if r.get("containers") is not None else "-")
@@ -372,9 +461,10 @@ def main(argv):
     try:
         cfg = _config.load()
         profile = cfg.profile(args.profile)
-        results = {"local": local_probe(cfg, profile, args.requires)}
+        watch = watched(profile, args.requires)
+        results = {"local": local_probe(cfg, profile, args.requires, watch)}
         for node in cfg.nodes_for(profile):
-            results[node["name"]] = probe(cfg, node, profile, args.requires)
+            results[node["name"]] = probe(cfg, node, profile, args.requires, watch=watch)
     except _config.ConfigError as e:
         print(f"delega: {e}", file=sys.stderr)
         return 3
@@ -386,4 +476,5 @@ def main(argv):
     for name, r in results.items():
         mx = cfg.nodes.get(name, {}).get("max_jobs")
         print(t("nodes.line", node=name, status=_status(r), live=live.get(name, 0), max=mx if mx else "-"))
+    print(t("nodes.auto_order", order=" → ".join(auto_order(profile))))
     return 0

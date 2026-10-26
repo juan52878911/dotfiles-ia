@@ -4,7 +4,8 @@
 It writes the channel files the launcher reads (lease, state, progress, result, summary, rc) and,
 inside the current directory (the worktree), commits a file, so launch/remote can be tested without
 the real broker. Env: STUB_SLEEP seconds to stay "running", STUB_COMMIT_TEXT file content to commit
-(none = no commit), STUB_RC exit code, STUB_ASK_FILE: wait until this file exists.
+(none = no commit), STUB_RC exit code, STUB_ASK_FILE: wait until this file exists, STUB_NOD_QUESTION:
+emit a question and its decision.request to the channel's nod.jsonl.
 """
 import json
 import os
@@ -35,6 +36,12 @@ def main(argv):
                      "db_env": {k: v for k, v in os.environ.items()
                                 if k.startswith(("PG", "MYSQL_", "REDIS_", "MONGODB_", "SQLITE_")) or k == "DATABASE_URL"},
                      "oauth_token_set": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))})
+    if os.environ.get("STUB_NOD_QUESTION"):     # the real emitter, as the broker on the node calls it
+        from delega import nod
+        terms = nod.terms_of(os.path.join(chan, "forbidden.txt"))
+        q = os.environ["STUB_NOD_QUESTION"]
+        nod.from_progress(chan, "NOTICE:question", q, terms=terms)
+        nod.decision_request(chan, "question", q, os.environ.get("DELEGA_ANSWER_WAIT_S", "900"), terms)
     end = time.time() + float(os.environ.get("STUB_SLEEP", "0"))
     while time.time() < end:
         time.sleep(0.1)
@@ -49,8 +56,9 @@ def main(argv):
     jw("result.json", {"type": "result", "result": "final report", "session_id": sid, "total_cost_usd": 0.5,
                        "is_error": rc != 0, "num_turns": 3})
     w("results.jsonl", json.dumps({"ts": now(), "result": "final report", "is_error": False, "cost_usd": 0.5}) + "\n")
-    jw("summary.json", {"session_id": sid, "rc": rc, "model": "stub", "duration_min": 0, "messages": 3, "tools": 2,
-                        "alerts": 0, "cost_usd": 0.5, "cap": None, "start": start, "end": time.time()})
+    if not os.environ.get("STUB_NO_SUMMARY"):   # a broker killed before END writes none
+        jw("summary.json", {"session_id": sid, "rc": rc, "model": "stub", "duration_min": 0, "messages": 3,
+                            "tools": 2, "alerts": 0, "cost_usd": 0.5, "cap": None, "start": start, "end": time.time()})
     jw("state.json", {"state": "done", "start": start, "last_event": time.time(), "tools": 2, "turns": 3,
                       "alerts": 0, "messages": 3, "session_id": sid, "rc": rc, "pid": os.getpid(), "cost_usd": 0.5})
     open(os.path.join(chan, "progress.log"), "a").write(f"{now()}\tEND\trc={rc}\n")

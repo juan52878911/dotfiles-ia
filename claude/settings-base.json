@@ -23,7 +23,12 @@
   "hooks": {
     "PreToolUse": [
       { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit", "command": "python3 ~/.claude/hooks/damage-control.py" },
-      { "matcher": "Bash", "command": "python3 ~/.claude/hooks/no-cat-grande.py" }
+      { "matcher": "Bash", "command": "python3 ~/.claude/hooks/no-cat-grande.py" },
+      { "matcher": "Bash", "command": "python3 ~/.claude/hooks/delega-scan.py" },
+      { "matcher": "Bash", "command": "python3 ~/.claude/hooks/delega-pr-gate.py" }
+    ],
+    "SessionStart": [
+      { "matcher": "startup|resume", "command": "python3 ~/.claude/hooks/modelo-orquestador.py" }
     ]
   }
 }

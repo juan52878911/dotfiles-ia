@@ -47,6 +47,9 @@ in
         ".claude/agents".source = enlace "claude/agents";
         ".claude/hooks/damage-control.py".source = enlace "claude/hooks/damage-control.py";
         ".claude/hooks/no-cat-grande.py".source = enlace "claude/hooks/no-cat-grande.py";
+        ".claude/hooks/delega-scan.py".source = enlace "claude/hooks/delega-scan.py";
+        ".claude/hooks/delega-pr-gate.py".source = enlace "claude/hooks/delega-pr-gate.py";
+        ".claude/hooks/modelo-orquestador.py".source = enlace "claude/hooks/modelo-orquestador.py";
       };
 
       home.activation.dotfilesIaClaude = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
