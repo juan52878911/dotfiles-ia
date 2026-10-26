@@ -121,11 +121,13 @@ def sync_node(cfg, prof, node, tar_path):
 
 
 def main(argv):
-    profile, names, dry, a = None, [], False, list(argv)
+    profile, names, dry, tar_out, a = None, [], False, None, list(argv)
     while a:
         x = a.pop(0)
         if x == "--profile" and a:
             profile = a.pop(0)
+        elif x == "--tar" and a:
+            tar_out = os.path.abspath(a.pop(0))
         elif x == "--dry-run":
             dry = True
         elif x in ("-h", "--help"):
@@ -140,7 +142,7 @@ def main(argv):
     except config.ConfigError as e:
         print(e, file=sys.stderr)
         return 2
-    if not nodes:
+    if not nodes and not tar_out:
         print(i18n.t("sync.no_nodes", profile=prof["name"]), file=sys.stderr)
         return 2
     with tempfile.TemporaryDirectory(prefix="delega-sync-") as tmp:
@@ -153,6 +155,10 @@ def main(argv):
             print(i18n.t("sync.skipped", path=s), file=sys.stderr)
         tar_path = os.path.join(tmp, "bundle.tar")
         make_tar(os.path.join(tmp, "stage"), tar_path)
+        if tar_out:     # no node contacted: e.g. to bake the rules into a kindling golden image
+            shutil.copy(tar_path, tar_out)
+            print(i18n.t("sync.tar", path=tar_out, n=len(staged)))
+            return 0
         rc = 0
         for node in nodes:
             if prof["name"] not in node["profiles"]:

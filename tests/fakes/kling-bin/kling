@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Fake kling for tests (runs on the fake node through tests/fakes/ssh).
+
+One VM at a time: `run -from G` copies $FAKE_KLING_GOLDENS/G into $FAKE_KLING_VMHOME (the VM's
+home, same absolute path the node config gives as vm_home). `exec` only passes the variables
+named with -e from the host environment, like the real one. Calls are logged to $HOME/.kling.log.
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+home = os.environ["HOME"]
+reg = os.path.join(home, ".kling-vms")
+vmhome = os.environ["FAKE_KLING_VMHOME"]
+
+
+def log(*a):
+    with open(os.path.join(home, ".kling.log"), "a") as f:
+        f.write(" ".join(a) + "\n")
+
+
+def path(p):
+    return p.split(":", 1)[1] if ":" in p and not p.startswith("/") else p
+
+
+def main(a):
+    log(*a)
+    os.makedirs(reg, exist_ok=True)
+    cmd = a[0]
+    if cmd == "ps":
+        print("ID NAME STATE")
+        for n in sorted(os.listdir(reg)):
+            print(f"x {n} running")
+        return 0
+    if cmd == "run":
+        name, image = a[a.index("-name") + 1], a[a.index("-from") + 1]
+        src = os.path.join(os.environ["FAKE_KLING_GOLDENS"], image)
+        if not os.path.isdir(src):
+            print(f"kling: no golden {image}", file=sys.stderr)
+            return 1
+        shutil.rmtree(vmhome, ignore_errors=True)
+        shutil.copytree(src, vmhome, symlinks=True)
+        open(os.path.join(reg, name), "w").close()
+        print(f"{name} ready")
+        return 0
+    if cmd == "rm":
+        if os.path.exists(os.path.join(reg, a[1])):
+            os.remove(os.path.join(reg, a[1]))
+            shutil.rmtree(vmhome, ignore_errors=True)
+        return 0
+    if cmd == "cp":
+        shutil.copy(path(a[1]), path(a[2]))
+        return 0
+    if cmd == "exec":
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
+        cwd, i = vmhome, 1
+        while a[i] != "--":
+            if a[i] == "-e":
+                k, _, v = a[i + 1].partition("=")
+                env[k] = v if _ else os.environ.get(k, "")
+                i += 2
+            elif a[i] == "-w":
+                cwd = a[i + 1]
+                i += 2
+            elif a[i] == "-timeout":
+                i += 2
+            else:
+                vm = a[i]
+                i += 1
+        if not os.path.exists(os.path.join(reg, vm)):
+            print(f"kling: no vm {vm}", file=sys.stderr)
+            return 1
+        return subprocess.run(a[i + 1:], cwd=cwd, env=env).returncode
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

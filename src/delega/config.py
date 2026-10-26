@@ -223,7 +223,7 @@ class Config:
         n["name"] = name
         n.setdefault("workdir", "delega")       # relative to the node's $HOME
         n.setdefault("python", "python3")
-        n.setdefault("runner", "host")          # host | docker
+        n.setdefault("runner", "host")          # host | docker | kindling
         n.setdefault("profiles", list(self.profiles))
         return n
 

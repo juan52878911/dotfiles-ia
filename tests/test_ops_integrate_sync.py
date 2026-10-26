@@ -119,6 +119,17 @@ class SyncTest(OpsCase):
         self.assertNotIn("credentials", out)
         self.assertIn("not sent", err)
 
+    def test_tar_writes_bundle_without_contacting_nodes(self):
+        import tarfile
+        out_tar = os.path.join(self.root, "rules.tar")
+        with mock.patch("delega.remote.ssh", side_effect=AssertionError("no node")):
+            rc, out, _ = self.run_cli(sync.main, "--tar", out_tar)
+        self.assertEqual(rc, 0, out)
+        names = tarfile.open(out_tar).getnames()
+        self.assertIn("claude/hooks/guard.py", names)
+        self.assertIn("home/.local/x.json", names)
+        self.assertFalse(any("credentials" in n or n.endswith(".env") for n in names))
+
     def test_remote_path(self):
         self.assertEqual(sync.remote_path("~/.claude"), '"$HOME"/.claude')
         self.assertEqual(sync.remote_path("/opt/c d"), "'/opt/c d'")

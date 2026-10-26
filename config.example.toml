@@ -52,6 +52,20 @@ min_disk_gb = 20
 profiles = ["work"]
 config_dirs = { work = "~/.claude-work" }
 
+# One ephemeral microVM per job on a kindling host (golden built with nodes/kindling/golden.sh).
+# Only explicit `--node sandbox` uses it unless you add it to a profile's `nodes`.
+[nodes.sandbox]
+ssh = "kling-host"
+runner = "kindling"
+max_jobs = 3
+profiles = ["work"]
+golden = "claude-{repo}"
+vm_user = "worker"
+vm_home = "/home/worker"
+egress_allow = ["anthropic.com"]
+token_command = ["security", "find-generic-password", "-s", "claude-work-token", "-w"]   # prints the OAuth token
+account = "me@example.com (token)"
+
 [projects."example-org/api"]
 verify = ["npm run typecheck", "npm test -- --run"]
 branch_prefixes = ["feature/", "fix/", "delega/"]

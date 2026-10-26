@@ -141,7 +141,7 @@ def reconcile(cfg):
 
 # ── channel access (local file or ssh) ──────────────────────────────────────
 def _node(cfg, meta):
-    return cfg.node(meta["NODE"])
+    return remote.job_node(cfg, meta)
 
 
 def read_channel(cfg, job_dir, name):

@@ -233,6 +233,9 @@ def probe(cfg, node, profile, requires=()):
     """Probe a configured node for a profile. `node` = node dict (cfg.node(name)) or its name."""
     node = cfg.node(node) if isinstance(node, str) else node
     profile = cfg.profile(profile) if isinstance(profile, str) else profile
+    if node.get("runner") == "kindling":
+        from . import kindling
+        return kindling.probe(cfg, node, profile, requires)
     args = _probe_args(cfg, profile, node, requires)
     py = node.get("python", "python3")
     inner = f"env DELEGA_PROBE={shlex.quote(json.dumps(args))} {shlex.quote(py)} -"

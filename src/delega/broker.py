@@ -168,9 +168,12 @@ def cmd_run(chdir, brief, command):
     save()
     write_lease()
     # An env var of a parent Claude session could leak its account: drop them all but the
-    # config dir the launcher chose on purpose.
+    # config dir the launcher chose on purpose and those named in DELEGA_KEEP_ENV (comma list;
+    # legacy ORQ_CONSERVAR). The kindling runner passes the worker's token that way, by process.
+    keep = {"CLAUDE_CONFIG_DIR"} | {x.strip() for x in (os.environ.get("DELEGA_KEEP_ENV")
+                                    or os.environ.get("ORQ_CONSERVAR") or "").split(",") if x.strip()}
     env = {k: v for k, v in os.environ.items()
-           if k == "CLAUDE_CONFIG_DIR" or not k.startswith(("CLAUDE", "ANTHROPIC"))}
+           if k in keep or not k.startswith(("CLAUDE", "ANTHROPIC"))}
     env["DELEGA_CHANNEL"] = ch.dir
     caps_txt = t("broker.caps_text", min=f"{max_min:g}", turns=max_turns, usd=f"{max_usd:g}")
     command = command + ["--input-format", "stream-json", "--output-format", "stream-json",

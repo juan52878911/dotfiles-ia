@@ -20,7 +20,16 @@ commands) and is reached through `delega <command>` (`src/delega/__main__.py`).
   accounts** (`config.validate()` refuses it).
 - **Node** = SSH alias + capacity: `ssh`, `max_jobs`, `min_disk_gb`, `profiles`,
   `workdir` (relative to the node's `$HOME`, default `delega`), `jobs_subdir` (default `jobs`),
-  `python`, `launcher` (default `["claude"]`; the profile launcher is only used on this machine), `runner = "host" | "docker"`, `config_dirs = {profile = "path"}`, `docker_image`.
+  `python`, `launcher` (default `["claude"]`; the profile launcher is only used on this machine), `runner = "host" | "docker" | "kindling"`, `config_dirs = {profile = "path"}`, `docker_image`.
+  A **kindling** node (`ssh` = the kindling host) runs each job in its own microVM `delega-<id>`
+  cloned from `golden` (default `claude-{repo}`; built with `nodes/kindling/golden.sh`). Its channel,
+  pyz and checkout (`vm_repo`, default `wt`) live inside the VM; `remote.ssh/scp_*` reach them through
+  `kling exec`/`kling cp` when the node dict carries `vm` (`remote.job_node(cfg, meta)` adds it from
+  meta `VM`). HEAD travels as a bundle on top of `golden_base_ref`, the branch comes back as a bundle,
+  and the VM is removed when the job ends (`keep_vm` to keep it). The token comes from
+  `token_command`, goes through ssh stdin and `kling exec -e` into the worker (broker
+  `DELEGA_KEEP_ENV`): never on a disk. No `--resume` (the VM is gone), no `--requires`; never picked
+  by `--node auto` unless listed in the profile's `nodes`.
 - **Compute** = an external provider a job may need (`--requires <name>`): `kind = "gcp-adc"`
   (`adc_path`, refresh-token check without printing it), `"env"` (`var`), `"command"`
   (`check = [argv]`, exit 0 = ok). `fix_hint` is printed when the check fails.
@@ -98,7 +107,7 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
   `metrics <channel>`. Env: `DELEGA_JOB_MAX_MIN`, `DELEGA_JOB_MAX_TURNS`, `DELEGA_JOB_MAX_USD`,
   `DELEGA_JOB_GRACE_S`, `DELEGA_STALL_S`, `DELEGA_ANSWER_WAIT_S`, `DELEGA_LEASE_RENEW_S`,
   `DELEGA_LOCALE`. Removes `CLAUDE_*`/`ANTHROPIC_*` from the child env **except**
-  `CLAUDE_CONFIG_DIR`.
+  `CLAUDE_CONFIG_DIR` and those listed in `DELEGA_KEEP_ENV` (legacy `ORQ_CONSERVAR`).
 - `nodes`: `probe(cfg, node, profile, requires=()) -> dict` with
   `{ok, reason, fix, email, mem_mb, disk_gb, load_pct, containers, claude_version, pyz_sha,
   python, os, compute: {name: "ok"|"expired"|"missing"|"error_…"|"unknown"}}`;
@@ -131,7 +140,9 @@ Legacy names (`buzon.jsonl`, `avisos.jsonl`, `progreso.log`, `estado.json`, `eve
 - `queue`: CLI `queue add <repo> <brief> [--prio n] [-- run options]`, `queue ls`, `tick [--adopt]`.
 - `integrate`: CLI `integrate <repo> <branch> [--into main]`: `git merge-tree --write-tree` dry run,
   then the project's `verify` commands in a temporary worktree.
-- `sync`: CLI `sync [--profile p] [node…]`: tar the profile's `node_bundle` (CLAUDE.md, hooks/,
+- `kindling`: `probe(cfg, node, profile, requires)` (same shape as `nodes.probe`), `create`, `destroy`,
+  `push_head`, `make_worktree`, `fetch_branch`, `start_worker`, `read_token`.
+- `sync`: CLI `sync [--profile p] [--tar file] [node…]`: tar the profile's `node_bundle` (CLAUDE.md, hooks/,
   agents/, settings.json) into the node's `~/.claude` (or its `config_dirs[profile]`). A `home/` dir in the bundle is unpacked relative to `$HOME`;
   the profile's `bundle_post_sync = ["cmd", …]` run on the node after unpacking (e.g. to merge settings.json).
   A rendered node-rules section is appended to CLAUDE.md; credential-like files are never sent; `--dry-run` lists what would go.

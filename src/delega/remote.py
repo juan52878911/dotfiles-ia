@@ -59,8 +59,55 @@ def refuse_credentials(path):
             raise RemoteError(f"refusing to transfer credentials: {path}")
 
 
+# ── kindling microVMs ───────────────────────────────────────────────────────
+# A job on a `runner = "kindling"` node runs inside its own microVM on the kindling host.
+# The job's node dict then carries `vm` (see job_node) and ssh/scp below go through
+# `kling exec` / `kling cp` on the host, as the VM user, with paths relative to its home.
+def job_node(cfg, meta):
+    """Node dict of a job; a kindling job also carries its microVM (meta VM)."""
+    n = cfg.node(meta["NODE"])
+    if meta.get("VM"):
+        n["vm"] = meta["VM"]
+    return n
+
+
+def host_node(node):
+    """The node itself without its microVM: commands run on the kindling host."""
+    return {k: v for k, v in node.items() if k != "vm"} if isinstance(node, dict) else node
+
+
+def vm_home(node):
+    return node.get("vm_home", "/home/worker")
+
+
+def vm_user(node):
+    return node.get("vm_user", "worker")
+
+
+def vm_path(node, p):
+    """Absolute path inside the VM of a path relative to its home (or `~/…`)."""
+    p = str(p)
+    if p.startswith("~/"):
+        p = p[2:]
+    return p if os.path.isabs(p) else f"{vm_home(node)}/{p}"
+
+
+def vm_cmd(node, cmd, root=False):
+    """Host command that runs `cmd` inside the job's VM (as the VM user unless root)."""
+    q, home = shlex.quote, vm_home(node)
+    who = "" if root else f"runuser -u {q(vm_user(node))} -- "
+    return f"kling exec -w {q(home)} {q(node['vm'])} -- {who}env HOME={q(home)} bash -c {q(cmd)}"
+
+
+def _vm_tmp(node):
+    return f"/tmp/delega-{node['vm']}"
+
+
 def ssh(node, cmd, input=None, timeout=60):
-    """Run a shell command on a node. Never raises on a non-zero exit; a timeout is rc 124."""
+    """Run a shell command on a node (inside the job's VM if the node dict carries one).
+    Never raises on a non-zero exit; a timeout is rc 124."""
+    if isinstance(node, dict) and node.get("vm"):
+        cmd = vm_cmd(node, cmd)
     argv = _ssh_prefix() + SSH_OPTS + [alias(node), cmd]
     try:
         return subprocess.run(argv, input=input, capture_output=True, text=True, timeout=timeout,
@@ -81,11 +128,40 @@ def _scp(node, src, dst):
 
 def scp_to(node, src, dst):
     refuse_credentials(src)
+    if isinstance(node, dict) and node.get("vm"):
+        return _scp_to_vm(node, src, dst)
     return _scp(node, str(src), f"{alias(node)}:{dst}")
 
 
 def scp_from(node, src, dst):
+    if isinstance(node, dict) and node.get("vm"):
+        return _scp_from_vm(node, src, dst)
     return _scp(node, f"{alias(node)}:{src}", str(dst))
+
+
+def _scp_to_vm(node, src, dst):
+    """Upload through the kindling host: scp to a host tmp dir, `kling cp` into the VM, chown."""
+    q, host, vm = shlex.quote, host_node(node), node["vm"]
+    tmp, path = f"{_vm_tmp(node)}/up-{os.path.basename(str(dst))}", vm_path(node, dst)
+    r = ssh(host, f"mkdir -p {q(_vm_tmp(node))}")
+    if r.returncode != 0:
+        return r
+    r = _scp(host, str(src), f"{alias(node)}:{tmp}")
+    if r.returncode != 0:
+        return r
+    return ssh(host, f"kling cp {q(tmp)} {q(vm + ':' + path)} >/dev/null"
+                     f" && kling exec {q(vm)} -- chown {q(vm_user(node))}: {q(path)}; rc=$?; rm -f {q(tmp)}; exit $rc")
+
+
+def _scp_from_vm(node, src, dst):
+    q, host, vm = shlex.quote, host_node(node), node["vm"]
+    tmp = f"{_vm_tmp(node)}/down/{os.path.basename(str(src))}"
+    r = ssh(host, f"mkdir -p {q(os.path.dirname(tmp))} && kling cp {q(vm + ':' + vm_path(node, src))} {q(tmp)} >/dev/null")
+    if r.returncode != 0:
+        return r
+    r = _scp(host, f"{alias(node)}:{tmp}", str(dst))
+    ssh(host, f"rm -f {q(tmp)}")
+    return r
 
 
 def must(r, what):

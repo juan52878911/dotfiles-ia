@@ -36,7 +36,7 @@ def _fetch_results(cfg, job_dir, meta):
         return
     try:
         from . import remote
-        remote.scp_from(cfg.node(meta["NODE"]), f"{meta.get('CHANNEL', '')}/results.jsonl", job_dir)
+        remote.scp_from(remote.job_node(cfg, meta), f"{meta.get('CHANNEL', '')}/results.jsonl", job_dir)
     except Exception:  # offline node, missing helper…: the draft just says "no report"
         pass
 

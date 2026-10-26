@@ -17,7 +17,7 @@ import sys
 import time
 
 from . import config as _config
-from . import jobs, nodes, remote, util
+from . import jobs, kindling, nodes, remote, util
 from .i18n import t
 
 REFUSED_RC = 2
@@ -327,7 +327,15 @@ def wait_and_finish(cfg, job_dir, poll_s=None):
     """Remote job: wait for rc, copy the channel back, close the job, fetch the branch, scan, report.
     Shared by `delega run` and `delega adopt`. Returns the worker's rc (9 on forbidden terms in the branch)."""
     meta = util.read_meta(job_dir)
-    node = cfg.node(meta["NODE"])
+    node = remote.job_node(cfg, meta)
+    try:
+        return _finish(cfg, job_dir, meta, node, poll_s)
+    finally:
+        if node.get("vm") and not node.get("keep_vm"):
+            kindling.destroy(node, node["vm"])
+
+
+def _finish(cfg, job_dir, meta, node, poll_s):
     chan = meta["CHANNEL"]
     poll_s = float(os.environ.get("DELEGA_WAIT_POLL_S", 20)) if poll_s is None else poll_s
     rc = wait_for_rc(cfg, node, chan, poll_s)
@@ -346,7 +354,10 @@ def wait_and_finish(cfg, job_dir, poll_s=None):
            owner=meta.get("OWNER"), cost_usd=summ.get("cost_usd", summ.get("total_cost_usd")), rc=rc)
     hits = False
     if branch and repo_dir and os.path.isdir(repo_dir):
-        ok, log = remote.fetch_branch(repo_dir, node, meta.get("REPO", ""), branch)
+        if node.get("vm"):
+            ok, log = kindling.fetch_branch(repo_dir, node, chan, job_dir, branch)
+        else:
+            ok, log = remote.fetch_branch(repo_dir, node, meta.get("REPO", ""), branch)
         with open(os.path.join(job_dir, "fetch.log"), "w") as f:
             f.write(log)
         if ok:
@@ -432,6 +443,7 @@ class Launch:
         self.cfg, self.args = cfg, args
         self.job_dir = None
         self.started = False
+        self.vm = None          # kindling: node dict with the job's microVM, once created
 
     # -- helpers
     def fail(self, e):
@@ -453,6 +465,8 @@ class Launch:
             # A launch that dies before the worker starts must not look alive for hours.
             if self.job_dir and not self.started and os.path.isdir(self.job_dir):
                 jobs.close_job(self.job_dir, "launch_failed")
+                if self.vm:
+                    kindling.destroy(self.vm, self.vm["vm"])
 
     def _run(self):
         cfg, a = self.cfg, self.args
@@ -551,7 +565,7 @@ class Launch:
         if not p["ok"]:
             raise Refused(4 if p["kind"] == "identity" else 5,
                           t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
-        if node:
+        if node and not kindling.is_kindling(node):   # kindling: checked inside the VM once it exists
             lv = nodes.claude_version(profile["launcher"], profile.get("config_dir"))
             if not a.allow_version_skew and lv and not nodes.same_minor(lv, p.get("claude_version")):
                 raise Refused(5, t("launch.err.version", node=node_name, remote=p.get("claude_version"), local=lv))
@@ -563,6 +577,8 @@ class Launch:
                       DELEGA_VERSION=_version(), RESUMED="1" if a.resume else "")
         if node is None:
             return self._run_local(profile, project, repo_dir, account, caps, argv_claude, repo)
+        if kindling.is_kindling(node):
+            return self._run_kindling(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude)
         return self._run_remote(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude, prev)
 
     # -- node choice
@@ -657,6 +673,56 @@ class Launch:
                     "start worker")
         self.started = True
         print(t("launch.started_remote", node=name, wt=wt, branch=branch, id=job_id))
+        return wait_and_finish(cfg, self.job_dir)
+
+    # -- kindling: one ephemeral microVM per job
+    def _run_kindling(self, profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude):
+        cfg, a = self.cfg, self.args
+        if a.resume:
+            raise Refused(REFUSED_RC, t("launch.err.kindling_resume"))
+        if not _is_git(repo_dir):
+            raise Refused(REFUSED_RC, t("launch.err.not_git", path=repo_dir))
+        token = kindling.read_token(node)
+        vm, image = kindling.vm_name(job_id), kindling.golden(node, repo)
+        util.add_meta(self.job_dir, VM=vm)
+        node = dict(node, vm=vm)
+        kindling.create(node, vm, image)
+        self.vm = node
+        t0 = time.time()
+        rv = remote.ssh(node, " ".join(shlex.quote(x) for x in nodes.launcher_for(profile, node) + ["--version"]))
+        m = re.search(r"\d+\.\d+(\.\d+)?", rv.stdout or "")
+        vv = m.group(0) if m else None
+        lv = nodes.claude_version(profile["launcher"], profile.get("config_dir"))
+        if not a.allow_version_skew and lv and not nodes.same_minor(lv, vv):
+            raise Refused(5, t("launch.err.version", node=node["name"], remote=vv, local=lv))
+        sha = remote.ensure_pyz(cfg, node)
+        chan = remote.channel_rel(node, job_id)
+        branch = a.branch or f"delega/{job_id}"
+        if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
+            print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
+        remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
+        kindling.push_head(repo_dir, node, chan, job_id, profile.get("git"))
+        wt = kindling.make_worktree(node, job_id, branch)
+        util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha, ACCOUNT=node.get("account", ""),
+                      CLAUDE_VERSION=vv or "")
+        remote.must(remote.scp_to(node, os.path.join(self.job_dir, "brief.md"), f"{chan}/brief.md"), "upload brief")
+        self._forbidden_file(profile, chan)
+        if os.path.exists(os.path.join(self.job_dir, "forbidden.txt")):
+            remote.must(remote.scp_to(node, os.path.join(self.job_dir, "forbidden.txt"), f"{chan}/forbidden.txt"),
+                        "upload forbidden.txt")
+        caps = dict(caps, DELEGA_KEEP_ENV=kindling.keep_env(node))
+        local_sh = os.path.join(self.job_dir, "run.sh")
+        with open(local_sh, "w") as f:
+            f.write(build_run_sh(node, profile, caps, chan, wt, argv_claude))
+        remote.must(remote.scp_to(node, local_sh, f"{chan}/run.sh"), "upload run.sh")
+        print(t("launch.kindling_ready", vm=vm, image=image, s=int(time.time() - t0)))
+        meta = util.read_meta(self.job_dir)
+        _audit(cfg, "launch", job=job_id, profile=profile["name"], account=meta.get("ACCOUNT"), node=node["name"],
+               branch=branch, base=meta.get("BASE"), project=project, owner=meta.get("OWNER"), vm=vm)
+        remote.must(kindling.start_worker(node, chan, token), "start worker")
+        token = None
+        self.started = True
+        print(t("launch.started_remote", node=f"{node['name']}:{vm}", wt=wt, branch=branch, id=job_id))
         return wait_and_finish(cfg, self.job_dir)
 
 

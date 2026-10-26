@@ -78,7 +78,7 @@ The module contracts and file formats are in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `[general]` | `locale` (`en`\|`es`), `owner_name`, `state_dir`, `default_profile` |
 | `[policy]` | `job.max_min`, `job.max_turns`, `job.max_usd`, `job.grace_s`, `stall_s`, `answer_wait_s`, `resume_max_min`, `max_local_jobs`, `expected_hours`, `node.max_load_pct`, `node.min_disk_gb`, `node.min_mem_mb`, `node.reserve_mb_per_job`, `permission_mode.default`/`.deny`, `budget.day_usd`, `quota.window_5h_pct`, `quota.weekly_pct`, `lint.require`, `lease.renew_s`/`.stale_s` |
 | `[profiles.<p>]` | `owner = "self"` (required), `launcher`, `config_dir`, `identity.expect_email` / `.expect_email_domain`, `repo_match`, `git`, `model`, `nodes`, `compute`, `forbidden_terms_file`, `forbidden_engines`, `node_bundle`, `bundle_post_sync`, `policy.*` |
-| `[nodes.<n>]` | `ssh`, `max_jobs`, `min_disk_gb`, `profiles`, `workdir`, `jobs_subdir`, `python`, `runner` (`host`\|`docker`), `config_dirs`, `docker_image` |
+| `[nodes.<n>]` | `ssh`, `max_jobs`, `min_disk_gb`, `profiles`, `workdir`, `jobs_subdir`, `python`, `runner` (`host`\|`docker`\|`kindling`), `config_dirs`, `docker_image`; kindling: `golden`, `vm_home`, `vm_user`, `vm_repo`, `golden_base_ref`, `egress_allow`, `token_command`, `token_env`, `account`, `keep_vm` |
 | `[compute.<c>]` | `kind` (`gcp-adc`\|`env`\|`command`), its parameters, `fix_hint` |
 | `[projects."owner/repo"]` | `verify`, `branch_prefixes`, `policy.*` |
 

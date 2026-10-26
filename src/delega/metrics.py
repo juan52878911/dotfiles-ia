@@ -144,7 +144,7 @@ def remote_job_metrics(cfg, meta, job):
     """Run `broker metrics` on the job's node; None when it cannot be reached."""
     try:
         from . import remote
-        node = cfg.node(meta["NODE"])
+        node = remote.job_node(cfg, meta)
         cmd = f"cd ~/{node['workdir']} && {node['python']} delega.pyz broker metrics {shlex.quote(meta['CHANNEL'])}"
         r = remote.ssh(node, cmd, timeout=60)
         return normalise(json.loads(r.stdout)) if r.returncode == 0 else None

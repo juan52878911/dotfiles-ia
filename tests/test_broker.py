@@ -183,6 +183,14 @@ class Env(BrokerCase):
         with open(out) as f:
             self.assertEqual(f.read().split(), ["CLAUDE_CONFIG_DIR=/cfg/a"])
 
+    def test_keep_env_lets_named_vars_through(self):
+        for var in ("DELEGA_KEEP_ENV", "ORQ_CONSERVAR"):
+            out = os.path.join(self.tmp.name, f"env-{var}.txt")
+            self.run_broker(FAKE_ENV_OUT=out, CLAUDE_CODE_OAUTH_TOKEN="tok", CLAUDE_CODE_X="1",
+                            ANTHROPIC_API_KEY="k", **{var: "CLAUDE_CODE_OAUTH_TOKEN, ,X"})
+            with open(out) as f:
+                self.assertEqual(f.read().split(), ["CLAUDE_CODE_OAUTH_TOKEN=tok"])
+
 
 class Legacy(BrokerCase):
     def make_legacy(self):
