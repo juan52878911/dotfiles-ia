@@ -1,6 +1,6 @@
 ---
 name: delega
-description: Orchestrate coding work by delegating it to Claude Code workers that run on another account of the user's (and/or on other machines) with hard caps. Use when the user says "delegate", "orchestrate", "run it on the node/VM", "with the work account", when `delega doctor` shows a configured profile matches the repo, or at the start of any coding task in a repo that belongs to a profile with `repo_match`. Answer the user in the language they write in.
+description: Orchestrate coding work by delegating it to Claude Code workers that run on another account of the user's (and/or on other machines) with hard caps. Use when the user says "delegate", "orchestrate", "run it on the node/VM", "with the work account", when `delega doctor` shows a configured profile matches the repo, or at the start of any coding task in a repo that belongs to a profile with `repo_match`. If another installed skill is specific to the repo's organisation and points here, follow that one and use this as its reference for the mechanics. Answer the user in the language they write in.
 ---
 
 # Orchestrating with delega
@@ -64,6 +64,11 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
      that compute check.
    - `--node local` for what needs local tools, a browser, uncommitted files, or push/PR (nodes have
      no git hosting credentials).
+   - `--node <kindling node>` (`runner = "kindling"`): the job runs in an ephemeral microVM cloned
+     from a golden image with the repo's dependencies already installed, with egress limited to an
+     allowlist, and deleted at the end. Good for isolated, parallel work that needs no containers or
+     services; no `--resume` (the VM is gone: use `handoff`) and no `--requires`. When the repo's
+     dependencies change, rebuild the golden (`nodes/kindling/golden.sh`).
    - Only **HEAD** travels to a node: commit first. The worker uses branch `delega/<id>` (or
      `--branch`); when it ends, the branch comes home and is scanned against the forbidden terms.
    - Nodes carry the profile's rules (agents, hooks, CLAUDE.md). New node or changed rules:
@@ -190,7 +195,7 @@ cuts between turns, minutes and messages cut at any time.
 | `delega scan <repo> <branch> [base]` | Forbidden terms in a branch (exit 9 on hits) |
 | `delega integrate <repo> <branch> [--into main]` | Merge dry run + verify commands |
 | `delega queue add\|ls` · `delega tick [--adopt]` | Queue with priorities |
-| `delega sync [--profile p] [node…]` | Rules bundle to the nodes |
+| `delega sync [--profile p] [--tar file] [node…]` | Rules bundle to the nodes (or to a tar for a golden) |
 | `delega audit [job\|branch]` | Provenance from the audit log |
 | `delega metrics start\|stop\|report` | Resources, tokens and times |
 
