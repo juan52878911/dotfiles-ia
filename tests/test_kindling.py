@@ -144,11 +144,12 @@ account = "dev@example.com (token)"
 
     def test_full_host_refused_by_probe(self):
         os.makedirs(os.path.join(self.node_home, ".kling-vms"))
-        for n in ("delega-a", "delega-b"):
+        for n in ("delega-a", "delega-b", "delega-seed-db-api-main"):
             open(os.path.join(self.node_home, ".kling-vms", n), "w").close()
         rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm"])
         self.assertEqual(rc, 5, out + err)
         self.assertIn("max_jobs=2", err)
+        self.assertIn("2 delega VMs", err)          # the seed sandbox is not a job
 
     def test_requires_compute_refused(self):
         rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--requires", "tool"])

@@ -25,6 +25,7 @@ from . import remote
 
 DEFAULT_EGRESS = ["anthropic.com"]
 VM_PREFIX = "delega-"
+NOT_JOBS = ("delega-seed-", "delega-load-", "delega-bake-")   # seed sandboxes, volume loaders, data-golden bakes
 
 
 def is_kindling(node):
@@ -76,7 +77,8 @@ def live_vms(node):
     r = remote.ssh(remote.host_node(node), "kling ps", timeout=30)
     if r.returncode != 0:
         return None
-    return sum(1 for line in r.stdout.splitlines() if any(w.startswith(VM_PREFIX) for w in line.split()))
+    return sum(1 for line in r.stdout.splitlines()
+               if any(w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS) for w in line.split()))
 
 
 def probe(cfg, node, profile, requires=()):
