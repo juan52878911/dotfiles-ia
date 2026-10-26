@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Fake delega-db for tests (the fake kling runs it for /usr/local/bin/delega-db inside a VM).
+
+up <engine> <name> <db> [seed]: the "database" is <root>/var/lib/delega-db/<name>/data, the seed's parts
+concatenated; check prints its size. Calls are logged to $HOME/.kling.log as `dbctl …`.
+"""
+import glob
+import os
+import shutil
+import sys
+
+a = sys.argv[1:]
+with open(os.path.join(os.environ["HOME"], ".kling.log"), "a") as f:
+    f.write("dbctl " + " ".join(a) + "\n")
+cmd = a[0] if a else ""
+if cmd == "install" or cmd == "has":
+    sys.exit(0)
+d = os.path.join(os.environ["FAKE_VM_ROOT"], "var/lib/delega-db", a[2] if len(a) > 2 else "")
+if cmd == "up":
+    if os.environ.get("FAKE_DBCTL_FAIL"):
+        print("delega-db: boom", file=sys.stderr)
+        sys.exit(1)
+    if os.path.exists(os.path.join(d, ".loaded")):
+        print(f"up {a[1]}/{a[2]} (already loaded)")
+        sys.exit(0)
+    os.makedirs(d, exist_ok=True)
+    data = b""
+    if len(a) > 4:
+        parts = sorted(glob.glob(os.path.join(a[4], "dump.*.part-*")))
+        if not parts:
+            print(f"delega-db: no dump.* in {a[4]}", file=sys.stderr)
+            sys.exit(1)
+        data = b"".join(open(p, "rb").read() for p in parts)
+        shutil.copy(os.path.join(a[4], "MANIFEST"), os.path.join(d, "SEED"))
+    open(os.path.join(d, "data"), "wb").write(data)
+    open(os.path.join(d, ".loaded"), "w").close()
+    print(f"loaded {a[1]}/{a[2]} errors=0")
+elif cmd == "check":
+    print(f"tables=1 bytes={os.path.getsize(os.path.join(d, 'data'))}")

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake chown for tests: the VM user does not exist here.
+exit 0

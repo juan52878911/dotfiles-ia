@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Fake `claude -p` speaking stream-json on stdin/stdout, for the broker tests.
+
+FAKE_MODE   chat (default)  answers each user message with a result, exits at stdin EOF
+            obey            works (tool calls) until asked to wrap up (cap), then reports
+            ignore          works forever and ignores every message (until killed)
+            question        notifies a question, reports, then waits for an answer
+            loop            repeats the same tool call, then reports
+            errors          three failing tool results in a row, then reports
+            cost            reports immediately with total_cost_usd = FAKE_COST
+FAKE_COST   total_cost_usd of every result (default 0.01)
+FAKE_SLEEP  seconds between tool calls / before a result (default 0.2)
+FAKE_ENV_OUT  file where CLAUDE*/ANTHROPIC* env vars are dumped (for the env tests)
+FAKE_RECV   file where every received user message is appended
+FAKE_LEAK   text added to the tool call and to the final result (redaction tests)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+
+mode = os.environ.get("FAKE_MODE", "chat")
+cost = float(os.environ.get("FAKE_COST", "0.01"))
+nap = float(os.environ.get("FAKE_SLEEP", "0.2"))
+leak = os.environ.get("FAKE_LEAK", "")
+lock = threading.Lock()
+
+
+def out(e):
+    with lock:
+        sys.stdout.write(json.dumps(e) + "\n")
+        sys.stdout.flush()
+
+
+def result(text="final report"):
+    out({"type": "result", "subtype": "success", "result": f"{text} {leak}".strip(), "session_id": "s-fake",
+         "total_cost_usd": cost, "is_error": False, "duration_api_ms": 1000, "num_turns": 1,
+         "modelUsage": {"claude-fake": {"inputTokens": 10, "outputTokens": 5, "cacheReadInputTokens": 0,
+                                        "cacheCreationInputTokens": 0, "costUSD": cost}}})
+
+
+def tool(cmd, n=0):
+    out({"type": "assistant", "message": {"id": f"m{n}", "model": "claude-fake",
+                                          "content": [{"type": "tool_use", "name": "Bash",
+                                                       "input": {"command": f"{cmd} {leak}".strip()}}]}})
+
+
+if os.environ.get("FAKE_ENV_OUT"):
+    with open(os.environ["FAKE_ENV_OUT"], "w") as f:
+        for k, v in sorted(os.environ.items()):
+            if k.startswith(("CLAUDE", "ANTHROPIC")):
+                f.write(f"{k}={v}\n")
+
+args = sys.argv
+prompt = args[args.index("--append-system-prompt") + 1] if "--append-system-prompt" in args else ""
+m = re.search(r"([^\s`]+/notify) milestone", prompt)
+notify = m.group(1) if m else None
+
+out({"type": "system", "subtype": "init", "session_id": "s-fake", "model": "claude-fake"})
+out({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "unifiedWindows": {
+    "five_hour": {"utilization": 0.25, "resetsAt": int(time.time()) + 3600},
+    "seven_day": {"utilization": 0.1, "resetsAt": int(time.time()) + 86400}}}})
+
+inbox, stop, got_first = [], threading.Event(), threading.Event()
+
+
+def read():
+    for l in sys.stdin:
+        try:
+            msg = json.loads(l)["message"]["content"]
+        except (ValueError, KeyError):
+            continue
+        if os.environ.get("FAKE_RECV"):
+            with open(os.environ["FAKE_RECV"], "a") as f:
+                f.write(msg + "\n")
+        inbox.append(msg)
+        got_first.set()
+    stop.set()
+    got_first.set()
+
+
+threading.Thread(target=read, daemon=True).start()
+got_first.wait()
+
+if mode == "cost":
+    result()
+elif mode == "errors":
+    tool("false")
+    for i in range(3):
+        out({"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "boom"}]}})
+    result()
+elif mode == "loop":
+    for i in range(3):
+        tool("echo same", i)
+        time.sleep(nap / 4)
+    result()
+elif mode == "question":
+    if notify:
+        subprocess.run([notify, "question", f"which database? {leak}".strip()], check=False,
+                       stdout=subprocess.DEVNULL)
+    result("asked")
+elif mode in ("obey", "ignore"):
+    i = 0
+    while not stop.is_set():
+        i += 1
+        tool(f"echo {i}", i)
+        if mode == "obey" and any(("cap" in x or "tope" in x) for x in inbox[1:]):
+            result()
+            break
+        time.sleep(nap)
+else:
+    if notify and leak:
+        subprocess.run([notify, "milestone", f"step done {leak}"], check=False, stdout=subprocess.DEVNULL)
+    tool("echo working")
+    time.sleep(nap)
+    result()
+
+if mode in ("chat", "question", "cost", "loop", "errors", "obey"):
+    # Further user messages get an answer; EOF ends the process.
+    seen = len(inbox) if mode == "obey" else 1
+    while True:
+        if len(inbox) > seen:
+            msg = inbox[seen]
+            seen += 1
+            out({"type": "assistant", "message": {"id": f"r{seen}", "model": "claude-fake",
+                                                  "content": [{"type": "text", "text": f"got: {msg}"}]}})
+            result(f"done after: {msg}")
+        elif stop.is_set():
+            break
+        else:
+            time.sleep(0.05)

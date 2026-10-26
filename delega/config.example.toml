@@ -1,0 +1,72 @@
+# delega configuration — copy to ~/.config/delega/config.toml and edit.
+# Every [policy] value can be overridden per profile ([profiles.X.policy]), per project
+# ([projects."owner/repo".policy]) or by an environment variable DELEGA_<KEY>.
+
+[general]
+locale = "en"                 # en | es — messages, worker protocol and templates
+owner_name = "Alex"           # how the skill refers to the human who decides
+state_dir = "~/.local/state/delega"
+default_profile = "work"
+
+[policy]
+job.max_min = 120             # per job: ask to wrap up, then cut after job.grace_s
+job.max_turns = 800           # assistant messages, subagents included
+job.max_usd = 15
+job.grace_s = 300
+resume_max_min = 60           # older sessions must be continued with `delega handoff`
+max_local_jobs = 3
+budget.day_usd = 150          # all jobs of the day; launching beyond it is refused
+quota.window_5h_pct = 70      # subscription windows: keep below these
+quota.weekly_pct = 90
+node.max_load_pct = 80
+node.min_disk_gb = 20
+
+# A profile is one account. owner = "self" is mandatory: delega only runs accounts that are
+# assigned to you and used only by you. Jobs never move between profiles.
+[profiles.work]
+owner = "self"
+config_dir = "~/.claude-work"            # exported as CLAUDE_CONFIG_DIR for every worker
+identity.expect_email_domain = "example.com"
+repo_match = { git_remote = "github.com[:/]example-org/" }
+git = { user_name = "Alex Doe", user_email = "alex@example.com" }
+model = "sonnet"
+forbidden_terms_file = "~/.config/delega/work/forbidden.txt"   # client names, never in commits
+node_bundle = "~/.config/delega/work/bundle"                   # CLAUDE.md, hooks/, agents/ for nodes
+# `delega sync` unpacks the bundle into the node's ~/.claude (or config_dirs): CLAUDE.md, hooks/, agents/,
+# settings.json. A home/ directory inside the bundle is unpacked relative to $HOME instead.
+# Commands run on the node after unpacking (e.g. to merge settings.json):
+bundle_post_sync = ["python3 ~/.local/share/example/merge-settings.py"]
+nodes = ["buildbox"]
+compute = ["vertex"]
+policy.budget.day_usd = 100
+
+[compute.vertex]
+kind = "gcp-adc"
+adc_path = "~/.config/gcloud/application_default_credentials.json"
+fix_hint = "gcloud auth application-default login --no-launch-browser"
+
+[nodes.buildbox]
+ssh = "buildbox"              # alias in ~/.ssh/config
+max_jobs = 2
+min_disk_gb = 20
+profiles = ["work"]
+config_dirs = { work = "~/.claude-work" }
+
+# One ephemeral microVM per job on a kindling host (golden built with nodes/kindling/golden.sh).
+# Only explicit `--node sandbox` uses it unless you add it to a profile's `nodes`.
+[nodes.sandbox]
+ssh = "kling-host"
+runner = "kindling"
+max_jobs = 3
+profiles = ["work"]
+golden = "claude-{repo}"
+vm_user = "worker"
+vm_home = "/home/worker"
+egress_allow = ["anthropic.com"]
+token_command = ["security", "find-generic-password", "-s", "claude-work-token", "-w"]   # prints the OAuth token
+account = "me@example.com (token)"
+
+[projects."example-org/api"]
+verify = ["npm run typecheck", "npm test -- --run"]
+branch_prefixes = ["feature/", "fix/", "delega/"]
+policy.budget.day_usd = 60

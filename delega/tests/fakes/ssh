@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Fake ssh for tests: runs the remote command locally with HOME=$FAKE_NODE_HOME.
+
+  ssh [options] <alias> <command…>      (git calls it the same way for push/fetch)
+
+An alias starting with "down" behaves like an unreachable host (rc 255). Every call is logged to
+$FAKE_NODE_HOME/.ssh.log (alias + command) so tests can assert on what was run.
+"""
+import os
+import subprocess
+import sys
+
+OPTS_WITH_VALUE = {"-o", "-p", "-i", "-l", "-F", "-J", "-L", "-R", "-D", "-b", "-c", "-E", "-S"}
+
+
+def main():
+    home = os.environ["FAKE_NODE_HOME"]
+    args, host, rest, i = sys.argv[1:], None, [], 0
+    while i < len(args):
+        a = args[i]
+        if host is None and a.startswith("-"):
+            i += 2 if a in OPTS_WITH_VALUE else 1
+            continue
+        if host is None:
+            host = a
+        else:
+            rest.append(a)
+        i += 1
+    if host is None:
+        return 255
+    os.makedirs(home, exist_ok=True)
+    with open(os.path.join(home, ".ssh.log"), "a") as f:
+        f.write(f"{host}\t{' '.join(rest)}\n")
+    if host.startswith("down"):
+        print(f"ssh: connect to host {host}: No route to host", file=sys.stderr)
+        return 255
+    env = {**os.environ, "HOME": home}
+    r = subprocess.run(["bash", "-c", " ".join(rest)], cwd=home, env=env)
+    return r.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

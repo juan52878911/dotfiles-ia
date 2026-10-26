@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Run delega from a checkout or a plugin install without pip (works through symlinks,
+# e.g. ln -s <checkout>/bin/delega ~/.local/bin/delega).
+src="${BASH_SOURCE[0]}"
+while [[ -L "$src" ]]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" == /* ]] || src="$dir/$src"
+done
+here="$(cd -P "$(dirname "$src")/.." && pwd)"
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m delega "$@"

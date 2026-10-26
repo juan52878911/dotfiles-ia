@@ -1,0 +1,4 @@
+#!/bin/sh
+# Fake runuser for tests: `runuser -u <user> -- cmd…` just runs cmd.
+shift 3
+exec "$@"
