@@ -247,6 +247,14 @@ class Kindling(KindlingCase):
         self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k2:result.txt"), "survived")
         self.assertRegex(self.kling_log(), r"\nrm delega-")
 
+    def test_vm_clock_behind_is_not_a_lost_broker(self):
+        # a VM restored from a golden whose clock kling could not resync: its lease looks 300 s old by
+        # this machine's clock, yet the broker is alive. Seen on a real host: rc 97 and the VM destroyed.
+        os.environ.update(FAKE_VM_CLOCK_SKEW_S="300", STUB_SLEEP="1.5", STUB_COMMIT_TEXT="on time")
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k4"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k4:result.txt"), "on time")
+
     def disconnect(self, **env):
         """Launch a job and cut ssh for good once it runs: rc 96. The worker waits for self.go."""
         self.go = os.path.join(self.root, "go")

@@ -345,14 +345,11 @@ def wait_for_rc(cfg, node, chan, poll_s, on_poll=None):
                     return int(r.stdout.strip().splitlines()[-1])
                 except (ValueError, IndexError):
                     return 1
-            lease = ssh_retry(cfg, node, f"cat {q}/lease.json")
+            lease = ssh_retry(cfg, node, remote.lease_cmd(chan))
             if lease.returncode == 0:
-                try:
-                    d = json.loads(lease.stdout)
-                    if not d.get("final") and time.time() - float(d.get("renewed", 0)) > stale:
-                        return RC_BROKER_LOST
-                except ValueError:
-                    pass
+                d, age = remote.lease_age(lease)      # by the node's clock, not this machine's
+                if d and not d.get("final") and age > stale:
+                    return RC_BROKER_LOST
             elif time.time() - t0 > start_timeout:
                 alive = ssh_retry(cfg, node, f"test -f {q}/state.json || test -f {q}/estado.json")
                 if alive.returncode != 0:

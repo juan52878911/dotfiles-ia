@@ -7,13 +7,21 @@ the real broker. Env: STUB_SLEEP seconds to stay "running", STUB_COMMIT_TEXT fil
 (none = no commit), STUB_RC exit code, STUB_ASK_FILE: wait until this file exists, STUB_NOD_QUESTION:
 emit a question and its decision.request to the channel's nod.jsonl, STUB_WAIT_FILE: stay running
 (renewing the lease) until this file exists (60 s at most), STUB_BIG_MB: also commit a random file of
-that many MiB (a branch bigger than kling exec's 8 MiB of stdout).
+that many MiB (a branch bigger than kling exec's 8 MiB of stdout). Inside a fake VM with
+FAKE_VM_CLOCK_SKEW_S, its clock (lease `renewed`) runs that many seconds behind, like tests/fakes/kling-bin/date.
 """
 import json
 import os
 import subprocess
 import sys
 import time
+
+
+SKEW = float(os.environ.get("FAKE_VM_CLOCK_SKEW_S") or 0) if os.environ.get("FAKE_VM_ROOT") else 0.0
+
+
+def clock():
+    return time.time() - SKEW
 
 
 def now():
@@ -28,7 +36,7 @@ def main(argv):
     start = time.time()
     w = lambda name, text: open(os.path.join(chan, name), "w").write(text)
     jw = lambda name, d: w(name, json.dumps(d))
-    jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": time.time()})
+    jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": clock()})
     jw("state.json", {"state": "running", "start": start, "last_event": start, "last_action": "starting",
                       "tools": 0, "turns": 0, "alerts": 0, "messages": 0, "session_id": None, "rc": None,
                       "pid": os.getpid()})
@@ -49,7 +57,7 @@ def main(argv):
         time.sleep(0.1)
     wait, limit = os.environ.get("STUB_WAIT_FILE"), time.time() + 60
     while wait and not os.path.exists(wait) and time.time() < limit:
-        jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": time.time()})
+        jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": clock()})
         time.sleep(0.1)
     if os.environ.get("STUB_BIG_MB"):
         with open("big.bin", "wb") as f:
@@ -72,7 +80,7 @@ def main(argv):
     jw("state.json", {"state": "done", "start": start, "last_event": time.time(), "tools": 2, "turns": 3,
                       "alerts": 0, "messages": 3, "session_id": sid, "rc": rc, "pid": os.getpid(), "cost_usd": 0.5})
     open(os.path.join(chan, "progress.log"), "a").write(f"{now()}\tEND\trc={rc}\n")
-    jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": time.time(), "final": True})
+    jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": clock(), "final": True})
     w("rc", str(rc))
     return rc
 

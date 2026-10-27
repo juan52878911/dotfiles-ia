@@ -505,15 +505,8 @@ def recover(cfg, job_dir, force=False):
         except (ValueError, IndexError):
             rc = 1
     else:
-        try:
-            lease = json.loads(remote.ssh(node, f"cat {chan}/lease.json", timeout=60).stdout or "null")
-        except ValueError:
-            lease = None
-        try:
-            fresh = bool(lease) and not lease.get("final") and \
-                time.time() - float(lease.get("renewed", 0)) < float(cfg.policy("lease.stale_s"))
-        except (TypeError, ValueError):
-            fresh = False
+        lease, age = remote.lease_age(remote.ssh(node, remote.lease_cmd(meta["CHANNEL"]), timeout=60))
+        fresh = bool(lease) and not lease.get("final") and age < float(cfg.policy("lease.stale_s"))
         if fresh and not force:
             print(t("jobs.recover.running", job=job_id(job_dir)), file=sys.stderr)
             return 2

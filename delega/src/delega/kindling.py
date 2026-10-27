@@ -14,7 +14,6 @@ delega.pyz. What comes back: the channel files and a bundle with the job branch.
 by `token_command` on this machine, goes through ssh stdin to the host and into the worker's
 environment with `kling exec -e`: it is never written to a disk, here, on the host or in the VM.
 """
-import json
 import os
 import re
 import shlex
@@ -125,18 +124,10 @@ def classify(cfg, node, vms):
             orphans.append((vm, "frozen"))
             continue
         chan = meta.get("CHANNEL")
-        r = remote.ssh(dict(node, vm=vm), f"cat {shlex.quote(chan)}/lease.json", timeout=30) if chan else None
-        lease = None
-        if r is not None and r.returncode == 0:
-            try:
-                lease = json.loads(r.stdout)
-            except ValueError:
-                lease = None
+        lease, age = remote.lease_age(remote.ssh(dict(node, vm=vm), remote.lease_cmd(chan), timeout=30)) \
+            if chan else (None, None)
         if lease:
-            try:
-                fresh = not lease.get("final") and time.time() - float(lease.get("renewed", 0)) < stale
-            except (TypeError, ValueError):
-                fresh = False
+            fresh = not lease.get("final") and age < stale
             (active.append(vm) if fresh else orphans.append((vm, "stale")))
             continue
         try:
