@@ -14,7 +14,7 @@ Mi configuración de IA en un solo sitio. De momento, Claude Code: hooks, subage
 | `claude/agents/` | Subagentes, cada uno con su modelo (Sonnet o Haiku; Opus queda para la sesión principal). |
 | `claude/settings-base.json` | Lo que se garantiza en `~/.claude/settings.json`: reglas `deny`, hooks y comodines que se quitan de `allow`. |
 | `claude/fusionar-settings.py` | Fusiona lo anterior sin pisar lo que escriben Claude Code, Nod u Orbit. Idempotente. |
-| `nix/modulo.nix` | Módulo de home-manager (`programs.dotfiles-ia`). |
+| `nix/modulo.nix` | Módulo de home-manager (`programs.dotfiles-ia`). Con `chronoIa.enable`, instala `chrono-ia` (chrono sobre un índice de operaciones de IA: delega, Nod y transcripciones de Claude) y un agente de launchd que lo sincroniza cada 5 min. |
 | `tests/probar-damage-control.py` | Casos de prueba del hook. |
 | `delega/` | Orquestador de trabajadores de Claude Code en otras cuentas y máquinas (topes, presupuesto, cupo, auditoría). Genérico y sin datos personales: la configuración vive fuera, en `~/.config/delega`. Ver `delega/README.md`. |
 

@@ -41,6 +41,32 @@ in
     };
   };
 
+  options.programs.dotfiles-ia.chronoIa = {
+    enable = lib.mkEnableOption ''
+      un índice de chrono para las operaciones de IA (trabajos de delega, eventos de Nod y transcripciones
+      de Claude Code): el comando `chrono-ia` y un agente de launchd que lo sincroniza'';
+    binario = lib.mkOption {
+      type = lib.types.str;
+      default = "${config.home.homeDirectory}/.local/bin/chrono";
+      description = "Binario de chrono (>= 0.7) que usan `chrono-ia` y la sincronización.";
+    };
+    db = lib.mkOption {
+      type = lib.types.str;
+      default = "${config.home.homeDirectory}/.local/state/chrono-ia/index.db";
+      description = ''
+        Índice. Las fuentes se añaden una vez a mano (quedan en el propio índice), p. ej.:
+          chrono-ia add <state_dir de delega> --as delega
+          chrono-ia add ~/.local/state/nod/events.jsonl --as nod
+          chrono-ia add '~/.claude/projects/**/*.jsonl' --as jsonl --name claude --preset claude-sessions
+      '';
+    };
+    intervalo = lib.mkOption {
+      type = lib.types.int;
+      default = 300;
+      description = "Segundos entre sincronizaciones (un sync incremental tarda menos de un segundo).";
+    };
+  };
+
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       home.file = {
@@ -56,6 +82,30 @@ in
         run ${pkgs.python3}/bin/python3 ${origen}/claude/fusionar-settings.py
       '';
     }
+
+    (lib.mkIf cfg.chronoIa.enable {
+      home.file.".local/bin/chrono-ia" = {
+        executable = true;
+        text = ''
+          #!/bin/sh
+          # chrono sobre el índice de operaciones de IA: chrono-ia delega, chrono-ia tail --source delega,nod …
+          exec ${cfg.chronoIa.binario} --db ${cfg.chronoIa.db} "$@"
+        '';
+      };
+      # Sin el sync, las consultas ven el índice de la última vez: Nod y las transcripciones crecen sin parar.
+      launchd.agents.chrono-ia-sync = {
+        enable = true;
+        config = {
+          ProgramArguments = [ cfg.chronoIa.binario "sync" "--db" cfg.chronoIa.db ];
+          StartInterval = cfg.chronoIa.intervalo;
+          RunAtLoad = true;
+          Nice = 10;
+          LowPriorityIO = true;
+          StandardOutPath = "${config.home.homeDirectory}/Library/Logs/chrono-ia-sync.log";
+          StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/chrono-ia-sync.log";
+        };
+      };
+    })
 
     (lib.mkIf cfg.pi.enable (
       let

@@ -140,6 +140,19 @@ cuts between turns, minutes and messages cut at any time.
 - `delega queue add <repo> <brief> --prio N` + `delega tick` (e.g. from a timer) launch queued work
   when quota, budget and node capacity allow; `tick --adopt` re-attaches orphaned remote jobs.
 
+### Measuring with chrono (if installed)
+
+When a chrono ≥ 0.7 index holds the delega state dir (`--as delega`), the Nod events (`--as nod`) and
+the Claude transcripts (`--preset claude-sessions`), use it instead of reading logs or transcripts:
+
+- **One monitor** for every job and session: `chrono --db <index> tail --source delega,nod --level WARN,ERROR`
+  (or `delega watch --bus`). Never one monitor per job.
+- **Retrospective with exact figures**, no agent needed: `chrono --db <index> delega --since <date>`
+  (spend matched against `delega spend`, infra failures, empty orchestrator turns, question → answer latency).
+- **"X without Y"**: `chrono --db <index> gaps` (questions without an answer, jobs without `integrate`,
+  sessions without a commit).
+- The chrono MCP pointed at that index exposes the same as tools (`delega`, `gaps`, `session_patterns`).
+
 ## 2. Parallelise, iterate and cut
 
 - Parallelise only pieces **without data dependencies**, each with its own environment, and never
