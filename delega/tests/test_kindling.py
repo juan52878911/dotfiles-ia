@@ -49,6 +49,23 @@ account = "dev@example.com (token)"
 """
         super().write_config()
 
+    def fake_vm(self, name, job=None, lease_age=None, end=False, final=False):
+        """A VM on the fake host (no golden home) and, with job, its job dir here and lease inside it."""
+        import json
+        import time
+        reg = os.path.join(self.node_home, ".kling-vms")
+        os.makedirs(reg, exist_ok=True)
+        with open(os.path.join(reg, name), "w") as f:
+            f.write("{}")
+        if job:
+            chan = f"delega-jobs/{job}"
+            self.new_job(id=job, NODE="vm", VM=name, CHANNEL=chan, **({"END": "1"} if end else {}))
+            if lease_age is not None:
+                d = os.path.join(reg, name + ".root") + self.vmhome + "/" + chan
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "lease.json"), "w") as f:
+                    json.dump({"pid": 1, "renewed": time.time() - lease_age, **({"final": True} if final else {})}, f)
+
     def kling_log(self):
         p = os.path.join(self.node_home, ".kling.log")
         return open(p).read() if os.path.exists(p) else ""
@@ -147,13 +164,157 @@ class Kindling(KindlingCase):
         self.assertFalse(os.path.exists(self.vmhome))
 
     def test_full_host_refused_by_probe(self):
-        os.makedirs(os.path.join(self.node_home, ".kling-vms"))
-        for n in ("delega-a", "delega-b", "delega-seed-db-api-main"):
-            open(os.path.join(self.node_home, ".kling-vms", n), "w").close()
-        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm"])
-        self.assertEqual(rc, 5, out + err)
-        self.assertIn("max_jobs=2", err)
-        self.assertIn("2 delega VMs", err)          # the seed sandbox is not a job
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-b", "20260101-000000-b", lease_age=1)
+        self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
+        self.fake_vm("delega-seed-db-api-main")
+        from delega import config, kindling
+        cfg = config.load()
+        res = kindling.probe(cfg, cfg.node("vm"), cfg.profile("work"))
+        self.assertFalse(res["ok"])
+        self.assertIn("max_jobs=2", res["reason"])
+        self.assertIn("2 delega VMs with a live job", res["reason"])       # the seed sandbox is not a job
+        self.assertIn("delega-20260101-000000-c (ended)", res["reason"])  # listed, not counted
+        self.assertIn("delega gc --node vm", res["fix"])
+
+    def test_orphans_do_not_count(self):
+        from delega import config, kindling
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
+        self.fake_vm("delega-20260101-000000-d")                                     # not a job of ours
+        self.fake_vm("delega-20260101-000000-e", "20260101-000000-e", lease_age=3600)  # broker gone
+        self.fake_vm("delega-20260101-000000-f", "20260101-000000-f", lease_age=1, final=True)  # finished
+        cfg = config.load()
+        res = kindling.probe(cfg, cfg.node("vm"), cfg.profile("work"))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["vms"], 1)
+        self.assertEqual(dict(res["orphans"]), {"delega-20260101-000000-c": "ended", "delega-20260101-000000-d": "unknown",
+                                                "delega-20260101-000000-e": "stale", "delega-20260101-000000-f": "stale"})
+
+    def test_gc_lists_then_deletes_only_ended_and_unknown(self):
+        import contextlib
+        import io
+
+        from delega import config, jobs
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
+        self.fake_vm("delega-20260101-000000-d")
+        self.fake_vm("delega-20260101-000000-e", "20260101-000000-e", lease_age=3600)
+        reg = os.path.join(self.node_home, ".kling-vms")
+        before = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(jobs.main_gc([]), 0)
+        self.assertEqual(sorted(x for x in os.listdir(reg) if not x.endswith(".root")), before)   # nothing deleted
+        self.assertIn("delega-20260101-000000-c (job ended) would be deleted", buf.getvalue())
+        self.assertIn("delega-20260101-000000-d (job unknown here) would be deleted", buf.getvalue())
+        self.assertIn("delega recover 20260101-000000-e", buf.getvalue())
+        self.assertIn("--yes", buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(jobs.gc(config.load(), yes=True), 2)
+        left = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
+        self.assertEqual(left, ["delega-20260101-000000-a", "delega-20260101-000000-e"])
+
+    def test_vm_gets_ttl_and_labels(self):
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--cap-min", "10"])
+        self.assertEqual(rc, 0, out + err)
+        job = util.read_meta(self.job_dir())["VM"][len("delega-"):]
+        # cap 10 min + grace 300 s + margin 30 min
+        self.assertIn(f"-ttl 45m -on-ttl freeze -label delega.job={job} -label delega.owner=tester -wait-ready",
+                      self.kling_log())
+
+    def cut_ssh_on_first_poll(self, how):
+        """Patch the per-poll hook so ssh to the host starts failing once the worker is running."""
+        from delega import nod
+        state = {"done": False}
+
+        def cut(*a, **k):
+            if not state["done"]:
+                state["done"] = True
+                with open(os.path.join(self.node_home, ".ssh.fail"), "w") as f:
+                    f.write(how)
+        return mock.patch.object(nod, "pull_and_forward", cut)
+
+    def test_ssh_fails_a_few_times_then_comes_back(self):
+        os.environ.update(STUB_SLEEP="0.5", STUB_COMMIT_TEXT="survived")
+        with self.cut_ssh_on_first_poll("3"):
+            rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k2"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("retry 1/5", err)
+        self.assertIn("retry 3/5", err)
+        self.assertNotIn("retry 4/5", err)
+        self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k2:result.txt"), "survived")
+        self.assertRegex(self.kling_log(), r"\nrm delega-")
+
+    def disconnect(self, **env):
+        """Launch a job and cut ssh for good once it runs: rc 96. The worker waits for self.go."""
+        self.go = os.path.join(self.root, "go")
+        os.environ.update(STUB_WAIT_FILE=self.go, STUB_COMMIT_TEXT="kept", **env)
+        with self.cut_ssh_on_first_poll("always"):
+            rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k3"])
+        self.addCleanup(lambda: open(self.go, "w").close())      # never leave the stub waiting
+        return rc, out, err
+
+    def release_worker(self):
+        import time
+        if os.path.exists(os.path.join(self.node_home, ".ssh.fail")):
+            os.remove(os.path.join(self.node_home, ".ssh.fail"))
+        open(self.go, "w").close()
+        rc_file = os.path.join(self.vmhome, util.read_meta(self.job_dir())["CHANNEL"], "rc")
+        for _ in range(200):
+            if os.path.exists(rc_file):
+                return
+            time.sleep(0.05)
+        self.fail("worker did not finish")
+
+    def test_no_contact_is_96_keeps_vm_and_adopt_brings_branch(self):
+        rc, out, err = self.disconnect()
+        self.assertEqual(rc, 96, out + err)
+        self.assertIn("delega adopt", err)
+        self.assertIn("Nothing was destroyed", err)
+        meta = util.read_meta(self.job_dir())
+        self.assertTrue(meta.get("DISCONNECTED"))
+        self.assertFalse(meta.get("END"))
+        self.assertNotRegex(self.kling_log(), r"\nrm delega-")
+        self.assertTrue(os.path.exists(os.path.join(self.node_home, ".kling-vms", meta["VM"])))
+        from delega import config, jobs
+        with open(os.path.join(self.job_dir(), "waiter.pid"), "w") as f:
+            f.write("0")                                                 # the waiter that got 96 is gone
+        self.assertIn((self.job_dir(), "disconnected"), jobs.reconcile(config.load()))
+        self.assertFalse(util.read_meta(self.job_dir()).get("END"))      # reconcile does not close it
+        self.release_worker()
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(jobs.adopt(config.load(), self.job_dir(), poll_s=0.05), 0)
+        self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k3:result.txt"), "kept")
+        self.assertTrue(util.read_meta(self.job_dir()).get("END"))
+        self.assertRegex(self.kling_log(), r"\nrm delega-")
+
+    def test_recover_brings_a_branch_bigger_than_exec_output(self):
+        rc, out, err = self.disconnect(STUB_BIG_MB="9")
+        self.assertEqual(rc, 96, out + err)
+        import contextlib
+        import io
+
+        from delega import config, jobs
+        os.remove(os.path.join(self.node_home, ".ssh.fail"))
+        e = io.StringIO()
+        with contextlib.redirect_stderr(e):
+            self.assertEqual(jobs.recover(config.load(), self.job_dir()), 2)      # worker alive: adopt, not recover
+        self.assertIn("delega adopt", e.getvalue())
+        self.release_worker()
+        o = io.StringIO()
+        with contextlib.redirect_stdout(o):
+            self.assertEqual(jobs.recover(config.load(), self.job_dir()), 0, o.getvalue())
+        self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k3:result.txt"), "kept")
+        size = int(sh("git", "-C", self.repo, "cat-file", "-s", "delega/k3:big.bin"))
+        self.assertEqual(size, 9 << 20)
+        self.assertGreater(os.path.getsize(os.path.join(self.job_dir(), "out.bundle")), 8 << 20)
+        self.assertRegex(self.kling_log(), r"cp delega-[^ ]+:[^ ]*out\.bundle ")     # a file, not stdout
+        self.assertTrue(util.read_meta(self.job_dir()).get("END"))
+        self.assertRegex(self.kling_log(), r"\nrm delega-")
 
     def test_requires_compute_refused(self):
         rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--requires", "tool"])

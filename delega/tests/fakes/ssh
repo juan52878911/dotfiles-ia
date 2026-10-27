@@ -3,7 +3,8 @@
 
   ssh [options] <alias> <command…>      (git calls it the same way for push/fetch)
 
-An alias starting with "down" behaves like an unreachable host (rc 255). Every call is logged to
+An alias starting with "down" behaves like an unreachable host (rc 255), and so does any alias while
+$FAKE_NODE_HOME/.ssh.fail holds a number > 0 (decremented per call) or the word "always". Every call is logged to
 $FAKE_NODE_HOME/.ssh.log (alias + command) so tests can assert on what was run.
 """
 import os
@@ -31,6 +32,15 @@ def main():
     os.makedirs(home, exist_ok=True)
     with open(os.path.join(home, ".ssh.log"), "a") as f:
         f.write(f"{host}\t{' '.join(rest)}\n")
+    fail = os.path.join(home, ".ssh.fail")
+    if os.path.exists(fail):
+        n = open(fail).read().strip()
+        if n == "always" or (n.isdigit() and int(n) > 0):
+            if n != "always":
+                with open(fail, "w") as f:
+                    f.write(str(int(n) - 1))
+            print(f"ssh: connect to host {host} port 22: Operation timed out", file=sys.stderr)
+            return 255
     if host.startswith("down"):
         print(f"ssh: connect to host {host}: No route to host", file=sys.stderr)
         return 255

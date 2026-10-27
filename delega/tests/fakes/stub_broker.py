@@ -5,7 +5,9 @@ It writes the channel files the launcher reads (lease, state, progress, result, 
 inside the current directory (the worktree), commits a file, so launch/remote can be tested without
 the real broker. Env: STUB_SLEEP seconds to stay "running", STUB_COMMIT_TEXT file content to commit
 (none = no commit), STUB_RC exit code, STUB_ASK_FILE: wait until this file exists, STUB_NOD_QUESTION:
-emit a question and its decision.request to the channel's nod.jsonl.
+emit a question and its decision.request to the channel's nod.jsonl, STUB_WAIT_FILE: stay running
+(renewing the lease) until this file exists (60 s at most), STUB_BIG_MB: also commit a random file of
+that many MiB (a branch bigger than kling exec's 8 MiB of stdout).
 """
 import json
 import os
@@ -45,6 +47,14 @@ def main(argv):
     end = time.time() + float(os.environ.get("STUB_SLEEP", "0"))
     while time.time() < end:
         time.sleep(0.1)
+    wait, limit = os.environ.get("STUB_WAIT_FILE"), time.time() + 60
+    while wait and not os.path.exists(wait) and time.time() < limit:
+        jw("lease.json", {"pid": os.getpid(), "host": "stub", "renewed": time.time()})
+        time.sleep(0.1)
+    if os.environ.get("STUB_BIG_MB"):
+        with open("big.bin", "wb") as f:
+            f.write(os.urandom(int(os.environ["STUB_BIG_MB"]) << 20))
+        subprocess.run(["git", "-c", "user.name=Stub", "-c", "user.email=stub@example.com", "add", "big.bin"], check=True)
     text = os.environ.get("STUB_COMMIT_TEXT")
     if text is not None:
         open("result.txt", "w").write(text + "\n")

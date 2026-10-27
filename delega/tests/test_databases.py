@@ -170,6 +170,7 @@ engine = "redis"
         self.assertEqual(rc, 0, out + err)
         log = self.kling_log()
         self.assertIn("-from claude-api -egress allowlist", log)
+        self.assertRegex(log, r"-ttl \d+m -on-ttl remove -label delega.job=")   # real data: removed, never frozen
         self.assertIn("sandbox create -name delega-seed-db-api-main", log)
         self.assertIn(":/seed:ro", log)
         self.assertRegex(log, r"dbctl up postgres main app \S+/tmp/delega-seed/main")

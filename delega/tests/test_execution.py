@@ -84,9 +84,8 @@ class AutoOrder(AutoCase):
         self.assertIn("delega golden build --node vm", out)
 
     def test_full_kindling_host_falls_through_to_hosts(self):
-        os.makedirs(os.path.join(self.node_home, ".kling-vms"))
-        for n in ("delega-a", "delega-b"):
-            open(os.path.join(self.node_home, ".kling-vms", n), "w").close()
+        for j in ("20260101-000000-a", "20260101-000000-b"):     # two jobs alive in their VMs
+            self.fake_vm("delega-" + j, j, lease_age=1)
         self.assertEqual(self.select()[0], "box")
         self.assertEqual(self.refused()[0]["node"], "vm")
         self.assertEqual(self.refused()[0]["stage"], "select")

@@ -44,6 +44,8 @@ DEFAULTS = {
         "quota": {"window_5h_pct": 70, "weekly_pct": 90},
         "lint": {"require": ["done", "cap", "report"]},
         "lease": {"renew_s": 30, "stale_s": 120},
+        "ssh": {"retries": 5, "retry_s": 30, "retry_max_s": 300},
+        "kindling": {"ttl_margin_min": 30},
     },
 }
 
