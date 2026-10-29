@@ -723,7 +723,7 @@ class Launch:
             branch = a.branch or f"delega/{job_id}"
             if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
                 print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
-            remote.push_head(repo_dir, node, job_id, profile.get("git"))
+            remote.push_head(repo_dir, node, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
             wt = remote.make_worktree(node, repo, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha)
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
@@ -800,7 +800,7 @@ class Launch:
         if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
             print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
-        kindling.push_head(repo_dir, node, chan, job_id, profile.get("git"))
+        kindling.push_head(repo_dir, node, chan, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
         wt = kindling.make_worktree(node, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha, ACCOUNT=node.get("account", ""),
                       CLAUDE_VERSION=vv or "")

@@ -226,9 +226,10 @@ def evaluate(cfg, profile, node, raw, requires=(), resources=True, remote_node=T
         if raw.get("load_pct") is not None and raw["load_pct"] > pj("node.max_load_pct"):
             return fail("resources", "load", t("nodes.fix.load"), load=raw["load_pct"],
                         max=pj("node.max_load_pct"))
+    watch_blocks = cfg.policy("node.expired_watch_blocks", profile)   # false: only required compute gates
     for name, status in res["compute"].items():
         need = name in (requires or ())
-        if status != "ok" and (need or status == "expired"):
+        if status != "ok" and (need or (status == "expired" and watch_blocks)):
             c = cfg.compute.get(name, {})
             hint = c.get("fix_hint") or t("nodes.fix.compute", name=name)
             fix = f"ssh -t {a} {shlex.quote(hint)}" if a else hint

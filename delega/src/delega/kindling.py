@@ -115,7 +115,8 @@ def create(node, vm, image):
     q = shlex.quote
     allow = ",".join(node.get("egress_allow", DEFAULT_EGRESS))
     r = remote.ssh(remote.host_node(node), f"kling run -name {q(vm)} -from {q(image)} -egress allowlist "
-                                          f"-allow {q(allow)} -wait-ready", timeout=300)
+                                          f"-allow {q(allow)} -wait-ready",
+                   timeout=int(node.get("create_timeout_s", 300)))  # sin reflink el clon copia el disco entero
     return remote.must(r, f"kling run {vm} from {image}")
 
 
