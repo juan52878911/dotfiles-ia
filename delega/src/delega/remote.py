@@ -208,6 +208,16 @@ def _git_env():
     return {**os.environ, "GIT_SSH_COMMAND": git_ssh_command()}
 
 
+def strip_trailers_hook(gitdir_q):
+    """Shell that installs a commit-msg hook (via core.hooksPath) dropping attribution trailers
+    (Co-Authored-By, "Generated with") from the worker's commits. `gitdir_q` is already quoted."""
+    body = ("#!/bin/sh\ngrep -v -i -e '^Co-Authored-By:' -e 'Generated with \\[Claude' \"$1\" > \"$1.d\"; "
+            "mv \"$1.d\" \"$1\"\n")
+    return (f"mkdir -p {gitdir_q}/delega-hooks && printf %s {shlex.quote(body)} > {gitdir_q}/delega-hooks/commit-msg"
+            f" && chmod +x {gitdir_q}/delega-hooks/commit-msg"
+            f" && git -C {gitdir_q} config core.hooksPath \"$(cd {gitdir_q} && pwd)/delega-hooks\"")
+
+
 def push_head(repo_dir, node, job_id, git=None):
     """Push HEAD to the node's bare repo as refs/heads/delega-base/<id> (created on first use).
     `git` = optional {user_name, user_email} configured in the bare repo for the worker's commits."""
@@ -219,6 +229,8 @@ def push_head(repo_dir, node, job_id, git=None):
         init += f" && git -C {bare} config user.email {shlex.quote(git['user_email'])}"
     if git and git.get("user_name"):
         init += f" && git -C {bare} config user.name {shlex.quote(git['user_name'])}"
+    if git and git.get("strip_trailers"):
+        init += " && " + strip_trailers_hook(bare)
     must(ssh(node, init), "create bare repo")
     ref = f"delega-base/{job_id}"
     r = subprocess.run(["git", "-C", repo_dir, "push", "-q", f"{alias(node)}:{bare_rel(node, repo)}",

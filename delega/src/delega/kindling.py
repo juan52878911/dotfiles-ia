@@ -139,6 +139,8 @@ def push_head(repo_dir, node, chan, job_id, git=None):
         setup += f" && git -C {q(wt)} config user.email {q(git['user_email'])}"
     if git and git.get("user_name"):
         setup += f" && git -C {q(wt)} config user.name {q(git['user_name'])}"
+    if git and git.get("strip_trailers"):
+        setup += " && " + remote.strip_trailers_hook(q(wt + "/.git"))
     if head == base:
         remote.must(remote.ssh(node, f"git -C {q(wt)} branch -f {q(ref)} {q(base)}{setup}"), "branch from golden")
         return ref
