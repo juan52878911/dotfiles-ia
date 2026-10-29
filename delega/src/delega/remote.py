@@ -213,12 +213,13 @@ def push_head(repo_dir, node, job_id, git=None):
     `git` = optional {user_name, user_email} configured in the bare repo for the worker's commits."""
     repo = repo_name(repo_dir)
     bare = shlex.quote(bare_rel(node, repo))
-    init = f"test -d {bare} || {{ mkdir -p {shlex.quote(workdir(node))} && git init -q --bare {bare}"
+    init = f"{{ test -d {bare} || {{ mkdir -p {shlex.quote(workdir(node))} && git init -q --bare {bare}; }}; }}"
+    # the identity is set on every launch, not only on creation: an existing bare keeps whatever it had
     if git and git.get("user_email"):
         init += f" && git -C {bare} config user.email {shlex.quote(git['user_email'])}"
     if git and git.get("user_name"):
         init += f" && git -C {bare} config user.name {shlex.quote(git['user_name'])}"
-    must(ssh(node, init + "; }"), "create bare repo")
+    must(ssh(node, init), "create bare repo")
     ref = f"delega-base/{job_id}"
     r = subprocess.run(["git", "-C", repo_dir, "push", "-q", f"{alias(node)}:{bare_rel(node, repo)}",
                         f"+HEAD:refs/heads/{ref}"], capture_output=True, text=True, env=_git_env())
