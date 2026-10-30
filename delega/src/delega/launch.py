@@ -534,7 +534,7 @@ class Launch:
             raise Refused(REFUSED_RC, t("launch.err.mode_denied", mode=mode))
         # 3. daily budget
         today = time.strftime("%Y%m%d")
-        spent, limit = _spend_total(cfg, today), float(pol("budget.day_usd"))
+        spent, limit = _spend_total(cfg, today, profile=profile["name"]), float(pol("budget.day_usd"))  # cada perfil, su tope
         if not a.over_budget and spent >= limit:
             raise Refused(8, t("launch.err.budget", spent=f"{spent:.2f}", limit=f"{limit:.2f}"))
         self.budget = (spent, limit)
