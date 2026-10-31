@@ -40,14 +40,13 @@ removes it, with `--db`) on its own. The branch comes back as a file (`kling cp`
 | You see | Do |
 |---|---|
 | `kling does not answer` (doctor / nodes) | Tell the user the host is down; do not retry in a loop. `delega nodes` again later. |
-| `N delega VMs with a live job (max_jobs=M); orphans not counted: …` | Wait or `delega queue add`; orphans: `delega gc --node <n>` (lists), then `delega gc --node <n> --yes`. |
+| rc 6 · `N delega VMs with a live job (max_jobs=M)…` or `doesn't fit` · `queued as <id>` | Nothing started; the brief is already queued. **Do not relaunch**, and do not raise `golden_mem` yourself. `delega tick` when there is room; orphans: `delega gc --node <n>` (lists), then `--yes`. |
 | `No contact with <host> … delega adopt <id>` (rc 96) | Nothing was lost: the worker keeps running in its VM. When the host answers: `delega adopt <id>` (waits and brings the branch) or `delega recover <id>` (closes now). |
 | rc 97 (broker lost) or `could not fetch <branch>` | `delega recover <id>`: reads the rc in the VM, brings the branch with `kling cp`, scans it, closes the job, deletes the VM. |
 | `delega gc` says `kept: it may hold work → delega recover <id>` | Run that `delega recover <id>`; never `kling rm` it by hand. |
 | `no golden <name>` | `delega golden build <repo>` (tell the user: 2–11 min). |
 | golden has no / a different lockfile fingerprint | Relaunch with `--rebuild-golden`. |
 | claude version skew between here and the golden | `delega golden build <repo>` (or `--allow-version-skew` if the user agrees). |
-| `doesn't fit: the microVM asks for N MiB` | Wait for a slot or `delega gc`; do **not** raise `golden_mem` or memory settings yourself. |
 | `unrecognized arguments: …` after `--zone` | Quote each glob and repeat the flag: `--zone 'src/**' --zone 'web/**'`. |
 | rc 98 (worker did not start) | `delega doctor [repo]`; read the job's `stderr.log`; report to the user. |
 

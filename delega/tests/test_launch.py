@@ -261,9 +261,10 @@ class FailureTests(LaunchCase):
         self.new_job(id="20260101-000001-1", NODE="local", REPO="a", ZONE="x/*")
         self.new_job(id="20260101-000002-1", NODE="local", REPO="b", ZONE="y/*")
         rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local"])
-        self.assertEqual(rc, 5)
+        self.assertEqual(rc, 6)                       # full: queued, no job folder of its own
         self.assertIn("max_local_jobs", err)
-        self.assertClosed()
+        self.assertIn("queued as", err)
+        self.assertEqual(len(self.jobs_in_state()), 2)
 
     def test_remote_version_skew(self):
         os.environ["FAKE_VERSION_REMOTE"] = "3.0.1"

@@ -143,6 +143,10 @@ cuts between turns, minutes and messages cut at any time.
 - Plan long batches away from the 5 h window reset (limit cuts cost hours of wall clock).
 - `delega queue add <repo> <brief> --prio N` + `delega tick` (e.g. from a timer) launch queued work
   when quota, budget and node capacity allow; `tick --adopt` re-attaches orphaned remote jobs.
+- **rc 6 = the node is full** (max_jobs, local slots, or the host's memory: `doesn't fit`). Nothing was
+  started and no job folder is left: the brief is queued once (the message gives its id; relaunching
+  the same brief finds it already queued) and `delega tick` launches it when there is room. **Do not
+  relaunch in a loop.** With policy `queue.when_full = "fail"` it only fails, printing the `queue add`.
 
 ### Measuring with chrono (if installed)
 

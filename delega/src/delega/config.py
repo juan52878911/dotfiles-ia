@@ -41,6 +41,7 @@ DEFAULTS = {
                  "expired_watch_blocks": True},
         "permission_mode": {"default": "auto", "deny": ["bypassPermissions"]},
         "budget": {"day_usd": 150.0},
+        "queue": {"when_full": "queue"},   # queue | fail: what `delega run` does when the node has no room
         "quota": {"window_5h_pct": 70, "weekly_pct": 90},
         "lint": {"require": ["done", "cap", "report"]},
         "lease": {"renew_s": 30, "stale_s": 120},

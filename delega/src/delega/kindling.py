@@ -191,6 +191,11 @@ def create(node, vm, image, ttl=None, on_ttl="freeze", labels=None):
     return remote.must(r, f"kling run {vm} from {image}")
 
 
+def no_room(err):
+    """`kling run` refused the VM for lack of host memory (the probe counts VMs, not MiB)."""
+    return "doesn't fit" in err
+
+
 def destroy(node, vm):
     q = shlex.quote
     remote.ssh(remote.host_node(node), f"kling rm {q(vm)} >/dev/null 2>&1; rm -rf {q('/tmp/delega-' + vm)}",

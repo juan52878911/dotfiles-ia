@@ -241,6 +241,11 @@ without an audit end, audit ends without a job dir, and jobs whose costs differ.
   CLI `scan <repo> <branch> [base]` / `scan --text <file>` (exit 9 on hits; never prints the matched text).
 - `handoff`: CLI `handoff <job> [out.md]`.
 - `queue`: CLI `queue add <repo> <brief> [--prio n] [-- run options]`, `queue ls`, `tick [--adopt]`.
+  `delega run` on a full node (probe `resources`, `max_jobs`, `max_local_jobs`, or `kling run` saying
+  `doesn't fit`) raises `Full`: rc 6, the job folder is removed (audit event `full`) and `add_once`
+  queues the brief unless the same repo, brief and options are already queued (`queue.when_full`:
+  `queue` | `fail`). `tick` launches with `DELEGA_FROM_QUEUE=1`, so a full node fails back (rc 6) and
+  the item stays queued instead of being queued again.
 - `integrate`: CLI `integrate <repo> <branch> [--into main]`: `git merge-tree --write-tree` dry run,
   then the project's `verify` commands in a temporary worktree.
 - `kindling`: `probe(cfg, node, profile, requires)` (same shape as `nodes.probe`; `vms` = VMs with a live job,

@@ -1,5 +1,7 @@
 """kindling runner: one ephemeral microVM per job, driven through tests/fakes/kling-bin."""
 import nod_sandbox  # noqa: F401  (Nod events of the tests go to a temp file)
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -176,6 +178,60 @@ class Kindling(KindlingCase):
         self.assertIn("2 delega VMs with a live job", res["reason"])       # the seed sandbox is not a job
         self.assertIn("delega-20260101-000000-c (ended)", res["reason"])  # listed, not counted
         self.assertIn("delega gc --node vm", res["fix"])
+
+    def fill_host(self):
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-b", "20260101-000000-b", lease_age=1)
+        return self.jobs_in_state()
+
+    def queued(self):
+        from delega import queue
+        return queue.pending(queue.read_items(self.cfg()))
+
+    def test_full_host_queues_once_and_leaves_no_job_folder(self):
+        # 26-oct: a caller relaunched every ~30 s with the host full and left one launch_failed folder
+        # per try. Now nothing is created, the brief is queued once and the retries find it there.
+        before = self.fill_host()
+        for i in range(3):
+            rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--cap-min", "30"])
+            self.assertEqual(rc, 6, out + err)
+            self.assertIn("already queued" if i else "queued as", err)
+        self.assertEqual(self.jobs_in_state(), before)
+        q = self.queued()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["args"], ["--node", "vm", "--cap-min", "30"])
+        self.assertNotIn("run -name", self.kling_log())
+
+    def test_host_out_of_memory_is_full_too(self):
+        os.environ["FAKE_KLING_NO_ROOM"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_KLING_NO_ROOM", None)
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm"])
+        self.assertEqual(rc, 6, out + err)
+        self.assertIn("doesn't fit", err)
+        self.assertEqual(self.jobs_in_state(), [])
+        self.assertEqual(len(self.queued()), 1)
+
+    def test_full_host_fails_once_when_queueing_is_off_or_from_the_queue(self):
+        before = self.fill_host()
+        for env in ({"DELEGA_QUEUE_WHEN_FULL": "fail"}, {"DELEGA_FROM_QUEUE": "1"}):
+            with mock.patch.dict(os.environ, env):
+                rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm"])
+            self.assertEqual(rc, 6, out + err)
+            self.assertIn("delega queue add", err)
+        self.assertEqual(self.jobs_in_state(), before)
+        self.assertEqual(self.queued(), [])
+
+    def test_tick_keeps_the_item_queued_while_the_node_is_full(self):
+        from delega import queue
+        self.fill_host()
+        item = queue.add(self.cfg(), self.repo, self.brief, run_args=["--node", "vm"])
+        with mock.patch.object(queue, "room", lambda *a: (True, "")), \
+                mock.patch.object(queue, "launch", lambda cfg, it: ("full", "")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                queue.main_tick([])
+        self.assertEqual([i["id"] for i in self.queued()], [item["id"]])
+        self.assertIn("node full", out.getvalue())
 
     def test_orphans_do_not_count(self):
         from delega import config, kindling

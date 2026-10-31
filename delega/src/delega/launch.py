@@ -31,6 +31,15 @@ class Refused(Exception):
         self.rc, self.msg, self.event, self.fields = rc, msg, event, fields
 
 
+FULL_RC = 6
+
+
+class Full(Refused):
+    """No room on the node right now: nothing was started, the brief waits in the queue."""
+    def __init__(self, msg, **fields):
+        super().__init__(FULL_RC, msg, event="full", **fields)
+
+
 # ── optional collaborators (other modules; called through the documented contract) ──
 def _spend_total(cfg, day, profile=None, project=None):
     from . import spend
@@ -515,12 +524,21 @@ def main(argv):
     except _config.ConfigError as e:
         print(f"delega: {e}", file=sys.stderr)
         return 3
-    return Launch(cfg, args).run()
+    return Launch(cfg, args, argv).run()
+
+
+def queue_args(argv, args):
+    """`delega run` options of argv without the two positionals, to relaunch it from the queue."""
+    rest, pos = list(argv), [args.repo, args.brief]
+    for x in pos:
+        if x in rest:
+            rest.remove(x)
+    return rest
 
 
 class Launch:
-    def __init__(self, cfg, args):
-        self.cfg, self.args = cfg, args
+    def __init__(self, cfg, args, argv=None):
+        self.cfg, self.args, self.argv = cfg, args, list(argv or [])
         self.job_dir = None
         self.started = False
         self.vm = None          # kindling: node dict with the job's microVM, once created
@@ -534,9 +552,33 @@ class Launch:
                reason=e.msg[:200], rc=e.rc, **e.fields)
         return e.rc
 
+    def full(self, e):
+        """Host full: the job folder goes (nothing ran), the brief is queued once and `delega tick`
+        launches it when there is room. From the queue itself, or with queue.when_full = "fail", it
+        only fails, with the fix."""
+        _audit(self.cfg, e.event, reason=e.msg[:200], rc=e.rc, **e.fields)
+        if self.job_dir and os.path.isdir(self.job_dir):
+            import shutil
+            shutil.rmtree(self.job_dir, ignore_errors=True)
+        self.job_dir = None
+        a = self.args
+        rest = queue_args(self.argv, a)
+        if os.environ.get("DELEGA_FROM_QUEUE") or self.cfg.policy("queue.when_full") == "fail":
+            cmd = " ".join(shlex.quote(x) for x in ["delega", "queue", "add", a.repo, a.brief]
+                           + (["--", *rest] if rest else []))
+            print("ERROR: " + t("launch.full.fail", reason=e.msg, cmd=cmd), file=sys.stderr)
+            return e.rc
+        from . import queue
+        item, new = queue.add_once(self.cfg, a.repo, a.brief, run_args=rest)
+        print(t("launch.full.queued" if new else "launch.full.already", reason=e.msg, id=item["id"]),
+              file=sys.stderr)
+        return e.rc
+
     def run(self):
         try:
             return self._run()
+        except Full as e:
+            return self.full(e)
         except Refused as e:
             return self.fail(e)
         except _config.ConfigError as e:
@@ -668,7 +710,7 @@ class Launch:
         # 9-11. identity, compute, version
         if node_name == "local":
             if not a.resume and jobs.live_counts(cfg, exclude=self.job_dir).get("local", 0) >= pol("max_local_jobs"):
-                raise Refused(5, t("launch.err.local_full", n=pol("max_local_jobs")))
+                raise Full(t("launch.err.local_full", n=pol("max_local_jobs")))
             p = nodes.local_probe(cfg, profile, a.requires)
             node = None
         else:
@@ -678,7 +720,9 @@ class Launch:
             p = nodes.probe(cfg, node, profile, a.requires)
             mx = node.get("max_jobs")
             if not a.resume and mx and jobs.live_counts(cfg, exclude=self.job_dir).get(node_name, 0) >= mx:
-                raise Refused(5, t("launch.err.node_full", node=node_name, n=mx))
+                raise Full(t("launch.err.node_full", node=node_name, n=mx))
+        if not p["ok"] and p["kind"] == "resources":
+            raise Full(t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
         if not p["ok"]:
             raise Refused(4 if p["kind"] == "identity" else 5,
                           t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
@@ -833,9 +877,14 @@ class Launch:
         node = dict(node, vm=vm)
         t0 = time.time()
         # the host freezes the VM past cap + grace + margin even if this machine dies; real data is removed instead
-        kindling.create(node, vm, image, ttl=kindling.ttl_min(cfg, caps, profile["name"], project),
-                        on_ttl="remove" if self.dbs else "freeze",
-                        labels={"delega.job": job_id, "delega.owner": util.read_meta(self.job_dir).get("OWNER") or "?"})
+        try:
+            kindling.create(node, vm, image, ttl=kindling.ttl_min(cfg, caps, profile["name"], project),
+                            on_ttl="remove" if self.dbs else "freeze",
+                            labels={"delega.job": job_id, "delega.owner": util.read_meta(self.job_dir).get("OWNER") or "?"})
+        except remote.RemoteError as e:
+            if kindling.no_room(str(e)):      # the host's memory, not max_jobs: same as a full node
+                raise Full(str(e).strip().splitlines()[0][:300])
+            raise
         self.vm = node
         dbrecs = []
         if self.dbs:
