@@ -67,6 +67,36 @@ in
     };
   };
 
+  options.programs.dotfiles-ia.tokeneconomizer = {
+    enable = lib.mkEnableOption "TokenEconomizer (plugin de Claude Code que aprende de las sesiones de cada repo)";
+    src = lib.mkOption {
+      type = lib.types.path;
+      description = "Fuente del plugin (un input del flake con flake = false, p. ej. un fork de microsoft/TokenEconomizer).";
+    };
+    configDirs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "~/.local/state/ws/claude/trabajo" ];
+      description = "Otros CLAUDE_CONFIG_DIR (cuentas) donde activarlo además de ~/.claude.";
+    };
+    claude = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "${config.home.homeDirectory}/.local/bin/claude";
+      description = "Binario de claude para instalarlo y actualizarlo al activar; null deja solo los settings.";
+    };
+    settings = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = { microskills = "on"; toolprune = "propose"; loopguard = "nudge"; };
+      description = "Claves de ~/.tokeneconomizer/config.json (global). Se fusionan: `te config set --global` sigue valiendo.";
+    };
+    pi = lib.mkOption {
+      type = lib.types.bool;
+      default = cfg.pi.enable;
+      description = "Instalarlo también como paquete de Pi.";
+    };
+  };
+
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       home.file = {
@@ -106,6 +136,40 @@ in
         };
       };
     })
+
+    (lib.mkIf cfg.tokeneconomizer.enable (
+      let
+        te = cfg.tokeneconomizer;
+        ruta = "${config.home.homeDirectory}/.local/share/TokenEconomizer";   # estable entre versiones del store
+        dirs = [ "${config.home.homeDirectory}/.claude" ] ++ te.configDirs;
+        ajustes = pkgs.writeText "tokeneconomizer-config.json" (builtins.toJSON te.settings);
+      in
+      {
+        home.file.".local/share/TokenEconomizer".source = te.src;
+
+        # Claude Code copia el plugin a su caché: los settings declaran el marketplace en `ruta` y el
+        # `claude plugin update` recoge la versión nueva tras cambiar el input.
+        home.activation.dotfilesIaTokeneconomizer = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
+          run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py tokeneconomizer tokeneconomizer \
+            ${ruta} ${lib.escapeShellArgs dirs} ${lib.optionalString (te.claude != null) "--claude ${te.claude}"} || true
+          run ${pkgs.python3}/bin/python3 -c '
+          import json, os, sys
+          p = os.path.expanduser("~/.tokeneconomizer/config.json")
+          try: d = json.load(open(p))
+          except (OSError, ValueError): d = {}
+          n = dict(d, **json.load(open(sys.argv[1])))
+          if n != d:
+              os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+              json.dump(n, open(p, "w"), indent=2); print("tokeneconomizer: config.json actualizado")
+          ' ${ajustes}
+          ${lib.optionalString te.pi ''
+            if [ -x ${config.home.homeDirectory}/.local/bin/pi ] && ! ${config.home.homeDirectory}/.local/bin/pi list 2>/dev/null | grep -qF ${ruta}; then
+              run ${config.home.homeDirectory}/.local/bin/pi install ${ruta} || true
+            fi
+          ''}
+        '';
+      }
+    ))
 
     (lib.mkIf cfg.pi.enable (
       let
