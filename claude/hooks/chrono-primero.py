@@ -3,8 +3,9 @@
 git log -p <ruta>, git log -- <ruta>), propone `chrono explain <ruta>[:A-B]`, que da los commits
 que escribieron esas líneas, si eran arreglos, tickets/PRs y autores en ~500 tokens frente a los
 ~10 000 de la salida cruda.
-Solo actúa si hay binario de chrono y un índice (.chrono/index.db) en el directorio del evento o en
-uno superior; si no, no dice nada. Corta la orden UNA vez por sesión y fichero: si el agente la repite
+Solo actúa si hay binario de chrono y un índice: .chrono/index.db en el directorio del evento o en uno
+superior, o `chrono.db` en el directorio común de git (el repo bare de los worktrees de delega en los
+nodos; entonces propone `chrono explain --db <ruta>`). Si no lo hay, no dice nada. Corta la orden UNA vez por sesión y fichero: si el agente la repite
 tal cual, pasa (a veces hace falta el parche literal). `git log --oneline -1 …` y los rangos de ramas
 no los toca: son baratos y chrono no los sustituye.
 Desactivar: CHRONO_PRIMERO=0."""
@@ -25,15 +26,43 @@ def binario():
     return None
 
 
-def indice(cwd):
-    d = os.path.abspath(cwd)
+def comun_git(d):
+    """El directorio común de git del repo que contiene d (el bare de un worktree), o None."""
     while True:
-        if os.path.isfile(os.path.join(d, ".chrono", "index.db")):
-            return d
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return g
+        if os.path.isfile(g):
+            with open(g) as f:
+                linea = f.readline().strip()
+            if not linea.startswith("gitdir:"):
+                return None
+            gd = os.path.normpath(os.path.join(d, linea[7:].strip()))
+            cd = os.path.join(gd, "commondir")
+            if os.path.isfile(cd):
+                with open(cd) as f:
+                    return os.path.normpath(os.path.join(gd, f.read().strip()))
+            return gd
         padre = os.path.dirname(d)
         if padre == d:
             return None
         d = padre
+
+
+def indice(cwd):
+    """(ruta del índice, hace falta --db) o None."""
+    d = os.path.abspath(cwd)
+    while True:
+        if os.path.isfile(os.path.join(d, ".chrono", "index.db")):
+            return os.path.join(d, ".chrono", "index.db"), False
+        padre = os.path.dirname(d)
+        if padre == d:
+            break
+        d = padre
+    comun = comun_git(os.path.abspath(cwd))
+    if comun and os.path.isfile(os.path.join(comun, "chrono.db")):
+        return os.path.join(comun, "chrono.db"), True
+    return None
 
 
 def tramos(cmd):
@@ -140,16 +169,19 @@ def main():
             break
     if not encontrado or not binario():
         return
-    raiz = indice(cwd)
-    if not raiz:
+    hallado = indice(cwd)
+    if not hallado:
         return
+    db, con_db = hallado
     fichero, rango, forma = encontrado
     clave = hashlib.sha1(f"{fichero}|{cmd}".encode()).hexdigest()[:16]
     if ya_avisado(ev.get("session_id") or os.getppid(), clave):
         return
     destino = fichero + (f":{rango[0]}-{rango[1]}" if rango else "")
-    motivo = (f"Este repo tiene índice de chrono ({raiz}/.chrono). En vez de `{forma}`, prueba primero "
-              f"`chrono explain {destino}` (o la herramienta MCP `explain` con target={destino}): da los "
+    orden = f"chrono explain --db {db} {destino}" if con_db else f"chrono explain {destino}"
+    mcp = "" if con_db else f" (o la herramienta MCP `explain` con target={destino})"
+    motivo = (f"Este repo tiene índice de chrono ({db}). En vez de `{forma}`, prueba primero "
+              f"`{orden}`{mcp}: da los "
               f"commits que escribieron esas líneas, si eran arreglos, tickets/PRs y autores en ~500 tokens "
               f"frente a ~10 000. Para el parche literal de un commit concreto, `git show <sha>`. Si de "
               f"verdad necesitas esta orden, repítela tal cual y pasará.")

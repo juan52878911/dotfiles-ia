@@ -42,4 +42,15 @@ caso('orden que ya usa chrono pasa', corta('chrono explain a.py; git blame a.py'
 caso('sin índice pasa', corta('git blame a.py', cwd=sin) is None, True)
 caso('desactivado pasa', corta('git blame a.py', sesion='u', CHRONO_PRIMERO='0') is None, True)
 caso('sin chrono pasa', corta('git blame a.py', sesion='v', PATH='/usr/bin:/bin') is None, True)
+# Worktree de delega en un nodo: el índice va en el repo bare como chrono.db.
+bare, wt = os.path.join(tmp, 'R.git'), os.path.join(tmp, 'trabajos', 'j1', 'wt')
+subprocess.run(['git', 'init', '-q', '--bare', bare], check=True)
+subprocess.run(['git', '-C', bare, '--work-tree', sin, 'commit', '-q', '--allow-empty', '-m', 'x'], check=True,
+               env=dict(entorno, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t',
+                        GIT_COMMITTER_EMAIL='t@t'))
+subprocess.run(['git', '-C', bare, 'worktree', 'add', '-q', '--detach', wt], check=True, capture_output=True)
+caso('worktree sin chrono.db pasa', corta('git blame a.py', cwd=wt, sesion='w') is None, True)
+open(os.path.join(bare, 'chrono.db'), 'w').close()
+caso('worktree con chrono.db propone --db', corta('git blame a.py', cwd=wt, sesion='w'),
+     'chrono.db a.py')
 sys.exit(1 if fallos else 0)
