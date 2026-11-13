@@ -34,6 +34,20 @@ Tres reglas antes que nada, y las tres salen de fallos reales:
 Formato de cada hallazgo: donde esta (fichero y linea), que pasa de verdad, como lo
 comprobaste, y que se pierde o se arriesga MEDIDO. Si no pudiste medirlo, dilo.
 
+Marca cada hallazgo con una palabra, y que la palabra hable de la PRUEBA, no de tu
+confianza:
+
+- **COMPROBADO** — lo ejecutaste y lo viste fallar. Va siempre con el comando
+  exacto y su salida, para que quien te lea lo repita sin confiar en ti.
+- **OPINION** — lo leiste y te lo parece, pero no lo has ejecutado. Vale como
+  hallazgo; no vale como prueba.
+- **DESCARTADO** — lo sospechaste, lo comprobaste y NO se sostiene. Dilo igual:
+  le ahorra a la siguiente pasada el camino que tu ya cerraste, y es la forma
+  concreta de cumplir la regla 3.
+
+Estar muy seguro no sube nada a COMPROBADO; solo lo sube un comando que otro pueda
+volver a correr. Un hallazgo sin marca se lee como OPINION.
+
 ---
 
 Buscas credenciales, y compruebas que quien las borra no borra de mas.

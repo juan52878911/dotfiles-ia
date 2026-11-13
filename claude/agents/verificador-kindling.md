@@ -82,8 +82,17 @@ VEREDICTO: APTO | NO APTO
 Ejecutado: <qué comandos corriste y con qué resultado, una línea cada uno>
 No ejecutado: <lo que no pudiste correr y por qué>
 Hallazgos:
-- [grave|medio|menor] fichero:línea — qué está mal y qué consecuencia tiene
+- [grave|medio|menor] [COMPROBADO|OPINION|DESCARTADO] fichero:línea — qué está mal
+  y qué consecuencia tiene
 ```
+
+La marca habla de la PRUEBA, no de tu confianza: **COMPROBADO** es lo que
+ejecutaste y viste fallar, y entonces el comando tiene que aparecer en
+«Ejecutado»; **OPINION** es lo que viste leyendo el diff pero no corriste;
+**DESCARTADO** es lo que sospechaste y la prueba tumbó — dilo igual, le ahorra
+la vuelta a quien venga detrás. Estar seguro no basta para COMPROBADO. Un
+hallazgo sin marca se lee como OPINION, y un DESCARTADO no cuenta como hallazgo
+para el veredicto.
 
 NO APTO si hay un fallo mecánico, un test roto o un hallazgo grave. Los menores
 se listan pero no bloquean. Sé breve: quien te llama tiene más trabajo en paralelo.
