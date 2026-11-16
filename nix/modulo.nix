@@ -97,6 +97,25 @@ in
     };
   };
 
+  options.programs.dotfiles-ia.diseno = {
+    enable = lib.mkEnableOption "diseno-studio (plugin de Claude Code de sistema de diseño, con su binario Rust compilado por Nix)";
+    package = lib.mkOption {
+      type = lib.types.package;
+      description = "El plugin ya empaquetado: `diseno-studio.packages.<sistema>.plugin` del flake de diseno-studio (trae bin/<so>-<arq>/diseno).";
+    };
+    configDirs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "~/.local/state/ws/claude/trabajo" ];
+      description = "Otros CLAUDE_CONFIG_DIR (cuentas) donde activarlo además de ~/.claude.";
+    };
+    claude = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "${config.home.homeDirectory}/.local/bin/claude";
+      description = "Binario de claude para instalarlo y actualizarlo al activar; null deja solo los settings.";
+    };
+  };
+
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
       home.file = {
@@ -168,6 +187,24 @@ in
               run ${config.home.homeDirectory}/.local/bin/pi install ${ruta} || true
             fi
           ''}
+        '';
+      }
+    ))
+
+    (lib.mkIf cfg.diseno.enable (
+      let
+        ds = cfg.diseno;
+        ruta = "${config.home.homeDirectory}/.local/share/diseno-studio";   # estable entre versiones del store
+        dirs = [ "${config.home.homeDirectory}/.claude" ] ++ ds.configDirs;
+      in
+      {
+        home.file.".local/share/diseno-studio".source = ds.package;
+
+        # Mismo esquema que tokeneconomizer: el marketplace local apunta a `ruta`, y tras un rebuild
+        # `claude plugin update` recoge el plugin nuevo (con el binario recién compilado).
+        home.activation.dotfilesIaDiseno = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
+          run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py diseno-studio diseno-studio \
+            ${ruta} ${lib.escapeShellArgs dirs} ${lib.optionalString (ds.claude != null) "--claude ${ds.claude}"} || true
         '';
       }
     ))
