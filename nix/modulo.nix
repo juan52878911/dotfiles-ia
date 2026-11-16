@@ -231,6 +231,15 @@ in
           cp -R ${wm.src}/skills/modern-web-guidance/guides $out/skills/web-moderna/guides
           cp ${self}/claude/web-moderna/SKILL.md $out/skills/web-moderna/SKILL.md
           cp ${wm.src}/LICENSE $out/LICENSE
+          cat > $out/README.md <<'EOF'
+        # web-moderna
+
+        Las 187 guías de Modern Web Guidance (equipo de Chrome, con Edge, Firefox y MDN) como plugin local de
+        Claude Code. La skill `web-moderna` las busca con Glob y Grep en `skills/web-moderna/guides/` antes de
+        implementar UI web, para usar las APIs actuales de HTML, CSS y JS en lugar de librerías o patrones
+        antiguos. No usa npx, ni red, ni telemetría: las guías vienen de un commit fijado en los dotfiles.
+        Lo empaqueta dotfiles-ia (`programs.dotfiles-ia.diseno.webModerna`); las licencias están en LICENSE y NOTICE.
+        EOF
           cat > $out/NOTICE <<'EOF'
         Guías de GoogleChrome/modern-web-guidance (https://github.com/GoogleChrome/modern-web-guidance):
         guías bajo CC-BY 4.0 y código bajo Apache-2.0 (ver LICENSE), sin modificar. La skill es de dotfiles-ia.
@@ -242,6 +251,7 @@ in
         EOF
           cat > $out/.claude-plugin/marketplace.json <<'EOF'
         {"name": "web-moderna", "owner": {"name": "Juan Bedoya"},
+         "description": "Guías de Modern Web Guidance (Chrome) empaquetadas por dotfiles-ia para buscarlas en local",
          "plugins": [{"name": "web-moderna", "source": "./", "version": "${version}",
                       "description": "Guías de la plataforma web moderna, en local"}]}
         EOF
