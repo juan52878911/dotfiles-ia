@@ -114,6 +114,15 @@ in
       default = "${config.home.homeDirectory}/.local/bin/claude";
       description = "Binario de claude para instalarlo y actualizarlo al activar; null deja solo los settings.";
     };
+    webModerna = {
+      enable = lib.mkEnableOption ''
+        web-moderna: las guías de Modern Web Guidance (equipo de Chrome) como plugin local de Claude Code,
+        con una skill que las busca en los ficheros (sin npx @latest, sin red y sin telemetría)'';
+      src = lib.mkOption {
+        type = lib.types.path;
+        description = "Fuente de las guías: un input del flake con flake = false, fijado a un commit de GoogleChrome/modern-web-guidance.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -205,6 +214,44 @@ in
         home.activation.dotfilesIaDiseno = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
           run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py diseno-studio diseno-studio \
             ${ruta} ${lib.escapeShellArgs dirs} ${lib.optionalString (ds.claude != null) "--claude ${ds.claude}"} || true
+        '';
+      }
+    ))
+
+    (lib.mkIf cfg.diseno.webModerna.enable (
+      let
+        wm = cfg.diseno.webModerna;
+        ruta = "${config.home.homeDirectory}/.local/share/web-moderna";
+        dirs = [ "${config.home.homeDirectory}/.claude" ] ++ cfg.diseno.configDirs;
+        version = "1.0.0-${builtins.substring 0 7 (wm.src.rev or "local")}";
+        # Plugin propio: las 187 guías del upstream + nuestra skill (claude/web-moderna/SKILL.md),
+        # que las busca con Glob/Grep. La skill del upstream llama a `npx -y modern-web-guidance@latest`.
+        plugin = pkgs.runCommand "web-moderna-${version}" { } ''
+          mkdir -p $out/.claude-plugin $out/skills/web-moderna
+          cp -R ${wm.src}/skills/modern-web-guidance/guides $out/skills/web-moderna/guides
+          cp ${self}/claude/web-moderna/SKILL.md $out/skills/web-moderna/SKILL.md
+          cp ${wm.src}/LICENSE $out/LICENSE
+          cat > $out/NOTICE <<'EOF'
+        Guías de GoogleChrome/modern-web-guidance (https://github.com/GoogleChrome/modern-web-guidance):
+        guías bajo CC-BY 4.0 y código bajo Apache-2.0 (ver LICENSE), sin modificar. La skill es de dotfiles-ia.
+        EOF
+          cat > $out/.claude-plugin/plugin.json <<'EOF'
+        {"name": "web-moderna", "version": "${version}",
+         "description": "Guías de la plataforma web moderna (Modern Web Guidance de Chrome) buscadas en local, sin red ni telemetría",
+         "author": {"name": "Juan Bedoya"}, "license": "Apache-2.0"}
+        EOF
+          cat > $out/.claude-plugin/marketplace.json <<'EOF'
+        {"name": "web-moderna", "owner": {"name": "Juan Bedoya"},
+         "plugins": [{"name": "web-moderna", "source": "./", "version": "${version}",
+                      "description": "Guías de la plataforma web moderna, en local"}]}
+        EOF
+        '';
+      in
+      {
+        home.file.".local/share/web-moderna".source = plugin;
+        home.activation.dotfilesIaWebModerna = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
+          run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py web-moderna web-moderna \
+            ${ruta} ${lib.escapeShellArgs dirs} ${lib.optionalString (cfg.diseno.claude != null) "--claude ${cfg.diseno.claude}"} || true
         '';
       }
     ))
