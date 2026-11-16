@@ -1,6 +1,6 @@
 ---
 name: web-moderna
-description: Guías de la plataforma web moderna del equipo de Chrome (Modern Web Guidance, 187 guías), buscadas en local sin red. Usar al empezar a implementar UI web de cliente (HTML, CSS, JS en el navegador, también dentro de React, Vue o Angular), antes de escribir un componente o de añadir una dependencia para algo que la plataforma ya resuelve, cuando se trate de diálogos, popovers, menús, tooltips, acordeones, carruseles, formularios y validación, anchor positioning, container queries, `:has()`, view transitions, animaciones ligadas al scroll, modo oscuro, color, tipografía y fuentes de respaldo, scrollbars, rendimiento (LCP, INP, imágenes, content-visibility) o PWA. No usar para backend, CI, scripts locales ni para decidir el aspecto (eso es el DESIGN.md de diseno-studio).
+description: Guías de la plataforma web moderna del equipo de Chrome (Modern Web Guidance, 187 guías), buscadas en local sin red. Usar al empezar a implementar UI web de cliente (HTML, CSS, JS en el navegador, también dentro de React, Vue o Angular), antes de escribir un componente o de añadir una dependencia para algo que la plataforma ya resuelve, cuando se trate de diálogos, popovers, menús, tooltips, acordeones, carruseles, formularios y validación, anchor positioning, container queries, `:has()`, view transitions, animaciones ligadas al scroll, modo oscuro, color, tipografía y fuentes de respaldo, scrollbars, rendimiento (LCP, INP, imágenes, content-visibility) o PWA. No usar para backend, CI, scripts locales ni para decidir el aspecto (eso es el DESIGN.md de plumb).
 ---
 
 # Web moderna (Modern Web Guidance, en local)
@@ -26,11 +26,11 @@ en los dotfiles: se leen como ficheros, sin `npx`, sin red y sin telemetría.
 
 Lee una o dos guías por tarea, no todas: cada una cuesta entre 500 y 2.000 tokens.
 
-## Con diseno-studio
+## Con plumb
 
 - El **DESIGN.md** decide los valores (colores, escala, radios, espaciado); estas guías deciden las
   **APIs** con las que se implementan. Si una guía trae colores o tamaños de ejemplo, usa los tokens.
-- Después de implementar, mide con `diseno medir` y `diseno puntuar` (contraste, foco visible,
+- Después de implementar, mide con `plumb measure` y `plumb score` (contraste, foco visible,
   desborde, estados). Una guía no garantiza accesibilidad: revisiones externas encontraron ejemplos
   que no cumplían WCAG, así que lo que diga la medida manda sobre lo que diga la guía.
 

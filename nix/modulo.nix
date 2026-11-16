@@ -97,11 +97,14 @@ in
     };
   };
 
+  # Sección de diseño: plugins de Claude Code para UI. Comparten configDirs y claude.
   options.programs.dotfiles-ia.diseno = {
-    enable = lib.mkEnableOption "diseno-studio (plugin de Claude Code de sistema de diseño, con su binario Rust compilado por Nix)";
-    package = lib.mkOption {
-      type = lib.types.package;
-      description = "El plugin ya empaquetado: `diseno-studio.packages.<sistema>.plugin` del flake de diseno-studio (trae bin/<so>-<arq>/diseno).";
+    plumb = {
+      enable = lib.mkEnableOption "plumb (github.com/juan52878911/plumb): DESIGN.md, medición y auditoría de UI con su binario Rust compilado por Nix";
+      package = lib.mkOption {
+        type = lib.types.package;
+        description = "El plugin ya empaquetado: `plumb.packages.<sistema>.plugin` del flake de plumb (trae bin/<so>-<arq>/plumb).";
+      };
     };
     configDirs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -200,20 +203,22 @@ in
       }
     ))
 
-    (lib.mkIf cfg.diseno.enable (
+    (lib.mkIf cfg.diseno.plumb.enable (
       let
         ds = cfg.diseno;
-        ruta = "${config.home.homeDirectory}/.local/share/diseno-studio";   # estable entre versiones del store
+        ruta = "${config.home.homeDirectory}/.local/share/plumb";   # estable entre versiones del store
         dirs = [ "${config.home.homeDirectory}/.claude" ] ++ ds.configDirs;
       in
       {
-        home.file.".local/share/diseno-studio".source = ds.package;
+        home.file.".local/share/plumb".source = ds.plumb.package;
 
         # Mismo esquema que tokeneconomizer: el marketplace local apunta a `ruta`, y tras un rebuild
         # `claude plugin update` recoge el plugin nuevo (con el binario recién compilado).
-        home.activation.dotfilesIaDiseno = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
-          run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py diseno-studio diseno-studio \
-            ${ruta} ${lib.escapeShellArgs dirs} ${lib.optionalString (ds.claude != null) "--claude ${ds.claude}"} || true
+        # --quitar retira el nombre anterior (diseno-studio) si sigue activado.
+        home.activation.dotfilesIaPlumb = lib.hm.dag.entryAfter [ "linkGeneration" "dotfilesIaClaude" ] ''
+          run ${pkgs.python3}/bin/python3 ${origen}/claude/activar-plugin.py plumb plumb \
+            ${ruta} ${lib.escapeShellArgs dirs} --quitar diseno-studio@diseno-studio \
+            ${lib.optionalString (ds.claude != null) "--claude ${ds.claude}"} || true
         '';
       }
     ))
