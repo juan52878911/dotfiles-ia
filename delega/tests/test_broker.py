@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "src")
@@ -18,6 +19,10 @@ from delega import broker  # noqa: E402
 
 class BrokerCase(unittest.TestCase):
     def setUp(self):
+        # i18n reads DELEGA_LOCALE from the ambient environment; pin it so in-process calls do not depend on it.
+        patcher = mock.patch.dict(os.environ, {"DELEGA_LOCALE": "en"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ch = os.path.join(self.tmp.name, "job")
