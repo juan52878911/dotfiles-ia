@@ -34,7 +34,6 @@ PYTHONPATH="%s" exec python3 -m delega "$@"
 class Base(DaemonCase):
     def setUp(self):
         super().setUp()
-        queue._LANZADOR_FALLOS.clear()
         r = self.tmp.name
         self.state_a = os.path.join(r, "state-a")
         os.makedirs(self.state_a)

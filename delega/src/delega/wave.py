@@ -274,6 +274,29 @@ class Env:
                                  start_new_session=True, env=dict(env, RCFILE=rcfile), cwd=self.repo_dir)
         return f"pend:{p.pid}:{stamp}"
 
+    def launch_refused(self, task):
+        """True when the last `delega run` of the task ended refused (rc `launch.REFUSED_RC`) before it made
+        a job directory, or its log carries the refusal for an open branch."""
+        from . import launch
+        if self._job_dir(task) is not None:
+            return False
+        stem = self._stem(task)
+        try:
+            with open(os.path.join(self._wave_dir(create=False), stem + ".rc")) as f:
+                rc = f.read().strip()
+            if rc:
+                return rc == str(launch.REFUSED_RC)
+        except OSError:
+            pass
+        try:
+            with open(os.path.join(self._wave_dir(create=False), stem + ".log"), encoding="utf-8",
+                      errors="replace") as f:
+                log = f.read()[-LOG_TAIL:]
+        except OSError:
+            return False
+        parts = i18n.t("launch.err.branch_in_use", branch="\0", job="\0", path="\0").split("\0")
+        return re.search(".*?".join(re.escape(p) for p in parts), log) is not None
+
     def _fetched_sha(self, job_dir, jid, branch):
         """The sha the job brought to this repo, or None if its fetch did not succeed.
         `launch` writes `FETCHED=<sha>` in meta when the fetch worked; `fetch.log` (empty = ok)
@@ -451,6 +474,9 @@ class LocalStore:
     def event(self, que, datos, task=None, once=False):
         _retry(lambda: mem.add_event(self.conn, que, datos, task=task, once=once, quien=mem.owner_id()))
 
+    def events(self, flow):
+        return mem.log_events(self.conn, limit=0, flow=flow)
+
     def sha_of(self, flow, task):
         for e in reversed(mem.log_events(self.conn, limit=0, flow=flow)):
             if e["que"] == "wave.sha" and e["datos"].get("tarea") == task:
@@ -495,6 +521,10 @@ class ClientStore:
         if rc != mem.EXIT_OK:
             raise mem.MemError(payload.get("error") or f"event: rc={rc}")
 
+    def events(self, flow):
+        rc, payload = self.client._call(lambda: self.client._remote("log", "--flow", flow, "--limit", "0"))
+        return payload.get("eventos", [])
+
     def sha_of(self, flow, task):
         rc, payload = self.client._call(lambda: self.client._remote("log", "--flow", flow, "--limit", "0"))
         for e in reversed(payload.get("eventos", [])):
@@ -523,6 +553,42 @@ def _needed_by_others(tasks, wave):
 
 def _conflict_files(out):
     return [ln.strip() for ln in out.splitlines() if ln.startswith("  ")]
+
+
+MAX_REFUSED = 3
+
+
+def _known(env, t, lanzador=None):
+    """`registro` of a decision: the tail of the task's job log, else one line of what is known."""
+    tail = ""
+    try:
+        tail = env.log_tail(t) if hasattr(env, "log_tail") else ""
+    except Exception:
+        pass
+    if tail:
+        return tail[-LOG_TAIL:]
+    return (f"job_id={t.get('job_id') or '-'} lanzador={lanzador or t.get('lanzador') or '-'} "
+            f"error={t.get('error') or '-'} estado={t.get('estado') or '-'}")
+
+
+def _launch_refused(env, t):
+    """True when the job of the task never ran because `delega run` refused to launch it."""
+    fn = getattr(env, "launch_refused", None)
+    return bool(fn and fn(t))
+
+
+def _count_refused(st, flow, t):
+    """Consecutive refused launches of the task (events; a job that brought a sha starts the count again)."""
+    n = 0
+    for e in st.events(flow):
+        d = e.get("datos") or {}
+        if d.get("tarea") != t["id"]:
+            continue
+        if e["que"] == "wave.lanzamiento_rechazado":
+            n += 1
+        elif e["que"] == "wave.sha":
+            n = 0
+    return n
 
 
 def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=None, lanzador=None,
@@ -554,7 +620,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             continue
         if state == NOT_FOUND:            # no directory on the host that should have it: not a failure
             st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "job_sin_directorio",
-                                           "job_id": jid}, task=t["id"], once=True)
+                                           "job_id": jid, "registro": _known(env, t, lanzador)},
+                     task=t["id"], once=True)
             continue
         if state == "queued":
             # the node was full: `delega run` did not start (rc 6). Give the attempt back.
@@ -573,10 +640,22 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             if not st.set(t["id"], "ok", "lanzada", job_id=jid):
                 continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="ok"))
+        elif t["estado"] == "arreglo" and _launch_refused(env, t):
+            # the fix job was refused at launch (rc 2: branch still open in a job's worktree…): it never ran,
+            # so it is not a failed fix. Back to `ok` (no attempt added), retried on a later step.
+            refused = _count_refused(st, flow, t) + 1
+            if not st.set(t["id"], "ok", "arreglo", force=True, job_id=jid, intentos=max(t["intentos"] - 1, 0)):
+                continue
+            st.event("wave.lanzamiento_rechazado", {"flujo": flow, "tarea": t["id"]}, task=t["id"])
+            if refused >= MAX_REFUSED:
+                st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "lanzamiento_rechazado",
+                                               "registro": _known(env, t, lanzador)}, task=t["id"], once=True)
+            say(i18n.t("wave.fix_refused", id=t["id"], n=refused))
         elif t["estado"] == "arreglo":
             if not st.set(t["id"], "bloqueada", "arreglo", job_id=jid, error="fix job failed"):
                 continue
-            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "arreglo_fallido"})
+            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "arreglo_fallido",
+                                           "registro": _known(env, t, lanzador)}, task=t["id"], once=True)
             say(i18n.t("wave.fix_failed", id=t["id"]))
         else:
             if not st.set(t["id"], "rojo", "lanzada", job_id=jid):
@@ -590,7 +669,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             continue
         if t["intentos"] >= 2:
             if st.set(t["id"], "bloqueada", "rojo", error="failed twice"):
-                st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_repetido"})
+                st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_repetido",
+                                               "registro": _known(env, t, lanzador)})
                 say(i18n.t("wave.blocked", id=t["id"]))
             continue
         if inflight >= par:
@@ -691,7 +771,7 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             files = _conflict_files(out)
             st.set(t["id"], "bloqueada", "ok", force=True, error="conflict")
             st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "conflicto",
-                                               "ficheros": files})
+                                               "ficheros": files, "registro": out[-LOG_TAIL:]})
             say(i18n.t("wave.conflict", id=t["id"], n=len(files)))
             return 0
         else:

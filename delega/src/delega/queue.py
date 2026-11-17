@@ -579,7 +579,8 @@ def _wave_step(cfg, client, fl):
 
 
 LANZADOR_MAX_FALLOS = 10     # consecutive cycles without an answer from the launcher (~5 min)
-_LANZADOR_FALLOS = {}        # (org, task) -> consecutive cycles without an answer
+FALLO_EVENT = "lanzador_sin_respuesta"   # one event per cycle without an answer: the count lives in the database
+RESPONDE_EVENT = "lanzador_responde"      # the launcher answered: the count starts again
 
 
 def _local_id():
@@ -642,19 +643,59 @@ def _is_alias(host):
     return bool(host) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", host) is not None
 
 
-def _decide(client, fl, t, motivo, **extra):
-    """A `necesita_decision` of the task, once."""
+def _known(t, host=None, env=None):
+    """`registro` of a decision about a task: the tail of its job's log, else a line of what is known."""
+    tail = ""
+    if env is not None and hasattr(env, "log_tail"):
+        try:
+            tail = env.log_tail(t)
+        except Exception:
+            tail = ""
+    if tail:
+        return tail[-wave_log_tail():]
+    return (f"job_id={t.get('job_id') or '-'} lanzador={host if host is not None else (t.get('lanzador') or '-')} "
+            f"error={t.get('error') or '-'} estado={t.get('estado') or '-'}")
+
+
+def wave_log_tail():
+    from . import wave
+    return wave.LOG_TAIL
+
+
+def _decide(client, fl, t, motivo, env=None, **extra):
+    """A `necesita_decision` of the task, once (with `registro`: what is known of it)."""
+    extra.setdefault("registro", _known(t, extra.get("lanzador"), env))
     _event_once(client, t, dict({"flujo": fl["id"], "motivo": motivo, "job_id": t.get("job_id")}, **extra))
 
 
-def _count_failure(client, fl, t, host, motivo):
-    """One more cycle without an answer from the launcher; at LANZADOR_MAX_FALLOS ask for a decision (once)."""
-    key = (client.org, t["id"])
-    n = _LANZADOR_FALLOS[key] = _LANZADOR_FALLOS.get(key, 0) + 1
+def _fallos(client, t):
+    """Consecutive cycles without an answer of the task's launcher, counted in the database."""
+    from . import relevo
+    n = 0
+    for e in relevo._export(client)["eventos"]:
+        if (e.get("datos") or {}).get("tarea") != t["id"]:
+            continue
+        if e["que"] == FALLO_EVENT:
+            n += 1
+        elif e["que"] == RESPONDE_EVENT:
+            n = 0
+    return n
+
+
+def _count_failure(client, fl, t, host, motivo, env=None):
+    """One more cycle without an answer from the launcher (an event, so a restart does not lose it);
+    at LANZADOR_MAX_FALLOS ask for a decision (once)."""
+    from . import relevo
+    try:
+        relevo._event(client, FALLO_EVENT, t["id"], {"lanzador": host, "motivo": motivo})
+        n = _fallos(client, t)
+    except Exception as e:
+        print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
+        return
     msg = "n2.lanzador_unreachable" if motivo == "lanzador_caido" else "n2.no_alias"
     print(i18n.t(msg, host=host, id=t["id"], n=n, max=LANZADOR_MAX_FALLOS), file=sys.stderr)
-    if n == LANZADOR_MAX_FALLOS:
-        _decide(client, fl, t, motivo, lanzador=host)
+    if n >= LANZADOR_MAX_FALLOS:
+        _decide(client, fl, t, motivo, env=env, lanzador=host)
 
 
 def task_state(cfg, client, fl, env, t):
@@ -673,29 +714,33 @@ def task_state(cfg, client, fl, env, t):
         return _foreign_state(cfg, client, fl, env, t, host)
     res = env.job_state(t)
     if res[0] == wave_not_found():
-        _decide(client, fl, t, "job_sin_directorio")
+        _decide(client, fl, t, "job_sin_directorio", env=env)
         return None
     return res
 
 
 def _foreign_state(cfg, client, fl, env, t, host):
-    key = (client.org, t["id"])
-    nodes = getattr(cfg, "nodes", None) or {}
+    nodes =getattr(cfg, "nodes", None) or {}
     if host in nodes:
         alias = (cfg.node(host).get("ssh") or host)
     elif not nodes and _is_alias(host):
         alias = host
     else:                                  # a Mac (or an old/empty `lanzador`): nobody to ask
-        _decide(client, fl, t, "lanzador_sin_ssh", lanzador=host)
+        _decide(client, fl, t, "lanzador_sin_ssh", env=env, lanzador=host)
         return None
     ans = _ask_lanzador(alias, dict(t, flujo=fl["id"]))
     if ans is None:
-        _count_failure(client, fl, t, host, "lanzador_caido")
+        _count_failure(client, fl, t, host, "lanzador_caido", env=env)
         return None
-    _LANZADOR_FALLOS.pop(key, None)
+    try:
+        if _fallos(client, t):
+            from . import relevo
+            relevo._event(client, RESPONDE_EVENT, t["id"], {"lanzador": host})
+    except Exception as e:
+        print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
     state, jid = ans["estado"], ans.get("job_id") or t.get("job_id")
     if state == wave_not_found():
-        _decide(client, fl, t, "job_sin_directorio", lanzador=host)
+        _decide(client, fl, t, "job_sin_directorio", env=env, lanzador=host)
         return None
     if state != "ok":
         return state, jid, None

@@ -1305,7 +1305,9 @@ def cmd_promote(args, db, as_json):
                                        "estado_anterior": row["estado"], "motivo": "promote_desactualizada"})
                 _event(c, "necesita_decision", {"tarea": task_id, "flujo": row["flujo"],
                                                 "motivo": "promote_desactualizada", "copiado_en": copied_at,
-                                                "actualizado": updated})
+                                                "actualizado": updated,
+                                                "registro": f"estado_anterior={row['estado']} copia={copied_at} "
+                                                            f"actualizado={updated} (la base se promovió: copia vieja)"})
                 blocked.append(task_id)
             # The leases are released, but their owners keep a fencing token with the old epoch.
             # A different new owner can take the role immediately; the old owner is refused.
@@ -1428,7 +1430,7 @@ def main(argv):
     Exit codes: 0 done, 2 invalid, 9 lease/CAS conflict, 10 database busy (retry).
     """
     argv = list(argv or [])
-    db, as_json, rest = None, False, []
+    db, as_json, rest, owner_opt = None, False, [], None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1443,6 +1445,11 @@ def main(argv):
             db = argv[i]
         elif a.startswith("--db="):
             db = a[5:]
+        elif a == "--owner" and i + 1 < len(argv):      # common: who writes (an escalated Claude over ssh)
+            i += 1
+            owner_opt = argv[i]
+        elif a.startswith("--owner="):
+            owner_opt = a[8:]
         elif a in ("-h", "--help"):
             rest.append("--help")
         else:
@@ -1455,6 +1462,19 @@ def main(argv):
     fn = ORDERS.get(cmd)
     if fn is None:
         return _fail(i18n.t("mem.unknown_cmd", cmd=cmd), as_json)
+    prev_owner = os.environ.get("DELEGA_MEM_OWNER")
+    if owner_opt:
+        os.environ["DELEGA_MEM_OWNER"] = owner_opt
+    try:
+        return _run(fn, args, db, as_json)
+    finally:
+        if prev_owner is None:
+            os.environ.pop("DELEGA_MEM_OWNER", None)
+        else:
+            os.environ["DELEGA_MEM_OWNER"] = prev_owner
+
+
+def _run(fn, args, db, as_json):
     try:
         return fn(args, db, as_json)
     except MemConflict as e:

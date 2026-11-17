@@ -30,6 +30,7 @@ MAX_REDS = 2
 MODEL = "sonnet"
 CAP_USD = 3
 EVENT_TAIL = 50
+LOG_TAIL = 6000
 FORBIDDEN_TOOLS = ("Bash(git *)", "Bash(gh *)", "Edit", "Write")
 # what guarantees that the escalated Claude never pushes or merges (see `claude_argv`):
 # the closed allow list below; the deny list only adds a second lock.
@@ -277,10 +278,38 @@ def candidates(exp):
     return out
 
 
-def brief_for(task, why, flow_export):
+def mem_access(cfg, org, owner):
+    """How the escalated Claude (it runs on THIS host) reaches the org's database: {cmd, tool, owner}.
+    `cmd` is the exact command prefix of the brief, `tool` the only `Bash(...)` the Claude may run.
+    A local base: `delega mem … --db <path> --org <org>`; a remote one: `ssh <host> delega mem …` with
+    the same options (`--owner` carries the identity the writes need to pass the fence)."""
+    import shlex
+    from . import mem
+    m = cfg.memoria_for(org)
+    opts = f"--db {shlex.quote(m['path'] or mem.db_path(None, org=org))} --org {shlex.quote(org)} --owner {shlex.quote(owner)}"
+    if m["local"]:
+        return {"cmd": "delega mem", "opts": opts, "tool": "Bash(delega mem *)", "owner": owner, "host": ""}
+    host = m["host"]
+    return {"cmd": f"ssh {host} delega mem", "opts": opts, "tool": f"Bash(ssh {host} delega mem *)",
+            "owner": owner, "host": host}
+
+
+def brief_for(task, why, flow_export, access=None, registro=""):
+    """`access`: what `mem_access` returned. `registro`: what is known of the cause (see `registro_of`)."""
+    access = access or {"cmd": "delega mem", "opts": "", "owner": ""}
     return i18n.t("relevo.brief", task=task["id"], why=why, flow=task["flujo"], brief=task["brief"],
-                  estado=task["estado"], intentos=task["intentos"],
+                  estado=task["estado"], intentos=task["intentos"], cmd=access["cmd"], opts=access["opts"],
+                  registro=registro or "-",
                   export=json.dumps(flow_export, ensure_ascii=False, indent=1, default=str))
+
+
+def registro_of(exp, tid):
+    """The `registro` of the newest `necesita_decision` of the task (its job log's tail, or what is known)."""
+    for e in reversed(exp["eventos"]):
+        d = e.get("datos") or {}
+        if e["que"] == NEEDS_DECISION and d.get("tarea") == tid and d.get("registro"):
+            return str(d["registro"])[-LOG_TAIL:]
+    return ""
 
 
 def _ws_in_org(org):
@@ -294,7 +323,12 @@ def _ws_in_org(org):
     return r.returncode == 0 and org.lower() in re.findall(r"[\w.-]+", r.stdout.lower())
 
 
-def claude_argv(brief, org=None):
+def _allowed(tool):
+    """Read tools + the ONE `Bash(...)` that reaches the org's base (default: the local `delega mem`)."""
+    return ALLOWED_TOOLS[:-1] + (tool or ALLOWED_TOOLS[-1],)
+
+
+def claude_argv(brief, org=None, tool=None):
     """argv of the escalated Claude. What guarantees what:
 
     * `--permission-mode default` + the CLOSED `--allowedTools` list (read tools + `Bash(delega mem *)`):
@@ -309,12 +343,15 @@ def claude_argv(brief, org=None):
     base = ["ws", "exec", "claude"] if _ws_in_org(org) else ["claude"]
     return base + ["-p", brief, "--model", MODEL, "--max-budget-usd", str(CAP_USD),
                    "--output-format", "json", "--permission-mode", "default",
-                   "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *FORBIDDEN_TOOLS]
+                   "--allowedTools", *_allowed(tool), "--disallowedTools", *FORBIDDEN_TOOLS]
 
 
-def claude_env():
-    """The environment of the escalated Claude: no way to push or open a PR."""
-    return {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+def claude_env(owner=None):
+    """The environment of the escalated Claude: no way to push or open a PR; its own mem identity."""
+    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+    if owner:
+        env["DELEGA_MEM_OWNER"] = owner
+    return env
 
 
 def escalation_profile(cfg, org, task=None, repo=None):
@@ -331,7 +368,7 @@ def escalation_profile(cfg, org, task=None, repo=None):
     return mine[0] if mine else None
 
 
-def spawn(cfg, task_id, brief, org=None, profile=None):
+def spawn(cfg, task_id, brief, org=None, profile=None, access=None):
     """Start the Claude orchestrator in the background; returns its log path.
 
     The run is a spend entry of its own (`<state>/<ts>-esc-<task>/`): its JSON result lands in
@@ -348,8 +385,8 @@ def spawn(cfg, task_id, brief, org=None, profile=None):
     util.write_json(os.path.join(run_dir, "escalado.json"),
                     {"OWNER": "relevo", "PROFILE": prof or "", "PROJECT": "", "TASK": task_id, "CAP_USD": CAP_USD})
     with open(log, "ab") as out, open(os.path.join(run_dir, "result.json"), "wb") as res:
-        subprocess.Popen(claude_argv(brief, org), stdout=res, stderr=out, stdin=subprocess.DEVNULL,
-                         env=claude_env(), start_new_session=True)
+        subprocess.Popen(claude_argv(brief, org, (access or {}).get("tool")), stdout=res, stderr=out,
+                         stdin=subprocess.DEVNULL, env=claude_env((access or {}).get("owner")), start_new_session=True)
     audit.record(cfg, "escalate", task=task_id, org=org, profile=prof, cap_usd=CAP_USD, dir=run_dir, log=log)
     return log
 
@@ -377,7 +414,8 @@ def escalate(cfg, client, limit=None):
         tried += 1
         try:
             prof = escalation_profile(cfg, client.org, task, ((fx.get("flujo") or {}).get("repo")))
-            log = spawn(cfg, tid, brief_for(task, why, fx), client.org, prof)
+            access = mem_access(cfg, client.org, client.owner + "-claude")
+            log = spawn(cfg, tid, brief_for(task, why, fx, access, registro_of(exp, tid)), client.org, prof, access)
         except Exception as e:
             print(i18n.t("relevo.error", err=e), file=sys.stderr)
             _event(client, SPAWN_FAILED, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "error": str(e)})
