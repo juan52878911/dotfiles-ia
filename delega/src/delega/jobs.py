@@ -180,7 +180,10 @@ def reconcile(cfg):
             continue
         if alive(cfg, d):
             if _is_remote(meta) and not _pid_alive(_read_pid(os.path.join(d, "waiter.pid"))):
-                out.append((d, "orphan"))
+                out.append((d, "disconnected" if meta.get("DISCONNECTED") else "orphan"))
+            continue
+        if meta.get("DISCONNECTED"):     # lost contact, its VM may hold work: adopt/recover close it, not this
+            out.append((d, "disconnected"))
             continue
         close_job(d, "dead", cfg)
         out.append((d, "closed"))
@@ -232,6 +235,8 @@ def describe(cfg, job_dir):
                      branch=(" · " + meta["BRANCH"]) if meta.get("BRANCH") else "", owner=meta.get("OWNER", "?"))
     if meta.get("END"):
         head += " · " + t("jobs.ps.closed")
+    elif meta.get("DISCONNECTED"):
+        head += " · " + t("jobs.ps.disconnected", job=job_id(job_dir))
     lines = [head]
     try:
         st = json.loads(read_channel(cfg, job_dir, "state.json") or "")
@@ -475,6 +480,108 @@ def main_adopt(argv):
     return adopt(cfg, d)
 
 
+# ── recover / gc ────────────────────────────────────────────────────────────
+def recover(cfg, job_dir, force=False):
+    """Close a remote job now, without waiting: read the rc inside the VM (or the node's channel), bring the
+    branch back as a file (`kling cp`, never stdout), fetch it, scan it, END the job and delete the VM.
+    Refuses while the worker's lease is fresh (use adopt) unless force."""
+    from . import launch
+    meta = util.read_meta(job_dir)
+    if meta.get("END"):
+        print(t("jobs.adopt.already"))
+        return 0
+    if not _is_remote(meta) or not meta.get("CHANNEL"):
+        print(t("jobs.recover.local"), file=sys.stderr)
+        return 2
+    node, chan = _node(cfg, meta), shlex.quote(meta["CHANNEL"])
+    r = remote.ssh(node, f"cat {chan}/rc", timeout=60)
+    if r.returncode in launch.SSH_DOWN:
+        print(t("jobs.recover.no_contact", host=remote.alias(node), err=(r.stderr or "").strip()[-200:]), file=sys.stderr)
+        return launch.RC_NO_CONTACT
+    rc = None
+    if r.returncode == 0:
+        try:
+            rc = int(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            rc = 1
+    else:
+        lease, age = remote.lease_age(remote.ssh(node, remote.lease_cmd(meta["CHANNEL"]), timeout=60))
+        fresh = bool(lease) and not lease.get("final") and age < float(cfg.policy("lease.stale_s"))
+        if fresh and not force:
+            print(t("jobs.recover.running", job=job_id(job_dir)), file=sys.stderr)
+            return 2
+        rc = launch.RC_BROKER_LOST
+    with open(os.path.join(job_dir, "waiter.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    print(t("jobs.recover.start", job=os.path.basename(job_dir), node=meta["NODE"], rc=rc))
+    return launch.wait_and_finish(cfg, job_dir, rc=rc)
+
+
+def main_recover(argv):
+    ap = argparse.ArgumentParser(prog="delega recover", description="Close a remote job now: read its rc, bring "
+                                 "its branch back, scan it and delete its VM (no waiting; see adopt).")
+    ap.add_argument("job")
+    ap.add_argument("--force", action="store_true", help="also when the worker still looks alive (stops waiting for it)")
+    args = ap.parse_args(argv)
+    cfg = _config.load()
+    try:
+        d = resolve(cfg, args.job)
+    except LookupError as e:
+        print(f"delega: {e}", file=sys.stderr)
+        return 7
+    return recover(cfg, d, args.force)
+
+
+def gc(cfg, node_names=None, yes=False, out=None):
+    """Delete the delega VMs whose job ended or is unknown to this state_dir, on every kindling host
+    (once per host). Without yes, only list them. The other orphans (frozen, stale lease) are shown
+    with `delega recover`: they may hold work. Returns the number of VMs deleted (or to delete)."""
+    from . import kindling
+    out = out or sys.stdout
+    seen, n = set(), 0
+    for name in node_names or [k for k, v in cfg.nodes.items() if v.get("runner") == "kindling"]:
+        node = cfg.node(name)
+        host = remote.alias(node)
+        if host in seen:
+            continue
+        seen.add(host)
+        vms = kindling.host_vms(node)
+        if vms is None:
+            print(t("jobs.gc.unreachable", host=host), file=out)
+            continue
+        _, orphans = kindling.classify(cfg, node, vms)
+        for vm, why in orphans:
+            if why in ("ended", "unknown"):
+                n += 1
+                if yes:
+                    kindling.destroy(node, vm)
+                print(t("jobs.gc.removed" if yes else "jobs.gc.would", vm=vm, host=host, why=t("jobs.gc.why." + why)),
+                      file=out)
+            else:
+                print(t("jobs.gc.keep", vm=vm, host=host, why=t("jobs.gc.why." + why),
+                        job=vm[len(kindling.VM_PREFIX):]), file=out)
+    if n and not yes:
+        print(t("jobs.gc.hint"), file=out)
+    elif not n:
+        print(t("jobs.gc.none"), file=out)
+    return n
+
+
+def main_gc(argv):
+    ap = argparse.ArgumentParser(prog="delega gc", description="List (and with --yes delete) the delega VMs left "
+                                 "on kindling hosts by jobs that ended or that this machine does not know.")
+    ap.add_argument("--node", action="append", help="kindling node (repeatable; default: all)")
+    ap.add_argument("--yes", action="store_true", help="delete them (default: only list)")
+    args = ap.parse_args(argv)
+    cfg = _config.load()
+    try:
+        gc(cfg, args.node, args.yes)
+    except _config.ConfigError as e:
+        print(f"delega: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv):
-    print("usage: delega ps|say|watch|adopt …", file=sys.stderr)
+    print("usage: delega ps|say|watch|adopt|recover|gc …", file=sys.stderr)
     return 2

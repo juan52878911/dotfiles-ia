@@ -20,8 +20,9 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 
-from . import remote
+from . import remote, util
 
 DEFAULT_EGRESS = ["anthropic.com"]
 VM_PREFIX = "delega-"
@@ -72,13 +73,69 @@ def read_token(node):
     return tok
 
 
-def live_vms(node):
-    """Number of delega VMs alive on the host, or None if it does not answer."""
+STATES = ("running", "frozen", "stopped", "failed", "starting", "creating", "paused")
+LAUNCH_WINDOW_S = 900       # a VM whose job has no lease yet still counts this long (it is being set up)
+
+
+def host_vms(node):
+    """[(vm, state)] of the delega job VMs on the host (`kling ps`), or None if it does not answer."""
     r = remote.ssh(remote.host_node(node), "kling ps", timeout=30)
     if r.returncode != 0:
         return None
-    return sum(1 for line in r.stdout.splitlines()
-               if any(w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS) for w in line.split()))
+    out = []
+    for line in r.stdout.splitlines():
+        words = line.split()
+        for w in words:
+            if w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS):
+                out.append((w, next((x for x in words if x in STATES), "")))
+    return out
+
+
+def live_vms(node):
+    """Number of delega VMs on the host (alive or not), or None if it does not answer."""
+    vms = host_vms(node)
+    return None if vms is None else len(vms)
+
+
+def job_dir_of(cfg, vm):
+    """This machine's job dir for a VM `delega-<id>`, or None (job unknown to this state_dir)."""
+    from . import jobs
+    jid = vm[len(VM_PREFIX):]
+    return next((d for d in jobs.job_dirs(cfg) if jobs.job_id(d) == jid), None)
+
+
+def classify(cfg, node, vms):
+    """Split the host's delega VMs into (active, orphans). Active = a job of this state_dir without END
+    whose lease (read inside the VM) was renewed within `lease.stale_s`, or that is still being set up.
+    orphans = [(vm, why)], why: ended (job has END), unknown (no such job here), frozen (stopped by its
+    ttl, or by hand), stale (lease too old or final) or no_lease. Only ended and unknown are `gc`'s."""
+    stale = float(cfg.policy("lease.stale_s"))
+    active, orphans = [], []
+    for vm, state in vms:
+        d = job_dir_of(cfg, vm)
+        meta = util.read_meta(d) if d else {}
+        if not d:
+            orphans.append((vm, "unknown"))
+            continue
+        if meta.get("END"):
+            orphans.append((vm, "ended"))
+            continue
+        if state and state != "running":
+            orphans.append((vm, "frozen"))
+            continue
+        chan = meta.get("CHANNEL")
+        lease, age = remote.lease_age(remote.ssh(dict(node, vm=vm), remote.lease_cmd(chan), timeout=30)) \
+            if chan else (None, None)
+        if lease:
+            fresh = not lease.get("final") and age < stale
+            (active.append(vm) if fresh else orphans.append((vm, "stale")))
+            continue
+        try:
+            young = time.time() - os.path.getmtime(os.path.join(d, "meta")) < LAUNCH_WINDOW_S
+        except OSError:
+            young = False
+        (active.append(vm) if young else orphans.append((vm, "no_lease")))
+    return active, orphans
 
 
 def has_golden(node, repo):
@@ -92,15 +149,18 @@ def probe(cfg, node, profile, requires=()):
     res = {"ok": False, "reason": "", "fix": "", "kind": "", "email": node.get("account") or "",
            "compute": {}, "node": node["name"], "vms": None, "claude_version": None}
     a = remote.alias(node)
-    n = live_vms(node)
-    if n is None:
+    vms = host_vms(node)
+    if vms is None:
         res.update(kind="unreachable", reason=f"{a}: kling does not answer", fix=f"ssh {a} kling ps")
         return res
-    res["vms"] = n
+    active, orphans = classify(cfg, node, vms)
+    n = len(active)
+    res["vms"], res["orphans"] = n, orphans
     mx = node.get("max_jobs")
     if mx and n >= mx:
-        res.update(kind="resources", reason=f"{a}: {n} delega VMs alive (max_jobs={mx})",
-                   fix=f"ssh {a} kling ps  # kling rm the orphans")
+        extra = f"; orphans not counted: {', '.join(f'{v} ({w})' for v, w in orphans)}" if orphans else ""
+        res.update(kind="resources", reason=f"{a}: {n} delega VMs with a live job (max_jobs={mx}){extra}",
+                   fix=f"delega ps --all  # wait, or close finished jobs; then delega gc --node {node['name']}")
         return res
     for c in requires:
         res["compute"][c] = "unsupported"
@@ -111,13 +171,29 @@ def probe(cfg, node, profile, requires=()):
     return res
 
 
-def create(node, vm, image):
+def ttl_min(cfg, caps, profile=None, project=None):
+    """Lifetime of a job VM: the job's time cap + its grace + `kindling.ttl_margin_min`."""
+    cap = float(caps.get("DELEGA_JOB_MAX_MIN") or cfg.policy("job.max_min", profile, project))
+    grace = float(caps.get("DELEGA_JOB_GRACE_S") or cfg.policy("job.grace_s", profile, project)) / 60
+    return int(cap + grace + float(cfg.policy("kindling.ttl_margin_min", profile, project)) + 0.999)
+
+
+def create(node, vm, image, ttl=None, on_ttl="freeze", labels=None):
+    """`kling run` the job VM from `image`. With ttl (minutes) the host freezes it (or removes it,
+    on_ttl="remove": VMs with real data) when it runs out, whatever happens to this machine."""
     q = shlex.quote
     allow = ",".join(node.get("egress_allow", DEFAULT_EGRESS))
+    extra = f" -ttl {int(ttl)}m -on-ttl {q(on_ttl)}" if ttl else ""
+    extra += "".join(f" -label {q(f'{k}={v}')}" for k, v in (labels or {}).items())
     r = remote.ssh(remote.host_node(node), f"kling run -name {q(vm)} -from {q(image)} -egress allowlist "
-                                          f"-allow {q(allow)} -wait-ready",
+                                          f"-allow {q(allow)}{extra} -wait-ready",
                    timeout=int(node.get("create_timeout_s", 300)))  # sin reflink el clon copia el disco entero
     return remote.must(r, f"kling run {vm} from {image}")
+
+
+def no_room(err):
+    """`kling run` refused the VM for lack of host memory (the probe counts VMs, not MiB)."""
+    return "doesn't fit" in err
 
 
 def destroy(node, vm):

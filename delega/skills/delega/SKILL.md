@@ -81,6 +81,10 @@ context. If {owner} asks, hand it to a worker or leave it for the close.
      services; no `--resume` (the VM is gone: use `handoff`) and no `--requires`. The golden records
      the sha256 of the repo's lockfiles; when HEAD's differ, the launch warns, and `--rebuild-golden` (or
      policy `golden.auto_rebuild = true`) rebuilds it first. `delega golden ls` shows fingerprint and age.
+     Each job VM carries a TTL (cap + grace + `kindling.ttl_margin_min`) after which the host freezes it
+     (removes it with `--db`), and labels `delega.job` / `delega.owner`. The host's free slots count only
+     VMs whose job is alive (fresh lease); the rest are listed as orphans. When to isolate and the known
+     errors with their fix: the `aislado` skill. Never drive `kling` over ssh by hand.
    - `--db <name>` (kindling only): the job gets a throwaway copy of a database the project declares
      (`[projects."…".databases.<name>]`), cloned from the data golden (`delega golden db`, ~1 s) or restored
      from the dump volume (`delega db volume create|refresh`). Use `templates/<locale>/brief-db.md` and,
@@ -139,6 +143,10 @@ cuts between turns, minutes and messages cut at any time.
 - Plan long batches away from the 5 h window reset (limit cuts cost hours of wall clock).
 - `delega queue add <repo> <brief> --prio N` + `delega tick` (e.g. from a timer) launch queued work
   when quota, budget and node capacity allow; `tick --adopt` re-attaches orphaned remote jobs.
+- **rc 6 = the node is full** (max_jobs, local slots, or the host's memory: `doesn't fit`). Nothing was
+  started and no job folder is left: the brief is queued once (the message gives its id; relaunching
+  the same brief finds it already queued) and `delega tick` launches it when there is room. **Do not
+  relaunch in a loop.** With policy `queue.when_full = "fail"` it only fails, printing the `queue add`.
 
 ### Measuring with chrono (if installed)
 
@@ -181,7 +189,12 @@ the Claude transcripts (`--preset claude-sessions`), use it instead of reading l
    - Stopped for longer, `--resume` is refused (it would re-send the whole context without cache).
      Use `delega handoff <job>` → fill in the draft → launch it as a new job (with `--branch` it
      continues on its commits on the same node). `--force-resume` only when it really pays off.
+   - **rc 96** (no contact with the host after the ssh retries): nothing was destroyed and the worker may
+     still be running; the job stays `disconnected`. When the host answers: `delega adopt <job>` (waits,
+     brings the branch) or `delega recover <job>` (closes now). **rc 97** (broker lost) or a branch that
+     could not be fetched: `delega recover <job>`. Never rescue by hand with `kling exec`.
 3. **Clean** the node's worktree and branches once the branch is integrated, and watch disk (`delega nodes`).
+   On kindling: `delega gc` lists VMs left by closed or unknown jobs; `delega gc --yes` deletes them.
 4. **Report** to {owner}: branch, `SESSION_ID`, job directory, cost (`delega spend`), what stays
    unverified. `delega audit <job|branch>` shows provenance (account, node, base, cost).
 
@@ -232,6 +245,8 @@ the Claude transcripts (`--preset claude-sessions`), use it instead of reading l
 | `delega spend [day\|all] [--by profile\|project\|owner]` | Cost and budget |
 | `delega run <repo> <brief> [options]` | Launch |
 | `delega ps [--all] [job]` · `watch` · `say <job> "…"` · `adopt <job>` | Channel |
+| `delega recover <job> [--force]` | Close a remote job now: rc, branch via `kling cp`, scan, delete its VM |
+| `delega gc [--node n] [--yes]` | List (delete with `--yes`) VMs whose job ended or is unknown here |
 | `delega handoff <job> [out.md]` | Continue without `--resume` |
 | `delega scan <repo> <branch> [base]` | Forbidden terms in a branch (exit 9 on hits) |
 | `delega integrate <repo> <branch> [--into main]` | Merge dry run + verify commands |
@@ -245,7 +260,8 @@ the Claude transcripts (`--preset claude-sessions`), use it instead of reading l
 
 Policy keys (all under `[policy]`, overridable per profile/project or with `DELEGA_<KEY>`):
 `job.max_min`, `job.max_turns`, `job.max_usd`, `job.grace_s`, `stall_s`, `answer_wait_s`,
-`resume_max_min`, `max_local_jobs`, `expected_hours`, `node.*`, `budget.day_usd`, `quota.*`, `lint.require`, `lint.branch|live|text`, `lint.live_keywords`, `lease.*`.
+`resume_max_min`, `max_local_jobs`, `expected_hours`, `node.*`, `budget.day_usd`, `quota.*`, `lint.require`, `lint.branch|live|text`, `lint.live_keywords`, `lease.*`,
+`ssh.retries|retry_s|retry_max_s`, `kindling.ttl_margin_min`.
 
 Files of each job live in `<state_dir>/<id>-<repo>/` (on a node, `~/<workdir>/jobs/<id>/`): `meta`,
 `brief.md`, `inbox.jsonl`, `notices.jsonl`, `progress.log`, `state.json`, `events.jsonl`, `result.json`,

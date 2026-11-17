@@ -97,6 +97,7 @@ class LaunchCase(unittest.TestCase):
             "DELEGA_LOCALE": "en", "DELEGA_WAIT_POLL_S": "0.2", "DELEGA_WATCH_POLL_S": "0.1",
             "DELEGA_OWNER": "tester", "DELEGA_NODE_MIN_DISK_GB": "0",
             "DELEGA_NODE_MAX_LOAD_PCT": "100000",  # never the host's real load
+            "DELEGA_SSH_RETRY_S": "0.01", "DELEGA_SSH_RETRY_MAX_S": "0.05",  # ssh retries without real waits
             "PYTHONPATH": os.path.join(ROOT, "src"),
         }
         p = mock.patch.dict(os.environ, env)

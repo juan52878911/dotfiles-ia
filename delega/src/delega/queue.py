@@ -68,6 +68,24 @@ def add(cfg, repo, brief, prio=0, run_args=()):
     return item
 
 
+def add_once(cfg, repo, brief, prio=0, run_args=()):
+    """add(), unless the same brief for the same repo and options is already queued: (item, new?).
+    A caller that relaunches in a loop while the node is full ends up with one item, not one per try."""
+    repo_abs = os.path.abspath(repo)
+    with open(brief, encoding="utf-8") as f:
+        text = f.read()
+    for it in pending(read_items(cfg)):
+        if it["repo"] != repo_abs or it.get("args") != list(run_args):
+            continue
+        try:
+            with open(it["brief"], encoding="utf-8") as f:
+                if f.read() == text:
+                    return it, False
+        except OSError:
+            pass
+    return add(cfg, repo, brief, prio, run_args), True
+
+
 def pending(items):
     return sorted((i for i in items if i.get("state") == "queued"), key=lambda i: (-i.get("prio", 0), i.get("ts", 0)))
 
@@ -78,6 +96,7 @@ def launch(cfg, item):
     env = dict(os.environ)
     root = os.path.dirname(util.PKG_DIR)            # checkout src/ or the .pyz itself
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["DELEGA_FROM_QUEUE"] = "1"                  # a full node fails back here instead of queueing again
     with open(log, "ab") as out:
         p = subprocess.Popen([sys.executable, "-m", "delega", "run", item["repo"], item["brief"], *item["args"]],
                              stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -87,7 +106,10 @@ def launch(cfg, item):
         rc = p.wait(timeout=LAUNCH_GRACE_S)
     except subprocess.TimeoutExpired:
         return "launched", str(p.pid)
-    return ("launched", str(p.pid)) if rc == 0 else ("failed", f"rc={rc}")
+    if rc == 0:
+        return "launched", str(p.pid)
+    from .launch import FULL_RC
+    return ("full", "") if rc == FULL_RC else ("failed", f"rc={rc}")
 
 
 def room(cfg, profile_name, today, cache):
@@ -185,6 +207,10 @@ def main_tick(argv):
                 print(i18n.t("tick.wait", id=it["id"], profile=name, why=why))
                 continue
             state, detail = launch(cfg, it)
+            if state == "full":               # room() said yes but the node had none: keep it queued
+                blocked.add(name)
+                print(i18n.t("tick.wait", id=it["id"], profile=name, why="node full"))
+                continue
             it["state"], it["started"] = state, time.time()
             started += 1 if state == "launched" else 0
             if state == "launched" and cache[name]["has_data"]:

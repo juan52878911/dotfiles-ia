@@ -3,6 +3,7 @@
 Tests point DELEGA_SSH / DELEGA_SCP at tests/fakes/{ssh,scp}. Credentials are never
 transferred: every upload goes through refuse_credentials().
 """
+import json
 import os
 import re
 import shlex
@@ -162,6 +163,25 @@ def _scp_from_vm(node, src, dst):
     r = _scp(host, f"{alias(node)}:{tmp}", str(dst))
     ssh(host, f"rm -f {q(tmp)}")
     return r
+
+
+def lease_cmd(chan):
+    """Shell that prints the channel's lease.json and then the node's own clock (`date +%s`)."""
+    return f"cat {shlex.quote(chan)}/lease.json && echo && date +%s"
+
+
+def lease_age(r):
+    """(lease, age_s) from the output of lease_cmd, the age measured with the node's clock: a VM
+    restored from a golden can run minutes behind this machine if kling could not resync its clock.
+    (None, None) when there is no lease or it cannot be read."""
+    if r.returncode != 0:
+        return None, None
+    lines = (r.stdout or "").strip().splitlines()
+    try:
+        d = json.loads("\n".join(lines[:-1]))
+        return d, float(lines[-1]) - float(d.get("renewed", 0))
+    except (ValueError, IndexError, TypeError, AttributeError):
+        return None, None
 
 
 def must(r, what):

@@ -31,6 +31,15 @@ class Refused(Exception):
         self.rc, self.msg, self.event, self.fields = rc, msg, event, fields
 
 
+FULL_RC = 6
+
+
+class Full(Refused):
+    """No room on the node right now: nothing was started, the brief waits in the queue."""
+    def __init__(self, msg, **fields):
+        super().__init__(FULL_RC, msg, event="full", **fields)
+
+
 # ── optional collaborators (other modules; called through the documented contract) ──
 def _spend_total(cfg, day, profile=None, project=None):
     from . import spend
@@ -290,58 +299,103 @@ def print_summary(job_dir, rc):
     print(res.get("result", ""))
 
 
-RC_NOT_STARTED, RC_BROKER_LOST = 98, 97
+RC_NOT_STARTED, RC_BROKER_LOST, RC_NO_CONTACT = 98, 97, 96
+SSH_DOWN = (255, 124)        # ssh could not reach the host / timed out: retry, never conclude anything
+
+
+class NoContact(Exception):
+    """The host did not answer after every retry. The job is left as it is (VM included)."""
+    def __init__(self, waited_s, err):
+        super().__init__(err)
+        self.waited_s, self.err = waited_s, err
+
+
+def retry_delays(cfg):
+    """Waits between ssh retries: retry_s doubling up to retry_max_s, `ssh.retries` of them."""
+    n, first, top = int(cfg.policy("ssh.retries")), float(cfg.policy("ssh.retry_s")), float(cfg.policy("ssh.retry_max_s"))
+    return [min(first * 2 ** i, top) for i in range(n)]
+
+
+def ssh_retry(cfg, node, cmd, timeout=30, delays=None):
+    """remote.ssh that retries while ssh itself fails (rc 255/124) and raises NoContact when it gives up.
+    A non-zero rc of the command (file missing, VM gone) is an answer and is returned as is."""
+    delays = retry_delays(cfg) if delays is None else delays
+    waited = 0.0
+    for i in range(len(delays) + 1):
+        r = remote.ssh(node, cmd, timeout=timeout)
+        if r.returncode not in SSH_DOWN:
+            return r
+        if i == len(delays):
+            break
+        print(t("launch.ssh_retry", host=remote.alias(node), n=i + 1, total=len(delays), s=int(delays[i]),
+                err=((r.stderr or "").strip().splitlines() or ["?"])[-1]), file=sys.stderr)
+        time.sleep(delays[i])
+        waited += delays[i]
+    raise NoContact(waited, ((r.stderr or "").strip().splitlines() or ["?"])[-1])
 
 
 def wait_for_rc(cfg, node, chan, poll_s, on_poll=None):
     """rc of the remote job. Never waits forever: if the broker shows no sign of life (no lease
     nor state file) within DELEGA_START_TIMEOUT_S → 98 (run.sh did not start); if its lease went
-    stale without an rc (broker killed, node rebooted) → 97. Transient ssh failures are retried."""
+    stale without an rc (broker killed, node rebooted) → 97. ssh failures are retried with growing
+    waits (`ssh.retries`, `ssh.retry_s`, `ssh.retry_max_s`); if the host stays silent → 96: nothing is
+    concluded about the worker, which may well be running."""
     q = shlex.quote(chan)
     start_timeout = float(os.environ.get("DELEGA_START_TIMEOUT_S", 180))
     stale = float(cfg.policy("lease.stale_s"))
     t0 = time.time()
-    while True:
-        if on_poll:
-            on_poll()
-        if remote.ssh(node, f"test -f {q}/rc", timeout=30).returncode == 0:
-            r = remote.ssh(node, f"cat {q}/rc", timeout=30)
-            try:
-                return int(r.stdout.strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                return 1
-        lease = remote.ssh(node, f"cat {q}/lease.json", timeout=30)
-        if lease.returncode == 0:
-            try:
-                d = json.loads(lease.stdout)
-                if not d.get("final") and time.time() - float(d.get("renewed", 0)) > stale:
+    try:
+        while True:
+            if on_poll:
+                on_poll()
+            if ssh_retry(cfg, node, f"test -f {q}/rc").returncode == 0:
+                r = ssh_retry(cfg, node, f"cat {q}/rc")
+                try:
+                    return int(r.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    return 1
+            lease = ssh_retry(cfg, node, remote.lease_cmd(chan))
+            if lease.returncode == 0:
+                d, age = remote.lease_age(lease)      # by the node's clock, not this machine's
+                if d and not d.get("final") and age > stale:
                     return RC_BROKER_LOST
-            except ValueError:
-                pass
-        elif time.time() - t0 > start_timeout:
-            alive = remote.ssh(node, f"test -f {q}/state.json || test -f {q}/estado.json", timeout=30)
-            if alive.returncode != 0:
-                return RC_NOT_STARTED
-        time.sleep(poll_s)
+            elif time.time() - t0 > start_timeout:
+                alive = ssh_retry(cfg, node, f"test -f {q}/state.json || test -f {q}/estado.json")
+                if alive.returncode != 0:
+                    return RC_NOT_STARTED
+            time.sleep(poll_s)
+    except NoContact as e:
+        node.setdefault("_no_contact", (e.waited_s, e.err))
+        return RC_NO_CONTACT
 
 
-def wait_and_finish(cfg, job_dir, poll_s=None):
+def wait_and_finish(cfg, job_dir, poll_s=None, rc=None):
     """Remote job: wait for rc, copy the channel back, close the job, fetch the branch, scan, report.
-    Shared by `delega run` and `delega adopt`. Returns the worker's rc (9 on forbidden terms in the branch)."""
+    Shared by `delega run`, `delega adopt` and `delega recover` (which passes the rc it read: no wait).
+    Returns the worker's rc (9 on forbidden terms in the branch, 96 if the host stopped answering)."""
     meta = util.read_meta(job_dir)
     node = remote.job_node(cfg, meta)
+    rc = None
+    given, rc = rc, None
     try:
-        return _finish(cfg, job_dir, meta, node, poll_s)
+        rc = _finish(cfg, job_dir, meta, node, poll_s, given)
+        return rc
     finally:
-        if node.get("vm") and not node.get("keep_vm"):
+        # without contact the VM (and the work in it) stays: `delega adopt`/`recover` closes it later
+        if node.get("vm") and not node.get("keep_vm") and rc != RC_NO_CONTACT:
             kindling.destroy(node, node["vm"])
 
 
-def _finish(cfg, job_dir, meta, node, poll_s):
+def _finish(cfg, job_dir, meta, node, poll_s, rc=None):
     chan = meta["CHANNEL"]
     poll_s = float(os.environ.get("DELEGA_WAIT_POLL_S", 20)) if poll_s is None else poll_s
     # the node cannot see this machine's Nod collector: its envelopes are pulled and forwarded from here
-    rc = wait_for_rc(cfg, node, chan, poll_s, on_poll=lambda: nod.pull_and_forward(cfg, job_dir, meta))
+    if rc is None:
+        rc = wait_for_rc(cfg, node, chan, poll_s, on_poll=lambda: nod.pull_and_forward(cfg, job_dir, meta))
+    else:
+        nod.pull_and_forward(cfg, job_dir, meta)
+    if rc == RC_NO_CONTACT:
+        return _disconnected(cfg, job_dir, meta, node)
     for f in COPY_BACK:
         remote.scp_from(node, f"{chan}/{f}", job_dir + "/")
     nod.forward(job_dir, meta, nod.job_terms(job_dir))
@@ -375,9 +429,21 @@ def _finish(cfg, job_dir, meta, node, poll_s):
                    result="hits" if hits else "clean" if terms else "no_terms",
                    dbs=meta.get("DBS") or None)
         else:
-            print(t("launch.branch.fetch_failed", branch=branch, log=os.path.join(job_dir, "fetch.log")))
+            first = next((x.strip() for x in log.splitlines() if x.strip()), "?")
+            print(t("launch.branch.fetch_failed", branch=branch, first=first, log=os.path.join(job_dir, "fetch.log")))
     print_summary(job_dir, rc)
     return 9 if hits and rc == 0 else rc
+
+
+def _disconnected(cfg, job_dir, meta, node):
+    """The host stopped answering: mark the job `disconnected` (no END) and say how to pick it up."""
+    waited, err = node.get("_no_contact", (0, "?"))
+    job = job_id_of(job_dir)
+    util.add_meta(job_dir, DISCONNECTED=int(time.time()))
+    _audit(cfg, "disconnected", job=job, node=meta.get("NODE"), vm=meta.get("VM") or None, err=err)
+    print(t("launch.disconnected", host=remote.alias(node), min=max(1, round(waited / 60)), err=err,
+            where=t("launch.disconnected.vm", vm=node["vm"]) if node.get("vm") else "", job=job), file=sys.stderr)
+    return RC_NO_CONTACT
 
 
 def _report_scan(repo_dir, branch, base, terms):
@@ -458,12 +524,21 @@ def main(argv):
     except _config.ConfigError as e:
         print(f"delega: {e}", file=sys.stderr)
         return 3
-    return Launch(cfg, args).run()
+    return Launch(cfg, args, argv).run()
+
+
+def queue_args(argv, args):
+    """`delega run` options of argv without the two positionals, to relaunch it from the queue."""
+    rest, pos = list(argv), [args.repo, args.brief]
+    for x in pos:
+        if x in rest:
+            rest.remove(x)
+    return rest
 
 
 class Launch:
-    def __init__(self, cfg, args):
-        self.cfg, self.args = cfg, args
+    def __init__(self, cfg, args, argv=None):
+        self.cfg, self.args, self.argv = cfg, args, list(argv or [])
         self.job_dir = None
         self.started = False
         self.vm = None          # kindling: node dict with the job's microVM, once created
@@ -477,9 +552,33 @@ class Launch:
                reason=e.msg[:200], rc=e.rc, **e.fields)
         return e.rc
 
+    def full(self, e):
+        """Host full: the job folder goes (nothing ran), the brief is queued once and `delega tick`
+        launches it when there is room. From the queue itself, or with queue.when_full = "fail", it
+        only fails, with the fix."""
+        _audit(self.cfg, e.event, reason=e.msg[:200], rc=e.rc, **e.fields)
+        if self.job_dir and os.path.isdir(self.job_dir):
+            import shutil
+            shutil.rmtree(self.job_dir, ignore_errors=True)
+        self.job_dir = None
+        a = self.args
+        rest = queue_args(self.argv, a)
+        if os.environ.get("DELEGA_FROM_QUEUE") or self.cfg.policy("queue.when_full") == "fail":
+            cmd = " ".join(shlex.quote(x) for x in ["delega", "queue", "add", a.repo, a.brief]
+                           + (["--", *rest] if rest else []))
+            print("ERROR: " + t("launch.full.fail", reason=e.msg, cmd=cmd), file=sys.stderr)
+            return e.rc
+        from . import queue
+        item, new = queue.add_once(self.cfg, a.repo, a.brief, run_args=rest)
+        print(t("launch.full.queued" if new else "launch.full.already", reason=e.msg, id=item["id"]),
+              file=sys.stderr)
+        return e.rc
+
     def run(self):
         try:
             return self._run()
+        except Full as e:
+            return self.full(e)
         except Refused as e:
             return self.fail(e)
         except _config.ConfigError as e:
@@ -611,7 +710,7 @@ class Launch:
         # 9-11. identity, compute, version
         if node_name == "local":
             if not a.resume and jobs.live_counts(cfg, exclude=self.job_dir).get("local", 0) >= pol("max_local_jobs"):
-                raise Refused(5, t("launch.err.local_full", n=pol("max_local_jobs")))
+                raise Full(t("launch.err.local_full", n=pol("max_local_jobs")))
             p = nodes.local_probe(cfg, profile, a.requires)
             node = None
         else:
@@ -621,7 +720,9 @@ class Launch:
             p = nodes.probe(cfg, node, profile, a.requires)
             mx = node.get("max_jobs")
             if not a.resume and mx and jobs.live_counts(cfg, exclude=self.job_dir).get(node_name, 0) >= mx:
-                raise Refused(5, t("launch.err.node_full", node=node_name, n=mx))
+                raise Full(t("launch.err.node_full", node=node_name, n=mx))
+        if not p["ok"] and p["kind"] == "resources":
+            raise Full(t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
         if not p["ok"]:
             raise Refused(4 if p["kind"] == "identity" else 5,
                           t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
@@ -775,7 +876,15 @@ class Launch:
         util.add_meta(self.job_dir, VM=vm, GOLDEN=image)
         node = dict(node, vm=vm)
         t0 = time.time()
-        kindling.create(node, vm, image)
+        # the host freezes the VM past cap + grace + margin even if this machine dies; real data is removed instead
+        try:
+            kindling.create(node, vm, image, ttl=kindling.ttl_min(cfg, caps, profile["name"], project),
+                            on_ttl="remove" if self.dbs else "freeze",
+                            labels={"delega.job": job_id, "delega.owner": util.read_meta(self.job_dir).get("OWNER") or "?"})
+        except remote.RemoteError as e:
+            if kindling.no_room(str(e)):      # the host's memory, not max_jobs: same as a full node
+                raise Full(str(e).strip().splitlines()[0][:300])
+            raise
         self.vm = node
         dbrecs = []
         if self.dbs:

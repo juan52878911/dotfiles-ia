@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Fake `date` for commands run inside a fake VM: with FAKE_VM_CLOCK_SKEW_S, `date +%s` runs that many
+seconds behind (a VM restored from a golden whose clock kling could not resync). Anything else: /bin/date."""
+import os
+import sys
+import time
+
+skew = os.environ.get("FAKE_VM_CLOCK_SKEW_S")
+if os.environ.get("FAKE_VM_ROOT") and skew and sys.argv[1:] == ["+%s"]:
+    print(int(time.time() - float(skew)))
+    sys.exit(0)
+os.execv("/bin/date", ["date"] + sys.argv[1:])
