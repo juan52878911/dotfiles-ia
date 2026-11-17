@@ -80,7 +80,6 @@ class F13(T.DaemonCase):
                   mock.patch("delega.relevo.spawn", lambda *a, **k: "x.log")):
             p.start()
             self.addCleanup(p.stop)
-        queue._LANZADOR_FALLOS.clear()
         r = self.tmp.name
         self.states_dir = {h: os.path.join(r, "state-" + h) for h in ("a", "b")}
         for d in self.states_dir.values():
