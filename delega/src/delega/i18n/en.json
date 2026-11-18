@@ -373,5 +373,14 @@
  "jobs.gc.why.unknown": "job unknown here",
  "jobs.gc.why.frozen": "frozen",
  "jobs.gc.why.stale": "lease stale",
- "jobs.gc.why.no_lease": "no lease"
+ "jobs.gc.why.no_lease": "no lease",
+ "tick.not_owner": "not the owner of lease {role}: nothing to do",
+ "tick.migrated": "queue item {id} migrated to the database as {task}",
+ "tick.migrate_skip": "queue item {id} not migrated: {err}",
+ "tick.no_checkout": "task {id} waits: no local checkout of {repo} (set repos in [memoria.<org>])",
+ "tick.daemon_start": "daemon: org {org}, owner {owner}, every {interval} s",
+ "tick.daemon_error": "daemon cycle failed: {err}",
+ "tick.install_usage": "usage: delega mem install-daemon [--org <org>] [--owner <name>] [--interval <s>] [--lease-ttl <s>] [--out <dir>] [--yes]",
+ "tick.install_dry": "nothing installed (add --yes to write the files; enable them with systemctl --user enable --now delega-tick or launchctl load)",
+ "tick.install_done": "files written; enable them with systemctl --user enable --now delega-tick or launchctl load"
 }

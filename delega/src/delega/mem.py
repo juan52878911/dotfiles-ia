@@ -149,8 +149,9 @@ def db_path(path=None):
 
 
 def owner_id():
-    """Who is acting: host:pid. The owner of a lease is this string."""
-    return f"{socket.gethostname()}:{os.getpid()}"
+    """Who is acting: $DELEGA_MEM_OWNER (a stable name, so a restarted daemon keeps its lease), else
+    host:pid. The owner of a lease is this string."""
+    return os.environ.get("DELEGA_MEM_OWNER") or f"{socket.gethostname()}:{os.getpid()}"
 
 
 def _stamp(ts):
@@ -320,6 +321,17 @@ def init_db(conn, org):
     return write(conn, op)
 
 
+def _profile_org(profile):
+    """The org of a profile of the config (its `org`, else its name); None when no profile is given."""
+    if not profile:
+        return None
+    try:
+        from . import config
+        return config.load().profile_org(profile)
+    except Exception:
+        return profile
+
+
 def _check_org(conn, org):
     base = get_org(conn)
     if base is None:
@@ -368,6 +380,9 @@ def add_task(conn, flow, brief, wave=1, zone=None, deps=None, run_args=None, tas
             raise MemError(i18n.t("mem.unknown_flow", flow=flow))
         if row["org"] != base:
             raise MemError(i18n.t("mem.org_mismatch", org=row["org"], base=base))
+        prof_org = _profile_org((run_args or {}).get("profile"))
+        if prof_org and prof_org != base:               # a personal task never lands in a Trycore base
+            raise MemError(i18n.t("mem.org_mismatch", org=prof_org, base=base))
         known = {r["id"] for r in c.execute("SELECT id FROM tareas WHERE flujo = ?", (flow,)).fetchall()}
         for dep in deps:
             if dep not in known:
@@ -390,6 +405,11 @@ def _task_dict(row):
     d["deps"] = json.loads(d.get("deps") or "[]")
     d["run_args"] = json.loads(d.get("run_args") or "{}")
     return d
+
+
+def list_flows(conn):
+    """All the flows (the daemon drives the `activo` ones), oldest first."""
+    return [dict(r) for r in conn.execute("SELECT * FROM flujos ORDER BY creado, id").fetchall()]
 
 
 def next_tasks(conn, flow):
@@ -682,14 +702,14 @@ def cmd_set(args, db, as_json):
 
 
 def cmd_claim(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role", "ttl"))
+    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner"))
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
     ttl = _number(vals.get("ttl", DEFAULT_TTL_S), "--ttl", float)
     conn = connect(db_path(db))
     try:
-        res = claim_lease(conn, rol, ttl)
+        res = claim_lease(conn, rol, ttl, owner=vals.get("owner"))
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -707,14 +727,14 @@ def cmd_claim(args, db, as_json):
 
 
 def cmd_heartbeat(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role", "ttl"))
+    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner"))
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
     ttl = _number(vals.get("ttl", DEFAULT_TTL_S), "--ttl", float)
     conn = connect(db_path(db))
     try:
-        res = heartbeat_lease(conn, rol, ttl)
+        res = heartbeat_lease(conn, rol, ttl, owner=vals.get("owner"))
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -731,14 +751,26 @@ def cmd_heartbeat(args, db, as_json):
     return EXIT_OK
 
 
+def cmd_flows(args, db, as_json):
+    _parse(args)
+    conn = connect(db_path(db))
+    try:
+        flows = list_flows(conn)
+    finally:
+        conn.close()
+    _out({"ok": True, "cmd": "flows", "flujos": flows}, [f"{f['id']}  {f['estado']}  {f['repo']}" for f in flows],
+         as_json)
+    return EXIT_OK
+
+
 def cmd_release(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role"))
+    pos, _, vals = _parse(args, values=("rol", "role", "owner"))
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
     conn = connect(db_path(db))
     try:
-        res = release_lease(conn, rol)
+        res = release_lease(conn, rol, owner=vals.get("owner"))
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -791,7 +823,13 @@ def cmd_export(args, db, as_json):
     return EXIT_OK
 
 
+def cmd_install_daemon(args, db, as_json):
+    from . import queue
+    return queue.cmd_install_daemon(args, db, as_json)
+
+
 ORDERS = {
+    "install-daemon": cmd_install_daemon, "flows": cmd_flows,
     "init": cmd_init, "add-flow": cmd_add_flow, "add-task": cmd_add_task, "next": cmd_next, "set": cmd_set,
     "claim": cmd_claim, "heartbeat": cmd_heartbeat, "release": cmd_release, "log": cmd_log, "export": cmd_export,
 }

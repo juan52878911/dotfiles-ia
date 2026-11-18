@@ -98,3 +98,12 @@ verify = ["npm run typecheck", "npm test -- --run"]
 branch_prefixes = ["feature/", "fix/", "delega/"]
 # branch_pattern = '^(feature|fix|chore)/'   # the repo hook's regex, if stricter than the prefixes
 policy.budget.day_usd = 60
+
+# Central orchestration memory, one database per org. Only the daemon that owns the lease
+# `orquestador:<org>` (`delega tick --daemon`) reconciles and launches. A host that is this machine
+# opens `path` directly; any other is reached with `ssh <host> delega mem … --json`.
+# `repos` maps a flow's git remote ("owner/repo") to its checkout on this machine.
+# [memoria.example-org]
+# host = "orq@db.example.com"
+# path = "~/.local/state/delega/memoria.db"
+# repos = { "example-org/api" = "~/src/api" }

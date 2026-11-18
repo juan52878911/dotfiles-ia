@@ -16,6 +16,7 @@ no identity check (fine for trying the tool, refused for remote nodes).
 import copy
 import os
 import re
+import socket
 import subprocess
 
 try:
@@ -116,6 +117,7 @@ class Config:
         self.nodes = data.get("nodes") or {}
         self.compute = data.get("compute") or {}
         self.projects = data.get("projects") or {}
+        self.memoria = data.get("memoria") or {}
         self.validate()
 
     # ── validation ──────────────────────────────────────────────────────────
@@ -137,6 +139,9 @@ class Config:
         for name, n in self.nodes.items():
             if not n.get("ssh"):
                 raise ConfigError(f"node '{name}': missing ssh = \"<alias in ~/.ssh/config>\"")
+        for org, m in self.memoria.items():
+            if not isinstance(m, dict):
+                raise ConfigError(f"[memoria.{org}]: expected a table with host = \"...\" and path = \"...\"")
         for key, pr in self.projects.items():
             for db, d in ((pr or {}).get("databases") or {}).items():
                 if not isinstance(d, dict) or d.get("engine") not in DB_ENGINES:
@@ -240,10 +245,54 @@ class Config:
         n.setdefault("profiles", list(self.profiles))
         return n
 
+    # ── memoria (the central orchestration database of each org) ────────────
+    def memoria_for(self, org):
+        """[memoria.<org>] as {org, host, path, local}. `local` when host is empty or this machine:
+        the database is then opened directly; otherwise through `ssh host delega mem … --json`."""
+        if org not in self.memoria:
+            raise ConfigError(f"no [memoria.{org}] in the config (known: {', '.join(self.memoria) or 'none'})")
+        m = copy.deepcopy(self.memoria[org])
+        m["org"] = org
+        m["host"] = str(m.get("host") or "")
+        m["path"] = m.get("path") or ""
+        m["local"] = is_this_machine(m["host"])
+        return m
+
+    def resolve_org(self, explicit=None):
+        """The org whose database to drive: explicit, $DELEGA_ORG, `ws contexto`, or the only one configured."""
+        org = explicit or os.environ.get("DELEGA_ORG")
+        if org:
+            return org
+        known = {k.lower(): k for k in self.memoria}
+        try:
+            r = subprocess.run(["ws", "contexto"], capture_output=True, text=True, timeout=5)
+            for word in re.findall(r"[\w.-]+", r.stdout.lower() if r.returncode == 0 else ""):
+                if word in known:
+                    return known[word]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if len(self.memoria) == 1:
+            return next(iter(self.memoria))
+        raise ConfigError("cannot tell the org: pass --org, set DELEGA_ORG or run inside a `ws contexto` of a "
+                          f"configured org ({', '.join(self.memoria) or 'no [memoria.<org>]'})")
+
+    def profile_org(self, name):
+        """The org a profile belongs to: `org = "..."` in the profile, else its name."""
+        return (self.profiles.get(name) or {}).get("org") or name
+
     def nodes_for(self, profile):
         """Nodes this profile may use, in preference order."""
         names = profile.get("nodes") or []
         return [self.node(n) for n in names if profile["name"] in self.node(n)["profiles"]]
+
+
+def is_this_machine(host):
+    """True for an empty host, localhost or this machine's name (`user@` is ignored)."""
+    h = (host or "").rsplit("@", 1)[-1].strip().lower()
+    if h in ("", "localhost", "127.0.0.1", "::1"):
+        return True
+    me = socket.gethostname().lower()
+    return h == me or h == me.split(".")[0]
 
 
 def _git(repo_dir, *args):
