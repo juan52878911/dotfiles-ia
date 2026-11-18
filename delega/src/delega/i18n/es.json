@@ -395,5 +395,12 @@
  "tick.daemon_error": "falló el ciclo del daemon: {err}",
  "tick.install_usage": "uso: delega mem install-daemon [--org <org>] [--owner <nombre>] [--interval <s>] [--lease-ttl <s>] [--out <dir>] [--yes]",
  "tick.install_dry": "no se instaló nada (añade --yes para escribir los ficheros; actívalos con systemctl --user enable --now delega-tick o launchctl load)",
- "tick.install_done": "ficheros escritos; actívalos con systemctl --user enable --now delega-tick o launchctl load"
+ "tick.install_done": "ficheros escritos; actívalos con systemctl --user enable --now delega-tick o launchctl load",
+ "jobs.recover.waiter": "el trabajo {job} aún tiene un waiter vivo (pid {pid}): `delega adopt` lo espera, o --force para tomarlo",
+ "launch.branch.in_ref": "AVISO: la rama {branch} está abierta en un worktree de aquí y no se pudo avanzar (sucio o divergente): el trabajo está en {ref}",
+ "launch.branch.merged": "la rama {branch} estaba abierta en un worktree de aquí: avanzada con ff-only",
+ "launch.err.branch_in_use": "la rama {branch} está abierta en el worktree del trabajo {job} ({path}), que no ha terminado: espera, ciérralo (delega recover) o usa otra rama",
+ "launch.warn.behind": "AVISO: HEAD local va {n} commit(s) por detrás de origin/{branch}; al nodo solo viaja HEAD",
+ "launch.worktree.retired": "worktree del trabajo terminado {job} retirado para reutilizar {branch}",
+ "lint.rounds": "vuelta {n} sobre la rama {branch} en 24 h; las anteriores costaron {cost} USD: comprueba que otra vuelta es lo correcto"
 }

@@ -150,3 +150,32 @@ def check_for(text, cfg, profile, project, requires=None):
     proj = cfg.projects.get(project) if project else None
     return check(text, levels={k: pol("lint." + k) for k in LEVELS}, pattern=branch_pattern(profile, proj),
                  requires=requires, env_file=profile.get("env_file"), live_keywords=pol("lint.live_keywords"))
+
+
+# ── rule 4: the same branch relaunched again and again ───────────────────────
+ROUNDS_FROM = 3          # warn from the third round on the same branch ...
+ROUNDS_WINDOW_H = 24     # ... within this many hours
+
+
+def check_rounds(cfg, branch, now=None):
+    """[("rounds", {n, branch, cost})] when launching on `branch` now would be its ROUNDS_FROM-th round (or later)
+    in the last ROUNDS_WINDOW_H hours; cost = what the earlier rounds spent. Reads the state dir only."""
+    import time
+    from . import jobs, spend, util
+    if not branch:
+        return []
+    now = time.time() if now is None else now
+    n, cost = 0, 0.0
+    for d in jobs.job_dirs(cfg):
+        if util.read_meta(d).get("BRANCH") != branch:
+            continue
+        try:
+            started = time.mktime(time.strptime("-".join(os.path.basename(d).split("-")[:2]), "%Y%m%d-%H%M%S"))
+        except ValueError:
+            continue
+        if 0 <= now - started <= ROUNDS_WINDOW_H * 3600:
+            n += 1
+            cost += spend.job_cost(d) or 0.0
+    if n + 1 < ROUNDS_FROM:
+        return []
+    return [("rounds", {"n": n + 1, "branch": branch, "cost": f"{cost:.2f}"})]

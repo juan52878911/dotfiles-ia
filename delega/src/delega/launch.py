@@ -375,7 +375,6 @@ def wait_and_finish(cfg, job_dir, poll_s=None, rc=None):
     Returns the worker's rc (9 on forbidden terms in the branch, 96 if the host stopped answering)."""
     meta = util.read_meta(job_dir)
     node = remote.job_node(cfg, meta)
-    rc = None
     given, rc = rc, None
     try:
         rc = _finish(cfg, job_dir, meta, node, poll_s, given)
@@ -415,16 +414,30 @@ def _finish(cfg, job_dir, meta, node, poll_s, rc=None):
     if branch and repo_dir and os.path.isdir(repo_dir):
         if node.get("vm"):
             ok, log = kindling.fetch_branch(repo_dir, node, chan, job_dir, branch)
+            source = os.path.join(job_dir, "out.bundle")
         else:
             ok, log = remote.fetch_branch(repo_dir, node, meta.get("REPO", ""), branch)
+            source = f"{remote.alias(node)}:{remote.bare_rel(node, meta.get('REPO', ''))}"
+        where, shown = None, branch
+        if not ok and remote.is_checked_out_error(log):
+            # the branch is open in a worktree here: git will not move it; bring it to refs/delega/<id>
+            ok, log2, where = remote.fetch_into(repo_dir, source, branch, job_id_of(job_dir),
+                                                None if node.get("vm") else remote._git_env())
+            log += log2
+            if ok and where == "ref":
+                shown = f"refs/delega/{job_id_of(job_dir)}"
         with open(os.path.join(job_dir, "fetch.log"), "w") as f:
             f.write(log)
         if ok:
-            last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", branch], capture_output=True,
+            last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", shown], capture_output=True,
                                   text=True).stdout.strip()
             print(t("launch.branch.fetched", branch=branch, last=last))
+            if where == "merged":
+                print(t("launch.branch.merged", branch=branch))
+            elif where == "ref":
+                print(t("launch.branch.in_ref", branch=branch, ref=shown), file=sys.stderr)
             terms = _terms(profile.get("forbidden_terms_file"))
-            hits = _report_scan(repo_dir, branch, meta.get("BASE"), terms)
+            hits = _report_scan(repo_dir, shown, meta.get("BASE"), terms)
             _audit(cfg, "scan", job=job_id_of(job_dir), branch=branch, node=meta["NODE"],
                    result="hits" if hits else "clean" if terms else "no_terms",
                    dbs=meta.get("DBS") or None)
@@ -645,6 +658,7 @@ class Launch:
             if missing:
                 raise Refused(REFUSED_RC, t("launch.err.lint", missing="; ".join(t("launch.lint." + m) for m in missing)))
             found = lint.check_for(brief_text, cfg, profile, project, a.requires)
+            found += [("warn", c, p) for c, p in lint.check_rounds(cfg, a.branch)]
             for level, code, params in found:
                 print(t("launch.lint_rule." + level, msg=t("lint." + code, **params)), file=sys.stderr)
             if found:
@@ -659,6 +673,7 @@ class Launch:
         clash = zone_conflict(cfg, repo, zone)
         if clash:
             raise Refused(REFUSED_RC, t("launch.err.zone", job=os.path.basename(clash[0]), mine=clash[1], theirs=clash[2]))
+        self._warn_behind(repo_dir, a.branch)
         # 6. forbidden terms in the brief (never print what matched)
         terms = _terms(profile.get("forbidden_terms_file"))
         hits = _scan_text(brief_text, terms)
@@ -750,6 +765,17 @@ class Launch:
             return self._run_kindling(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude)
         return self._run_remote(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude, prev)
 
+    def _warn_behind(self, repo_dir, branch):
+        """Only HEAD travels to the node: say so when origin/<branch> has commits HEAD does not."""
+        if not _is_git(repo_dir):
+            return
+        b = branch or _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        if not b or b == "HEAD" or not _git(repo_dir, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{b}"):
+            return
+        n = _git(repo_dir, "rev-list", "--count", f"HEAD..refs/remotes/origin/{b}")
+        if n and n.isdigit() and int(n) > 0:
+            print(t("launch.warn.behind", n=n, branch=b), file=sys.stderr)
+
     # -- node choice
     def _choose_node(self, profile, node_opt, requires, prev, repo=None):
         cfg = self.cfg
@@ -827,6 +853,7 @@ class Launch:
             if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
                 print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
             remote.push_head(repo_dir, node, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
+            self._free_branch(node, repo, branch)
             wt = remote.make_worktree(node, repo, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha)
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
@@ -854,6 +881,20 @@ class Launch:
         return wait_and_finish(cfg, self.job_dir)
 
     # -- kindling: one ephemeral microVM per job
+    def _free_branch(self, node, repo, branch):
+        """`--branch` on a branch another worktree of the node still has open: retire that worktree when its
+        job has ended, refuse (rc 5) when the job is alive or unknown."""
+        holder = remote.worktree_holder(node, repo, branch)
+        if not holder:
+            return
+        holder_job = os.path.basename(os.path.dirname(holder.rstrip("/")))
+        for d in jobs.job_dirs(self.cfg):
+            if jobs.job_id(d) == holder_job and util.read_meta(d).get("END"):
+                remote.remove_worktree(node, repo, holder)
+                print(t("launch.worktree.retired", job=holder_job, branch=branch))
+                return
+        raise Refused(5, t("launch.err.branch_in_use", branch=branch, job=holder_job, path=holder))
+
     def _run_kindling(self, profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude):
         cfg, a = self.cfg, self.args
         if a.resume:

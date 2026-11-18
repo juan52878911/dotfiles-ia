@@ -493,6 +493,10 @@ def recover(cfg, job_dir, force=False):
     if not _is_remote(meta) or not meta.get("CHANNEL"):
         print(t("jobs.recover.local"), file=sys.stderr)
         return 2
+    old = _read_pid(os.path.join(job_dir, "waiter.pid"))
+    if old and old != os.getpid() and _pid_alive(old) and not force:    # an adopt/run already closes it
+        print(t("jobs.recover.waiter", job=job_id(job_dir), pid=old), file=sys.stderr)
+        return 2
     node, chan = _node(cfg, meta), shlex.quote(meta["CHANNEL"])
     r = remote.ssh(node, f"cat {chan}/rc", timeout=60)
     if r.returncode in launch.SSH_DOWN:
