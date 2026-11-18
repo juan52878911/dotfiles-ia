@@ -153,6 +153,12 @@ def run_flags(run_args, zona=None):
 
 
 def _pid_alive(pid):
+    try:                                   # si es hijo nuestro y ya terminó, recogerlo: sin /proc (macOS) un zombi parece vivo
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return False
+    except OSError:                        # no es hijo nuestro (ChildProcessError) u otro error: seguir mirando
+        pass
     try:
         with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
