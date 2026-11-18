@@ -484,6 +484,106 @@ class MemTest(unittest.TestCase):
                            "--db", self.db, "--json"])
         self.assertEqual(rc, 0, err)
 
+    def _promote_setup(self, old="old-owner"):
+        """A claimed lease, a copy of the memory and a promotion over it. Returns (copy, claim args)."""
+        self.init()
+        self.flow("f1")
+        claim = ["claim", "orquestador", "--owner", old, "--org", "trycore", "--db", self.db, "--json"]
+        rc, _, err = _run(claim)
+        self.assertEqual(rc, 0, err)
+        copy = os.path.join(self.tmp.name, "copy.db")
+        rc, _, err = _run(["backup", "--to", copy, "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        return copy, claim
+
+    def _promote(self, copy, *extra):
+        return _run(["promote", "--from", copy, "--org", "trycore", "--db", self.db, "--yes", "--json", *extra])
+
+    def _count(self, sql):
+        conn = mem.connect(self.db)
+        try:
+            return conn.execute(sql).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_fenced_owner_cannot_set_or_event_after_promote(self):
+        copy, _ = self._promote_setup()
+        self.task(flow="f1", brief="x", task_id="t1")
+        with mock.patch.dict(os.environ, {"DELEGA_MEM_OWNER": "old-owner"}):
+            rc, _, err = _run(["set", "t1", "--estado", "lanzada", "--org", "trycore", "--db", self.db, "--json"])
+            self.assertEqual(rc, 0, err)                      # before the promotion it still writes
+            self.assertEqual(self._promote(copy)[0], 0)
+            events = self._count("SELECT COUNT(*) FROM eventos")
+            state = self._count("SELECT COUNT(*) FROM tareas WHERE estado = 'lanzada'")
+            rc, _, err = _run(["set", "t1", "--estado", "ok", "--forzar", "--org", "trycore",
+                               "--db", self.db, "--json"])
+            self.assertEqual(rc, 9, err)
+            rc, _, err = _run(["event", "algo", "--org", "trycore", "--db", self.db, "--json"])
+            self.assertEqual(rc, 9, err)
+            self.assertEqual(self._count("SELECT COUNT(*) FROM eventos"), events)
+            self.assertEqual(self._count("SELECT COUNT(*) FROM tareas WHERE estado = 'ok'"), 0)
+            self.assertEqual(state, self._count("SELECT COUNT(*) FROM tareas WHERE estado = 'lanzada'"))
+        with mock.patch.dict(os.environ, {"DELEGA_MEM_OWNER": "new-owner"}):
+            rc, _, err = _run(["event", "algo", "--org", "trycore", "--db", self.db, "--json"])
+            self.assertEqual(rc, 0, err)
+
+    def test_promote_leaves_tasks_older_than_the_copy_and_blocks_arreglo_after_it(self):
+        self.init()
+        self.flow("f1")
+        self.task(flow="f1", brief="antes", task_id="old")
+        self.task(flow="f1", brief="despues", task_id="fix")
+        for t, st in (("old", "lanzada"), ("fix", "lanzada")):
+            self.assertEqual(_run(["set", t, "--estado", st, "--org", "trycore", "--db", self.db])[0], 0)
+        self.assertEqual(_run(["set", "fix", "--estado", "rojo", "--org", "trycore", "--db", self.db])[0], 0)
+        copy = os.path.join(self.tmp.name, "copy.db")
+        self.assertEqual(_run(["backup", "--to", copy, "--org", "trycore", "--db", self.db])[0], 0)
+        time.sleep(0.05)
+        self.assertEqual(_run(["set", "fix", "--estado", "arreglo", "--org", "trycore", "--db", self.db])[0], 0)
+        rc, _, err = self._promote(copy)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._count("SELECT estado FROM tareas WHERE id = 'old'"), "lanzada")
+        self.assertEqual(self._count("SELECT estado FROM tareas WHERE id = 'fix'"), "bloqueada")
+
+    def test_promote_holds_the_write_lock_of_the_main_database(self):
+        copy, _ = self._promote_setup()
+        seen = []
+        real = mem.backup
+
+        def spy(conn, dest):
+            other = sqlite3.connect(self.db, timeout=0.2)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                seen.append("writable")
+            except sqlite3.OperationalError:
+                seen.append("locked")
+            finally:
+                other.close()
+            return real(conn, dest)
+        with mock.patch.object(mem, "backup", spy):
+            rc, _, err = self._promote(copy)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seen, ["locked"])
+
+    def test_failback_readmits_the_owner_with_unfence_or_promote_owner(self):
+        copy, claim = self._promote_setup()
+        self.assertEqual(self._promote(copy)[0], 0)
+        self.assertEqual(_run(claim)[0], 9)
+        rc, _, _ = _run(["unfence", "old-owner", "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 2)                               # without --yes nothing is touched
+        self.assertEqual(_run(claim)[0], 9)
+        rc, _, err = _run(["unfence", "old-owner", "--yes", "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(_run(claim)[0], 0)
+        # the lease of the last epoch is what counts: a second promotion fences it again, --owner readmits it
+        copy2 = os.path.join(self.tmp.name, "copy2.db")
+        self.assertEqual(_run(["backup", "--to", copy2, "--org", "trycore", "--db", self.db])[0], 0)
+        self.assertEqual(self._promote(copy2)[0], 0)
+        self.assertEqual(_run(claim)[0], 9)
+        copy3 = os.path.join(self.tmp.name, "copy3.db")
+        self.assertEqual(_run(["backup", "--to", copy3, "--org", "trycore", "--db", self.db])[0], 0)
+        self.assertEqual(self._promote(copy3, "--owner", "old-owner")[0], 0)
+        self.assertEqual(_run(claim)[0], 0)
+
     def test_promote_does_not_remove_wal_sidecars_of_an_open_connection(self):
         self.init()
         self.flow("f1")

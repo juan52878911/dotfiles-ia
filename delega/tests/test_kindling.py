@@ -372,6 +372,8 @@ class Kindling(KindlingCase):
             self.assertEqual(jobs.gc(config.load()), 2)                   # only ours would be deleted
         self.assertIn("another orchestrator (trycore)", buf.getvalue())
         self.assertIn("no owner label", buf.getvalue())
+        self.assertIn("old label (delega.owner=%s, no delega.orch); delete it by hand with `kling rm delega-20260101-000000-z`" % OWNER,
+                      buf.getvalue())
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             self.assertEqual(jobs.gc(config.load(), yes=True), 2)       # only ours

@@ -212,7 +212,7 @@ without an audit end, audit ends without a job dir, and jobs whose costs differ.
   `recover(cfg, job_dir, force=False)` (no wait: rc read in the VM — 97 if none and the lease is stale;
   refuses while the lease is fresh unless force — then the same close as adopt: channel, branch via
   `kling cp`, scan, END, VM deleted), `gc(cfg, node_names=None, yes=False)` (VMs `delega-*` whose job has
-  END or is not in this state_dir: listed, deleted with yes; other orphans are listed with `recover`), `close_job(job_dir, reason, cfg=None, rc=None)` (END + summary; with cfg, audit `end`),
+  END or is not in this state_dir: listed, deleted with yes; other orphans are listed with `recover`; VMs with only the old `delega.owner` label are listed as «old label, delete by hand», never deleted), `close_job(job_dir, reason, cfg=None, rc=None)` (END + summary; with cfg, audit `end`),
   `ensure_summary(job_dir, rc, reason) -> dict`; CLI `ps [--all] [job]`, `say <job> <text>`,
   `watch [--all] [--from-start] [--bus] [job…]`,
   `adopt <job>`, `recover <job> [--force]`, `gc [--node n]… [--yes]`. Default scope = jobs whose `OWNER` equals `DELEGA_OWNER` or the basename of `$PWD`.

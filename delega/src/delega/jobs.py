@@ -591,6 +591,10 @@ def gc(cfg, node_names=None, yes=False, out=None):
             if owner != me:
                 # Only our canonical orchestrator label authorizes deletion. A legacy owner label,
                 # a missing label, or another orchestrator's label all mean "do not touch it".
+                legacy = (labels.get(vm) or {}).get(kindling.OWNER_LABEL)
+                if not owner and legacy:
+                    print(t("kindling.gc.legacy_label", vm=vm, host=host, owner=legacy), file=out)
+                    continue
                 key = "kindling.gc.other_owner" if owner else "kindling.gc.no_owner"
                 print(t(key, vm=vm, host=host, owner=owner, me=me), file=out)
                 continue
