@@ -305,6 +305,24 @@ class RealEnvTest(unittest.TestCase):
         t = mem._task_dict(conn.execute("SELECT * FROM tareas WHERE id='a'").fetchone())
         self.assertEqual((t["estado"], t["intentos"]), ("pendiente", 0))
 
+    def test_rc0_without_a_commit_is_not_done(self):                   # relevo pilot: a hook refused the commit
+        jd = os.path.join(self.tmp.name, "job")
+        os.makedirs(jd)
+        head = git(self.repo, "rev-parse", "HEAD")
+        with open(os.path.join(jd, "meta"), "w") as f:
+            f.write(f"BASE={head}\nEND=1\n")
+        with open(os.path.join(jd, "summary.json"), "w") as f:
+            f.write('{"rc": 0}')
+        task = {"id": "a", "flujo": "f", "rama": "delega/x", "job_id": "J1"}
+        with mock.patch.object(self.env, "_job_dir", lambda t: jd), \
+                mock.patch("delega.jobs.job_id", lambda d: "J1"):
+            with mock.patch.object(self.env, "_fetched_sha", lambda *a: head):
+                self.assertEqual(self.env.job_state(task)[0], "fail")       # the branch is the base
+            git(self.repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "y")
+            new = git(self.repo, "rev-parse", "HEAD")
+            with mock.patch.object(self.env, "_fetched_sha", lambda *a: new):
+                self.assertEqual(self.env.job_state(task), ("ok", "J1", new))
+
     def test_fetched_sha_needs_a_clean_fetch_log(self):                # finding 8
         jd = os.path.join(self.tmp.name, "job")
         os.makedirs(jd)

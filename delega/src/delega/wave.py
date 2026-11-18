@@ -336,12 +336,16 @@ class Env:
                 pass
             return "fail", jid, None
         real = jobs.job_id(found)
-        if not util.read_meta(found).get("END"):
+        meta = util.read_meta(found)
+        if not meta.get("END"):
             return "running", real, None
         summ = util.read_json(os.path.join(found, "summary.json"), {}) or {}
         if summ.get("rc") != 0:
             return "fail", real, None
         sha = self._fetched_sha(found, real, task.get("rama"))
+        base = (meta.get("BASE") or "").strip()
+        if sha and len(base) >= 7 and (sha.startswith(base) or base.startswith(sha)):
+            return "fail", real, None        # rc 0 without a commit (a blocker, a refused hook): not done
         return ("ok", real, sha) if sha else ("fail", real, None)
 
     def integrate(self, branch, into, node, sha=None):
