@@ -95,9 +95,14 @@ class Base(unittest.TestCase):
         for d in (self.home, self.bin, self.state):
             os.makedirs(d)
         real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+        self.seed = os.path.join(r, "seed")       # what the "remote" holds: one real commit
+        for a in (["init", "-q", "-b", "main", self.seed],
+                  ["-C", self.seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                   "--allow-empty", "-m", "seed"]):
+            subprocess.run([real_git, *a], check=True, capture_output=True)
         script(os.path.join(self.bin, "git"),
-               f'if [ "$1" = clone ] && [ "$2" = --bare ]; then echo "clone $3 $4" >> {self.calls}; '
-               f'mkdir -p "$4"; exit 0; fi\nexec {real_git} "$@"\n')
+               f'if [ "$1" = clone ] && [ "$3" = --bare ]; then echo "clone $4 $5" >> {self.calls}; '
+               f'exec {real_git} clone -q --bare {self.seed} "$5"; fi\nexec {real_git} "$@"\n')
         script(os.path.join(self.bin, "ws"),
                f'if [ "$1" = contexto ]; then echo "contexto activo: trycore"; exit 0; fi\n'
                f'echo "ws $(echo "$*" | tr \'\\n\' \' \')" >> {self.calls}\n')
@@ -153,11 +158,25 @@ class NodeDaemon(Base):
         launched = []
         self.assertTrue(self.cycle(launched))
         bare = os.path.join(self.home, "delega", "api.git")
-        self.assertEqual(launched, [("t1", bare, "only in the database: t1")])
+        work = os.path.join(self.home, "delega", "relevo", "api")
+        self.assertEqual(launched, [("t1", work, "only in the database: t1")])
         self.assertEqual(self.log(), [f"clone {REMOTE} {bare}"])
         self.add_task("t2")
         self.cycle(launched)
         self.assertEqual(self.log(), [f"clone {REMOTE} {bare}"])          # the bare is created once
+
+    def test_node_checkout_is_a_working_clone_that_launch_can_use(self):
+        from delega import remote
+        work = relevo.origin(self.cfg, REMOTE)
+        self.assertEqual(remote.repo_name(work), "api")                    # not the bare's parent folder
+        git = lambda *a: subprocess.run(["git", "-C", work, *a], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(git("remote", "get-url", "origin"), REMOTE)
+        bare = os.path.join(self.home, "delega", "api.git")
+        subprocess.run(["git", "-C", self.seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "second"], check=True)
+        subprocess.run(["git", "-C", bare, "fetch", "-q", self.seed, "+main:main"], check=True)
+        self.assertEqual(relevo.origin(self.cfg, REMOTE), work)
+        self.assertEqual(git("log", "-1", "--format=%s"), "second")         # refreshed from the bare
 
     def test_without_relevo_node_the_mac_checkouts_are_used(self):
         self.assertIsNone(relevo.origin(config.Config({"profiles": {"p": {"owner": "self"}}}), REMOTE))
@@ -276,6 +295,8 @@ class NodeDaemon(Base):
             self.assertEqual(relevo.escalate(self.cfg, client), ["t1"])      # next cycle retries
             self.assertEqual(relevo.escalate(self.cfg, client), [])
         self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(len(self.log(wait=1)), 1)      # the detached fake ws is done before the tmp goes
+        time.sleep(0.2)
 
     def test_needs_decision_event_and_no_second_request(self):
         self.add_task("t1")

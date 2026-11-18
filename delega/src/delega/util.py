@@ -76,9 +76,31 @@ def add_meta(job_dir, **kv):
             f.write(f"{k}={'' if v is None else v}\n")
 
 
+def _running_archive():
+    """Path of the .pyz this package is imported from, or None when it runs from a directory."""
+    if os.path.isdir(PKG_DIR):
+        return None
+    path = PKG_DIR
+    while path and not os.path.isfile(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+    return path if path and zipfile.is_zipfile(path) else None
+
+
 def build_pyz(dest):
     """Zip this package into a runnable .pyz (python3 delega.pyz <command> …). Returns its sha256[:12]."""
     import hashlib
+    archive = _running_archive()
+    if archive:                         # running from a delega.pyz (a node): it is already the package
+        with open(archive, "rb") as f:
+            data = f.read()
+        if archive != os.path.abspath(dest):
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(data)
+        return hashlib.sha256(data).hexdigest()[:12]
     buf = io.BytesIO()
     def put(z, name, data):  # fixed timestamp: same sources → same hash (used to detect drift)
         z.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), data, zipfile.ZIP_DEFLATED)
@@ -95,6 +117,9 @@ def build_pyz(dest):
                     with open(full, "rb") as f:
                         put(z, os.path.join("delega", os.path.relpath(full, PKG_DIR)), f.read())
     data = buf.getvalue()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        if "delega/__init__.py" not in z.namelist():     # never ship an empty package to a node
+            raise OSError(f"build_pyz: no package found under {PKG_DIR}")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "wb") as f:
         f.write(data)

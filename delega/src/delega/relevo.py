@@ -119,8 +119,11 @@ def repo_basename(remote):
 
 
 def origin(cfg, remote):
-    """Bare repo `~/<workdir>/<repo>.git` of this node for a flow's remote, cloned when missing.
-    None when this is not a node's config (the Mac keeps its checkouts) or the clone fails."""
+    """Checkout this node launches a flow's tasks from: `~/<workdir>/relevo/<repo>`, a plain clone of the
+    node's bare `~/<workdir>/<repo>.git` (cloned from the remote when missing), with `origin` set to the
+    flow's remote and HEAD detached at the bare's HEAD, refreshed on every call. `launch` needs a working
+    checkout: from a bare repo it would name the repo after its parent folder and have no HEAD to push.
+    None when this is not a node's config (the Mac keeps its checkouts) or a git step fails."""
     name = node_name(cfg)
     if not name or not remote:
         return None
@@ -128,16 +131,36 @@ def origin(cfg, remote):
         workdir = cfg.node(name)["workdir"]
     except config.ConfigError:
         workdir = "delega"
-    bare = os.path.join(os.path.expanduser("~"), workdir, repo_basename(remote) + ".git")
-    if os.path.isdir(bare):
-        return bare
-    os.makedirs(os.path.dirname(bare), exist_ok=True)
-    r = subprocess.run(["git", "clone", "--bare", remote, bare], capture_output=True, text=True)
-    if r.returncode != 0:
+    base = repo_basename(remote)
+    home = os.path.join(os.path.expanduser("~"), workdir)
+    bare, work = os.path.join(home, base + ".git"), os.path.join(home, "relevo", base)
+
+    def git(*a):
+        return subprocess.run(["git", *a], capture_output=True, text=True)
+
+    def fail(r):
         print(i18n.t("relevo.clone_failed", repo=remote, err=(r.stderr or r.stdout).strip()), file=sys.stderr)
-        shutil.rmtree(bare, ignore_errors=True)
         return None
-    return bare
+
+    if not os.path.isdir(bare):
+        os.makedirs(home, exist_ok=True)
+        r = git("clone", "-q", "--bare", remote, bare)
+        if r.returncode != 0:
+            shutil.rmtree(bare, ignore_errors=True)
+            return fail(r)
+    if not os.path.isdir(os.path.join(work, ".git")):
+        os.makedirs(os.path.dirname(work), exist_ok=True)
+        r = git("clone", "-q", "--no-checkout", bare, work)
+        if r.returncode != 0:
+            shutil.rmtree(work, ignore_errors=True)
+            return fail(r)
+    for step in (("-C", work, "remote", "set-url", "origin", remote),
+                 ("-C", work, "fetch", "-q", bare, "HEAD"),
+                 ("-C", work, "checkout", "-q", "--detach", "--force", "FETCH_HEAD")):
+        r = git(*step)
+        if r.returncode != 0:
+            return fail(r)
+    return work
 
 
 # ── asking Claude to decide ─────────────────────────────────────────────────────────────────────

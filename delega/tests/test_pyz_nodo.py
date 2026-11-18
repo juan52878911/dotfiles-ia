@@ -25,6 +25,25 @@ class PyzCatalog(unittest.TestCase):
             self.assertIn("org o", r.stdout)
 
 
+    def test_build_pyz_from_inside_the_pyz_ships_the_same_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pyz, again = os.path.join(tmp, "delega.pyz"), os.path.join(tmp, "out", "delega.pyz")
+            sha = util.build_pyz(pyz)
+            code = ("import sys; sys.path.insert(0, %r); from delega import util; print(util.build_pyz(%r))"
+                    % (pyz, again))
+            r = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,
+                               env=dict(os.environ, PYTHONPATH=""))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), sha)
+            with open(pyz, "rb") as a, open(again, "rb") as b:
+                self.assertEqual(a.read(), b.read())
+
+    def test_build_pyz_refuses_an_empty_package(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(util, "PKG_DIR", tmp):
+            with self.assertRaises(OSError):
+                util.build_pyz(os.path.join(tmp, "x.pyz"))
+
+
 class RemoteMemoryPath(unittest.TestCase):
     def test_ssh_command_puts_local_bin_first(self):
         from delega import queue
