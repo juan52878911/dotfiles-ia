@@ -593,7 +593,7 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
 
     # 2. launch the ready ones
     inflight = sum(1 for t in tasks if t["estado"] in ("lanzada", "arreglo"))
-    ready, _ = mem.nextst.tasks(flow)
+    ready = st.next(flow)
     for t in ready:
         if t["ola"] != wave:
             continue
