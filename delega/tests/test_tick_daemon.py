@@ -144,7 +144,8 @@ class LaunchOnlyOnce(DaemonCase):
         launched = []
         self.assertTrue(self.cycle("a", launched))
         self.assertEqual(launched, [("a", "q-" + item["id"])])
-        self.assertEqual(open(queue.qpath(self.cfg)).read(), before)      # queue.jsonl is read-only
+        self.assertNotEqual(open(queue.qpath(self.cfg)).read(), before)   # the item is marked migrated
+        self.assertEqual(queue.read_items(self.cfg)[0]["state"], "migrated")
         self.assertTrue(self.cycle("a", launched))
         self.assertEqual(len(launched), 1)                                # migrated once
 
@@ -190,6 +191,130 @@ class CompareAndSet(DaemonCase):
         self.assertEqual(launched, ["t1"])                 # only the daemon that took it launched it
         self.assertEqual(self.states(), {"t1": "lanzada"})
         self.assertIn("state changed", err.getvalue())     # the second one said why it skipped it
+
+
+CAP = {"has_data": False, "new": 9, "live": 0, "slots": 9}
+
+
+class Hardening(DaemonCase):
+    """F7: reconciliation, waves, per-org files, migrated items, org of the profile, one escalation."""
+
+    def cycle(self, client=None, launch=None, **extra):
+        client = client or self.client("a")
+        patches = [mock.patch("delega.quota.capacity", lambda cfg, name, **k: CAP),
+                   mock.patch.object(queue, "_reconcile", lambda cfg, adopt: None)]
+        if launch:
+            patches.append(mock.patch.object(queue, "launch", launch))
+        err = io.StringIO()
+        with contextlib.ExitStack() as st:
+            [st.enter_context(p) for p in patches]
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            st.enter_context(contextlib.redirect_stderr(err))
+            queue.daemon_cycle(self.cfg, client, ttl=30)
+        return err.getvalue()
+
+    def row(self, tid):
+        c = sqlite3.connect(self.db)
+        try:
+            return c.execute("SELECT estado, job_id, rama, nodo FROM tareas WHERE id = ?", (tid,)).fetchone()
+        finally:
+            c.close()
+
+    def test_launch_records_job_branch_and_node_through_the_real_launch(self):
+        self.add_task("t1")
+
+        class P:
+            pid = 4242
+
+            def wait(self, timeout=None):
+                return 0
+        with mock.patch("subprocess.Popen", lambda *a, **k: P()):
+            self.cycle()
+        estado, job_id, rama, nodo = self.row("t1")
+        self.assertEqual(estado, "lanzada")
+        self.assertTrue(job_id.startswith("pend:4242:"), job_id)
+        self.assertEqual(rama, "delega/q-f1-t1")
+        self.assertEqual(nodo, "auto")
+
+    def test_lanzada_is_reconciled_to_ok_or_rojo(self):
+        from delega import wave
+        for t in ("t1", "t2", "t3"):
+            self.add_task(t)
+            self.assertEqual(self.client("a").set(t, "lanzada", job_id="j-" + t)[0], 0)
+        states = {"j-t1": "ok", "j-t2": "fail", "j-t3": "running"}
+        with mock.patch.object(wave.Env, "job_state", lambda self, t: (states[t["job_id"]], t["job_id"])):
+            self.cycle()
+        self.assertEqual(self.states(), {"t1": "ok", "t2": "rojo", "t3": "lanzada"})
+
+    def test_flow_with_waves_goes_to_wave_step_and_not_to_the_plain_launch(self):
+        from delega import wave
+        self.add_task("t1")
+        self.add_task("t2", wave="2")
+        calls, launched = [], []
+        with mock.patch.object(wave, "step", lambda conn, flow, env, **kw: calls.append((flow, kw.get("org")))):
+            self.cycle(launch=lambda cfg, it: launched.append(it["id"]) or ("launched", "1"))
+        self.assertEqual(calls, [("f1", "trycore")])
+        self.assertEqual(launched, [])
+        self.assertEqual(self.states(), {"t1": "pendiente", "t2": "pendiente"})
+
+    def test_brief_and_log_live_under_the_org_and_the_flow(self):
+        self.add_task("t1")
+        seen = []
+
+        def fake(cfg, it):
+            seen.append(it)
+            it["log"] = "x"
+            return "launched", "1"
+        self.cycle(launch=fake)
+        want = os.path.join(self.state, "queue", "trycore")
+        self.assertEqual(seen[0]["brief"], os.path.join(want, "f1-t1.md"))
+        self.assertEqual(seen[0]["log_path"], os.path.join(want, "f1-t1.log"))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "queue", "t1.md")))
+
+    def test_migrated_items_are_not_launched_by_a_normal_tick(self):
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", REMOTE], check=True)
+        brief = os.path.join(self.tmp.name, "b.md")
+        with open(brief, "w") as f:
+            f.write("legacy")
+        queue.add(self.cfg, self.repo, brief)
+        self.cycle(launch=lambda cfg, it: ("launched", "1"))
+        self.assertEqual([i["state"] for i in queue.read_items(self.cfg)], ["migrated"])
+        launched = []
+        with mock.patch.object(queue, "launch", lambda cfg, it: launched.append(it) or ("launched", "1")), \
+                mock.patch.object(queue, "_reconcile", lambda cfg, adopt: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            queue.main_tick([])
+        self.assertEqual(launched, [])
+
+    def test_task_without_profile_of_another_org_is_refused(self):
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", REMOTE], check=True)
+        with open(self.conf, "a") as f:
+            f.write('[profiles.personal.repo_match]\ngit_remote = "acme/api"\n')
+        self.cfg = config.load()
+        self.add_task("t1")
+        launched = []
+        err = self.cycle(launch=lambda cfg, it: launched.append(it["id"]) or ("launched", "1"))
+        self.assertEqual(launched, [])
+        self.assertEqual(self.states(), {"t1": "pendiente"})
+        self.assertIn("does not belong", err)
+
+    def test_one_escalation_per_cycle(self):
+        from delega import relevo
+        for t in ("t1", "t2"):
+            self.add_task(t)
+            self.client("a").set(t, "lanzada")
+        conn = mem.connect(self.db)
+        for t in ("t1", "t2"):
+            mem.add_event(conn, relevo.NEEDS_DECISION, {"tarea": t, "motivo": "x"}, task=t)
+        conn.close()
+        spawned = []
+        with mock.patch.object(relevo, "spawn", lambda cfg, tid, brief: spawned.append(tid) or "log"):
+            self.cycle()
+            self.assertEqual(len(spawned), 1)
+            self.cycle()
+        self.assertEqual(sorted(spawned), ["t1", "t2"])
 
 
 class Takeover(DaemonCase):
