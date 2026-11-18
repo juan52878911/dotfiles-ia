@@ -74,6 +74,7 @@ class Base(DaemonCase):
         err = io.StringIO()
         with mock.patch("delega.quota.capacity", lambda cfg, name, **k: cap), \
                 mock.patch.object(queue, "_reconcile", lambda cfg, adopt: None), \
+                mock.patch("delega.relevo.spawn", lambda *a, **k: "x.log"), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             queue.daemon_cycle(self.cfg, self.client(owner), ttl=30)
         return err.getvalue()
