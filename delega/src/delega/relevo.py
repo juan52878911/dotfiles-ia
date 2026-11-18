@@ -118,13 +118,9 @@ def repo_basename(remote):
     return re.sub(r"\.git$", "", remote.strip().rstrip("/")).rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
-def origin(cfg, remote, branch=None):
-    """Checkout this node launches a flow's tasks from: `~/<workdir>/relevo/<repo>`, a plain clone of the
-    node's bare `~/<workdir>/<repo>.git` (cloned from the remote when missing), with `origin` set to the
-    flow's remote and HEAD detached at the flow's destination `branch` in the bare (else `main`, `master`
-    or the bare's HEAD), refreshed on every call. `launch` needs a working
-    checkout: from a bare repo it would name the repo after its parent folder and have no HEAD to push.
-    None when this is not a node's config (the Mac keeps its checkouts) or a git step fails."""
+def node_paths(cfg, remote):
+    """(bare, work) of a node's checkout of `remote`: `~/<workdir>/<repo>.git` and `~/<workdir>/relevo/<repo>`.
+    None when this is not a node's config (the Mac) or there is no remote."""
     name = node_name(cfg)
     if not name or not remote:
         return None
@@ -134,7 +130,24 @@ def origin(cfg, remote, branch=None):
         workdir = "delega"
     base = repo_basename(remote)
     home = os.path.join(os.path.expanduser("~"), workdir)
-    bare, work = os.path.join(home, base + ".git"), os.path.join(home, "relevo", base)
+    return os.path.join(home, base + ".git"), os.path.join(home, "relevo", base)
+
+
+def origin(cfg, remote, branch=None):
+    """Checkout this node launches a flow's tasks from: `~/<workdir>/relevo/<repo>`, a plain clone of the
+    node's bare `~/<workdir>/<repo>.git` (cloned from the remote when missing), with `origin` set to the
+    flow's remote and HEAD detached at the flow's destination `branch` (else `main`, `master` or the
+    bare's HEAD), refreshed on every call. The local branch of the clone is where `integrate --merge`
+    works: it is brought up to the bare's when older (or missing), never moved back when it is newer
+    (what was integrated and not pushed yet), and a newer one is pushed to the bare (fast-forward only).
+    `launch` needs a working checkout: from a bare repo it would name the repo after its parent folder and
+    have no HEAD to push. None when this is not a node's config (the Mac keeps its checkouts) or a git
+    step fails."""
+    paths = node_paths(cfg, remote)
+    if not paths:
+        return None
+    bare, work = paths
+    home = os.path.dirname(bare)
 
     def git(*a):
         return subprocess.run(["git", *a], capture_output=True, text=True)
@@ -158,14 +171,43 @@ def origin(cfg, remote, branch=None):
     r = git("-C", work, "remote", "set-url", "origin", remote)
     if r.returncode != 0:
         return fail(r)
+    used = None
     for ref in [f"refs/heads/{b}" for b in (branch, "main", "master") if b] + ["HEAD"]:
         r = git("-C", work, "fetch", "-q", bare, ref)
         if r.returncode == 0:
+            used = ref
             break
     else:
         return fail(r)
-    r = git("-C", work, "checkout", "-q", "--detach", "--force", "FETCH_HEAD")
+    target = "FETCH_HEAD"
+    if used.startswith("refs/heads/"):
+        target = _sync_local(git, work, bare, used)
+    r = git("-C", work, "checkout", "-q", "--detach", "--force", target)
     return work if r.returncode == 0 else fail(r)
+
+
+def _sync_local(git, work, bare, ref):
+    """Reconcile the clone's `ref` (refs/heads/<b>) with the bare's, just fetched into FETCH_HEAD.
+    Returns what HEAD should be detached at."""
+    fetched = git("-C", work, "rev-parse", "FETCH_HEAD^{commit}").stdout.strip()
+    local = git("-C", work, "rev-parse", "--verify", "-q", ref + "^{commit}").stdout.strip()
+    if not fetched:
+        return "FETCH_HEAD"
+    if not local:
+        git("-C", work, "update-ref", ref, fetched)
+        return ref
+    if local == fetched:
+        return ref
+    if git("-C", work, "merge-base", "--is-ancestor", local, fetched).returncode == 0:
+        git("-C", work, "update-ref", ref, fetched, local)       # the bare is ahead
+        return ref
+    if git("-C", work, "merge-base", "--is-ancestor", fetched, local).returncode == 0:
+        # the clone is ahead: what was integrated here and has not reached the bare. Never undo it.
+        r = git("-C", work, "push", "-q", bare, f"{local}:{ref}")
+        if r.returncode != 0:
+            print(i18n.t("relevo.push_failed", ref=ref, err=(r.stderr or r.stdout).strip()), file=sys.stderr)
+        return ref
+    return "FETCH_HEAD"                                            # diverged: launch from the bare's
 
 
 # ── asking Claude to decide ─────────────────────────────────────────────────────────────────────

@@ -478,5 +478,10 @@
  "sync.branch_no_checkout": "{repo}: sin checkout en esta máquina, rama no empujada",
  "sync.branch_dry": "  empujaría {branch} -> {repo}.git",
  "sync.branch_pushed": "{node}: {branch} -> {repo}.git empujada",
- "sync.branch_failed": "{node}: {branch} -> {repo}.git FALLÓ: {err}"
+ "sync.branch_failed": "{node}: {branch} -> {repo}.git FALLÓ: {err}",
+ "relevo.push_failed": "no se pudo empujar {ref} al bare del nodo: {err}",
+ "jobstate.not_found": "tarea {id}: trabajo {job} no encontrado en este host",
+ "n2.no_alias": "la tarea {id} la lanzó '{host}', que no es un host alcanzable por ssh: no se le pregunta ({n}/{max})",
+ "wave.integrate_push_failed": "tarea {id}: integrada en {into}, pero no se pudo empujar al bare del nodo: {err}",
+ "sync.fetch_failed": "rama {branch} de {repo}: `git fetch origin` falló, no se empuja a {node}: {err}"
 }

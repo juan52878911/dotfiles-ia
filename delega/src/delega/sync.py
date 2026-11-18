@@ -153,7 +153,10 @@ def push_branch(node, repo, branch, checkout):
     """Push the flow's destination branch to the node's bare repo (only that ref, only to the bare)."""
     import subprocess as sp
     from . import remote
-    sp.run(["git", "-C", checkout, "fetch", "-q", "origin", branch], capture_output=True, text=True)
+    f = sp.run(["git", "-C", checkout, "fetch", "-q", "origin", branch], capture_output=True, text=True)
+    if f.returncode != 0:      # an old `origin/<branch>` would be force-pushed over what the node has
+        return False, i18n.t("sync.fetch_failed", branch=branch, repo=repo, node=node.get("name", ""),
+                             err=(f.stderr or f.stdout or "").strip())
     ref = f"refs/remotes/origin/{branch}"
     if sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref], capture_output=True).returncode != 0:
         ref = f"refs/heads/{branch}"

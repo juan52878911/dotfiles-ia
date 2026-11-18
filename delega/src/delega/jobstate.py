@@ -2,8 +2,9 @@
 
     delega job-state --task <id> --rama <rama> --job-id <id> [--flujo <flujo>] [--repo <dir>] --json
 
-Prints one JSON object: {"estado": running|ok|fail|queued, "job_id": ..., "sha": ..., "node": ...}.
-It uses the same logic as `wave.Env.job_state` against THIS machine's state_dir. It never writes.
+Prints one JSON object: {"estado": running|ok|fail|queued|no_encontrado, "job_id": ..., "sha": ..., "node": ...}.
+It uses the same logic as `wave.Env.job_state` against THIS machine's state_dir. It never writes (it creates
+no directory or file). `no_encontrado`: a real job id with no job directory here (not a failure).
 """
 import json
 import sys
@@ -37,7 +38,7 @@ def job_info(task, repo_dir=None):
     meta = util.read_meta(found) if found else {}
     if found and not repo_dir and meta.get("REPO_DIR"):
         env = wave.Env(meta["REPO_DIR"])
-    state, jid, sha = env.job_state(task)
+    state, jid, sha = env.job_state(task, write=False)
     return state, jid, sha, meta.get("NODE") or None
 
 

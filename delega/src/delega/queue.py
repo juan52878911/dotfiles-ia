@@ -8,6 +8,7 @@ ready task with a compare-and-set (`set --desde pendiente`) before launching it,
 never launch the same task."""
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -287,8 +288,11 @@ class MemClient:
     compare-and-set of `set`: a task is only launched by the daemon that moved it out of
     `pendiente`. A busy database (rc 10) is retried a few times before giving up."""
 
-    def __init__(self, cfg, org, owner):
+    def __init__(self, cfg, org, owner, host=None):
         self.org, self.owner, self.m = org, owner, cfg.memoria_for(org)
+        # `host`: the name other hosts reach this one by over ssh (what `lanzador` records). Not the
+        # owner of the lease: that one is only an identity. A node's is its relevo node name; the Mac has none.
+        self.host = host or relevo.node_name(cfg)
         self.role = ROLE_PREFIX + org
 
     # local ----------------------------------------------------------------------------------
@@ -528,11 +532,14 @@ def _flow_env(cfg, client, fl):
     """The `wave.Env` of a flow: its repo checkout (the node's bare repo on a node, the local checkout
     of `[memoria.<org>].repos` on the Mac), never the cwd of the daemon; the origin must be the flow's repo."""
     from . import mem, wave
-    repo = relevo.origin(cfg, fl["repo"], fl.get("rama_destino")) or _checkout(client.m, fl["repo"])
+    repo = relevo.origin(cfg, fl["repo"], fl.get("rama_destino"))
+    paths = relevo.node_paths(cfg, fl["repo"]) if repo else None
+    repo = repo or _checkout(client.m, fl["repo"])
     if not repo:
         raise mem.MemError(i18n.t("tick.no_checkout", id=fl["id"], repo=fl["repo"]))
     wave.check_origin(repo, fl["repo"])
-    return wave.Env(repo, org=client.org)
+    # on a node what `integrate` merges must reach the bare repo the next launches start from
+    return wave.Env(repo, org=client.org, bare=paths[0] if paths and repo == paths[1] else None)
 
 
 def _has_deps(tasks):
@@ -557,7 +564,8 @@ def _wave_step(cfg, client, fl):
             else:
                 base = client
             wave.check_profiles(base, flow, client.org, env.repo_dir)
-            wave.step(base, flow, env, org=client.org, say=lambda m: print(m))
+            wave.step(base, flow, env, org=client.org, say=lambda m: print(m), lanzador=client.host,
+                      resolve=lambda t: task_state(cfg, client, fl, env, t))
         except mem.MemError as e:
             print(i18n.t("tick.bad_item", id=flow, err=e), file=sys.stderr)
         finally:
@@ -592,7 +600,7 @@ def _ask_lanzador(host, t):
             d = json.loads(line)
         except ValueError:
             continue
-        if isinstance(d, dict) and d.get("estado") in ("running", "ok", "fail", "queued"):
+        if isinstance(d, dict) and d.get("estado") in ("running", "ok", "fail", "queued", wave_not_found()):
             return d
         return None
     return None
@@ -611,44 +619,9 @@ def _event_once(client, t, datos):
         print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
 
 
-def _reconcile_foreign(cfg, client, fl, t):
-    """A task launched by another owner whose job directory is not here: ask the launcher.
-    Returns (state, job_id) to settle, or None to leave the task in `lanzada` for the next cycle."""
-    key = (client.org, t["id"])
-    host = t["lanzador"]
-    ans = _ask_lanzador(host, dict(t, flujo=fl["id"]))
-    if ans is None:
-        n = _LANZADOR_FALLOS[key] = _LANZADOR_FALLOS.get(key, 0) + 1
-        print(i18n.t("n2.lanzador_unreachable", host=host, id=t["id"], n=n, max=LANZADOR_MAX_FALLOS),
-              file=sys.stderr)
-        if n == LANZADOR_MAX_FALLOS:
-            _event_once(client, t, {"flujo": fl["id"], "motivo": "lanzador_caido", "lanzador": host,
-                                    "job_id": t.get("job_id")})
-        return None
-    _LANZADOR_FALLOS.pop(key, None)
-    state, jid = ans["estado"], ans.get("job_id") or t.get("job_id")
-    if state != "ok":
-        return state, jid
-    sha, node = ans.get("sha"), ans.get("node")
-    if not sha:
-        return "fail", jid
-    err = None
-    try:
-        from . import remote
-        env = _flow_env(cfg, client, fl)
-        if wave_have(env.repo_dir, sha):
-            pass
-        elif not node:
-            err = "unknown node"
-        else:
-            ok, log = remote.fetch_branch(env.repo_dir, cfg.node(node), fl["repo"], t.get("rama"))
-            if not ok or not wave_have(env.repo_dir, sha):
-                err = (log or "fetch failed").strip()[-200:]
-    except Exception as e:
-        err = str(e)
-    if err:
-        print(i18n.t("n2.ok_not_fetched", id=t["id"], sha=sha[:12], node=node, err=err), file=sys.stderr)
-    return "ok", jid
+def wave_not_found():
+    from . import wave
+    return wave.NOT_FOUND
 
 
 def wave_have(repo_dir, sha):
@@ -657,43 +630,100 @@ def wave_have(repo_dir, sha):
     return rc == 0
 
 
+def _is_alias(host):
+    """An ssh alias or host name: `<host>:tick` (the old `lanzador`, an owner) is not one."""
+    return bool(host) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]*", host) is not None
+
+
+def _decide(client, fl, t, motivo, **extra):
+    """A `necesita_decision` of the task, once."""
+    _event_once(client, t, dict({"flujo": fl["id"], "motivo": motivo, "job_id": t.get("job_id")}, **extra))
+
+
+def _count_failure(client, fl, t, host, motivo):
+    """One more cycle without an answer from the launcher; at LANZADOR_MAX_FALLOS ask for a decision (once)."""
+    key = (client.org, t["id"])
+    n = _LANZADOR_FALLOS[key] = _LANZADOR_FALLOS.get(key, 0) + 1
+    msg = "n2.lanzador_unreachable" if motivo == "lanzador_caido" else "n2.no_alias"
+    print(i18n.t(msg, host=host, id=t["id"], n=n, max=LANZADOR_MAX_FALLOS), file=sys.stderr)
+    if n == LANZADOR_MAX_FALLOS:
+        _decide(client, fl, t, motivo, lanzador=host)
+
+
+def task_state(cfg, client, fl, env, t):
+    """THE decision of the state of a `lanzada`/`arreglo` task, for the daemon (`_reconcile_tasks`) and
+    for step 1 of `wave.step`. Returns (state, job_id, sha) or None: leave the task as it is.
+
+    - the job directory is here (or the task is this host's): `env.job_state`, the real thing;
+    - the directory is not here and the `lanzador` is another host: ask it over ssh (`delega job-state`).
+      No answer: None, and after LANZADOR_MAX_FALLOS cycles a decision. A `lanzador` that is not an ssh
+      alias (the Mac's old `<host>:tick`) is not asked: the same count, then a decision;
+    - a real job id with no directory where it should be (here, or the launcher says `no_encontrado`):
+      a decision `job_sin_directorio` (once), never a failure of the job.
+    The state of the job of ANOTHER host is never judged from this host's disk."""
+    host = (t.get("lanzador") or "").strip()
+    if env._job_dir(t) is None and host and host != client.host:
+        return _foreign_state(cfg, client, fl, env, t, host)
+    res = env.job_state(t)
+    if res[0] == wave_not_found():
+        _decide(client, fl, t, "job_sin_directorio")
+        return None
+    return res
+
+
+def _foreign_state(cfg, client, fl, env, t, host):
+    key = (client.org, t["id"])
+    if not _is_alias(host):
+        _count_failure(client, fl, t, host, "lanzador_sin_alias")
+        return None
+    ans = _ask_lanzador(host, dict(t, flujo=fl["id"]))
+    if ans is None:
+        _count_failure(client, fl, t, host, "lanzador_caido")
+        return None
+    _LANZADOR_FALLOS.pop(key, None)
+    state, jid = ans["estado"], ans.get("job_id") or t.get("job_id")
+    if state == wave_not_found():
+        _decide(client, fl, t, "job_sin_directorio", lanzador=host)
+        return None
+    if state != "ok":
+        return state, jid, None
+    sha, node = ans.get("sha"), ans.get("node")
+    if not sha:
+        return "fail", jid, None
+    err = None
+    try:
+        from . import remote
+        if wave_have(env.repo_dir, sha):
+            pass
+        elif not node:
+            err = "unknown node"
+        else:
+            ok, log = remote.fetch_branch(env.repo_dir, cfg.node(node), relevo.repo_basename(fl["repo"]),
+                                          t.get("rama"))
+            if not ok or not wave_have(env.repo_dir, sha):
+                err = (log or "fetch failed").strip()[-200:]
+    except Exception as e:
+        err = str(e)
+    if err:
+        print(i18n.t("n2.ok_not_fetched", id=t["id"], sha=sha[:12], node=node, err=err), file=sys.stderr)
+    return "ok", jid, sha
+
+
 def _reconcile_tasks(cfg, client, fl, tasks):
     """lanzada -> ok/rojo from the state of the task's job (compare-and-set on `lanzada`)."""
-    from . import mem
     env = None
     for t in tasks:
-        foreign = False
         if t["estado"] != "lanzada" or not t.get("job_id"):
             continue
         try:
             env = env or _flow_env(cfg, client, fl)
-            if t.get("lanzador") and t["lanzador"] != client.owner and env._job_dir(t) is None:
-                res = _reconcile_foreign(cfg, client, fl, t)
-                if res is None:
-                    continue
-                state, jid = res
-                foreign = True
-            else:
-                state, jid, _sha = env.job_state(t)
+            res = task_state(cfg, client, fl, env, t)
         except Exception as e:
             print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
             continue
-        if state in ("running", "queued"):
+        if res is None or res[0] in ("running", "queued"):
             continue
-        if state == "fail" and not foreign and not jid.startswith("pend:") and env._job_dir(t) is None:
-            # a real job id whose directory is gone (cleaned, or another state_dir): not a failure
-            # of the job; leave the task as it is and ask for a decision, once
-            datos = {"flujo": fl["id"], "motivo": "job_sin_directorio", "job_id": jid}
-            try:
-                if client.m["local"]:
-                    client._call(lambda: client._local_rc(lambda c: mem.add_event(
-                        c, "necesita_decision", datos, task=t["id"], once=True, quien=client.owner)))
-                else:
-                    client._remote("event", "necesita_decision", "--task", t["id"], "--once",
-                                   "--datos", json.dumps(datos))
-            except Exception as e:
-                print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
-            continue
+        state, jid = res[0], res[1]
         target = "ok" if state == "ok" else "rojo"
         rc, _ = client.set(t["id"], target, desde="lanzada", job_id=jid,
                            error=None if target == "ok" else "job failed")
@@ -760,7 +790,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
         """Take the task with a compare-and-set (`set --desde pendiente`): the daemon that moves
         it out of `pendiente` is the one that launches it; the others get rc 9 and skip it."""
         rc, payload = client.set(it["id"], "lanzada", desde="pendiente", rama=it.get("rama"),
-                                 nodo=it.get("nodo"), lanzador=client.owner)
+                                 nodo=it.get("nodo"), lanzador=client.host)
         if rc == mem.EXIT_OK:
             return True
         print(i18n.t("tick.bad_item", id=it["id"], err=mem_reason(rc, payload, it["id"])), file=sys.stderr)
@@ -775,7 +805,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
         if state != "launched":               # 'lanzada' -> 'rojo': the worker never started
             client.set(it["id"], "rojo", error=detail)
         else:
-            client.set(it["id"], "lanzada", desde="lanzada", job_id=it.get("job_id"), lanzador=client.owner)
+            client.set(it["id"], "lanzada", desde="lanzada", job_id=it.get("job_id"), lanzador=client.host)
 
     started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl),
                            reserve=reserve, unreserve=unreserve)
@@ -795,13 +825,22 @@ def _escalate_one(cfg, client):
 
 
 def main_daemon(argv):
+    """`delega tick --daemon [--org o] [--owner id] [--host alias] [--interval s] [--lease-ttl s] [--once] [--adopt]`.
+
+    `--owner` is the identity of the daemon in the org's lease (default `<hostname>:tick`). `--host` is
+    something else: the name the OTHER daemons reach this machine by over ssh. It is written as `lanzador`
+    on every task this daemon launches, and a daemon that takes the lease over asks that host
+    (`ssh <host> delega job-state`) how the job goes instead of judging it from its own disk. By default it
+    is the node's name (`[relevo] node`); the Mac has none: it records no `lanzador`, and a task launched
+    there whose directory is not on the machine that holds the lease waits and then asks for a decision
+    (`necesita_decision`), it is never relaunched or marked red from afar."""
     import signal
     import socket
     import threading
     opts, i = {"interval": INTERVAL_S, "lease-ttl": LEASE_TTL_S}, 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith("--") and a[2:] in ("interval", "lease-ttl", "org", "owner") and i + 1 < len(argv):
+        if a.startswith("--") and a[2:] in ("interval", "lease-ttl", "org", "owner", "host") and i + 1 < len(argv):
             opts[a[2:]] = argv[i + 1]
             i += 1
         i += 1
@@ -809,7 +848,8 @@ def main_daemon(argv):
         cfg = config.load()
         org = cfg.resolve_org(opts.get("org"))
         interval, ttl = float(opts["interval"]), float(opts["lease-ttl"])
-        client = MemClient(cfg, org, opts.get("owner") or f"{socket.gethostname()}:tick")
+        client = MemClient(cfg, org, opts.get("owner") or f"{socket.gethostname()}:tick",
+                            host=opts.get("host"))
     except (config.ConfigError, ValueError) as e:
         print(e, file=sys.stderr)
         return 2
@@ -863,7 +903,7 @@ def cmd_install_daemon(args, db, as_json):
         a = args[i]
         if a == "--yes":
             yes = True
-        elif a in ("--org", "--owner", "--interval", "--lease-ttl", "--out") and i + 1 < len(args):
+        elif a in ("--org", "--owner", "--host", "--interval", "--lease-ttl", "--out") and i + 1 < len(args):
             if a == "--out":
                 out = args[i + 1]
             else:
