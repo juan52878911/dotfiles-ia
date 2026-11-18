@@ -117,6 +117,16 @@ class WaveTest(unittest.TestCase):
         self.assertEqual(self.states()["a"], "bloqueada")
         self.assertEqual(self.events("necesita_decision")[0]["datos"]["ficheros"], ["src/a/x.py", "src/a/y.py"])
 
+    def test_no_verify_blocks_with_a_decision_and_no_fix_job(self):    # relevo pilot 5
+        self.three()
+        self.env.results = {"a": [(12, "this project has no verify commands")]}
+        for _ in range(4):
+            self.step(par=3)
+        self.assertEqual(self.states()["a"], "bloqueada")
+        self.assertEqual([l[0] for l in self.env.launches].count("a"), 1)          # no fix job
+        ev = self.events("necesita_decision")
+        self.assertEqual([e["datos"]["motivo"] for e in ev], ["sin_verify"])
+
     def test_failed_job_retries_once_as_fix_then_blocks(self):          # finding 14
         self.three()
         self.env.states = {"a": "fail"}

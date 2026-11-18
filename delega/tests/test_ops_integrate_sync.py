@@ -211,7 +211,7 @@ class IntegrateMergeTest(OpsCase):
         self.commit_on(repo, "feat", "b.txt", "new\n")
         old = self.git(repo, "rev-parse", "main")
         rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge")
-        self.assertEqual(rc, 7, out + err)
+        self.assertEqual(rc, integrate.EXIT_MERGE_UNVERIFIED, out + err)       # 12, not 7 (red)
         self.assertEqual(self.git(repo, "rev-parse", "main"), old)
         rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge", "--allow-unverified")
         self.assertEqual(rc, 0, out + err)

@@ -15,6 +15,7 @@ EXIT_VERIFY = 5
 EXIT_MERGE_VERIFY = 7      # --merge: suite red, destination untouched
 EXIT_MERGE_CONFLICTS = 8   # --merge: conflicts, destination untouched
 EXIT_DEST_MOVED = 11       # --merge: the destination moved meanwhile (retry; not a conflict), untouched
+EXIT_MERGE_UNVERIFIED = 12 # --merge: the project has no `verify` (and no --allow-unverified), untouched
 IDENT = {"GIT_AUTHOR_NAME": "delega", "GIT_AUTHOR_EMAIL": "delega@localhost",
          "GIT_COMMITTER_NAME": "delega", "GIT_COMMITTER_EMAIL": "delega@localhost"}
 
@@ -239,7 +240,7 @@ def main(argv):
         if merge and not allow_unverified:
             print(i18n.t("integrate.no_verify_merge", into=into), file=sys.stderr)
             audit.record(cfg, "integrate", result="unverified_refused", merge=True, **common)
-            return EXIT_MERGE_VERIFY
+            return EXIT_MERGE_UNVERIFIED
         return finish(cfg, repo, into, branch, tree, merge, job_dir, [], common, unverified=True,
                       into_sha=into_sha, branch_sha=branch_sha)
     if node_name:

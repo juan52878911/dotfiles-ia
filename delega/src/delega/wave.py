@@ -678,6 +678,12 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
                                                "registro": out[-LOG_TAIL:]})
             say(i18n.t("wave.blocked", id=t["id"]))
             return 0
+        elif rc == 12:      # no `verify` for the project: nothing a fix job can repair, a decision now
+            st.set(t["id"], "bloqueada", "ok", force=True, error="no verify")
+            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "sin_verify",
+                                               "registro": out[-LOG_TAIL:]})
+            say(i18n.t("wave.no_verify", id=t["id"]))
+            return 0
         elif rc == 11:      # the target moved (another job): retry on the next step
             say(i18n.t("wave.retarget", id=t["id"], into=into))
             return 0

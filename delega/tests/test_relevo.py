@@ -318,6 +318,13 @@ class NodeDaemon(Base):
         self.assertEqual(len(self.log(wait=1)), 1)      # the detached fake ws is done before the tmp goes
         time.sleep(0.2)
 
+    def test_a_task_wave_blocked_before_asking_is_still_escalated(self):    # relevo pilot 5
+        exp = {"eventos": [{"que": "necesita_decision", "datos": {"tarea": "t1", "motivo": "conflicto"}}],
+               "tareas": [{"id": "t1", "estado": "bloqueada"}]}
+        self.assertEqual(relevo.candidates(exp), {"t1": "conflicto"})
+        exp["eventos"].append({"que": relevo.REQUEST, "datos": {"tarea": "t1"}})
+        self.assertEqual(relevo.candidates(exp), {})                                # one request, ever
+
     def test_needs_decision_event_and_no_second_request(self):
         self.add_task("t1")
         c = sqlite3.connect(self.db)

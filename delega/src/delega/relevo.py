@@ -272,7 +272,7 @@ def candidates(exp):
             out[t["id"]] = failed[t["id"]][1]      # blocked, but the Claude never started: try again
         elif t["estado"] == "rojo" and reds.get(t["id"], 0) >= MAX_REDS:
             out[t["id"]] = f"rojo x{reds[t['id']]}"
-        elif t["id"] in flagged and t["estado"] != "bloqueada":
+        elif t["id"] in flagged:          # `wave` blocks a task before asking: blocked is not decided
             out[t["id"]] = flagged[t["id"]]
     return out
 
