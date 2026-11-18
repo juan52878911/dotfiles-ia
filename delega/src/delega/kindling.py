@@ -14,6 +14,7 @@ delega.pyz. What comes back: the channel files and a bundle with the job branch.
 by `token_command` on this machine, goes through ssh stdin to the host and into the worker's
 environment with `kling exec -e`: it is never written to a disk, here, on the host or in the VM.
 """
+import json
 import os
 import re
 import shlex
@@ -27,6 +28,7 @@ from . import remote, util
 DEFAULT_EGRESS = ["anthropic.com"]
 VM_PREFIX = "delega-"
 NOT_JOBS = ("delega-seed-", "delega-load-", "delega-bake-")   # seed sandboxes, volume loaders, data-golden bakes
+OWNER_LABEL = "delega.owner"     # which orchestrator launched the VM (a host can be shared)
 
 
 def is_kindling(node):
@@ -73,7 +75,8 @@ def read_token(node):
     return tok
 
 
-STATES = ("running", "frozen", "stopped", "failed", "starting", "creating", "paused")
+STATES = ("running", "frozen", "stopped", "failed", "starting", "creating", "created", "paused")
+TRANSIENT = ("starting", "creating", "created")   # the VM is still being set up: it is alive, not frozen
 LAUNCH_WINDOW_S = 900       # a VM whose job has no lease yet still counts this long (it is being set up)
 
 
@@ -97,6 +100,36 @@ def live_vms(node):
     return None if vms is None else len(vms)
 
 
+def host_labels(node):
+    """{vm: {label: value}} of the delega VMs on the host (`kling ps -json`), {} if it does not answer.
+
+    A host can be shared by two orchestrators (the personal one and Trycore's on the same kling): the
+    `delega.owner` label says whose VM it is, so `gc` never deletes the other's.
+    """
+    r = remote.ssh(remote.host_node(node), "kling ps -json", timeout=30)
+    if r.returncode != 0:
+        return {}
+    try:
+        data = json.loads(r.stdout or "[]")
+    except ValueError:
+        return {}
+    out = {}
+    for mc in data if isinstance(data, list) else []:
+        if not isinstance(mc, dict):
+            continue
+        name = mc.get("name") or ""
+        if not name.startswith(VM_PREFIX) or name.startswith(NOT_JOBS):
+            continue
+        labels = mc.get("labels")
+        out[name] = labels if isinstance(labels, dict) else {}
+    return out
+
+
+def owner_of(labels, vm):
+    """The `delega.owner` label of a VM ("" if it has none): the orchestrator that launched it."""
+    return (labels.get(vm) or {}).get(OWNER_LABEL) or ""
+
+
 def job_dir_of(cfg, vm):
     """This machine's job dir for a VM `delega-<id>`, or None (job unknown to this state_dir)."""
     from . import jobs
@@ -108,7 +141,9 @@ def classify(cfg, node, vms):
     """Split the host's delega VMs into (active, orphans). Active = a job of this state_dir without END
     whose lease (read inside the VM) was renewed within `lease.stale_s`, or that is still being set up.
     orphans = [(vm, why)], why: ended (job has END), unknown (no such job here), frozen (stopped by its
-    ttl, or by hand), stale (lease too old or final) or no_lease. Only ended and unknown are `gc`'s."""
+    ttl, or by hand), stale (lease too old or final) or no_lease. Only ended and unknown are `gc`'s.
+    A VM that is still being set up (starting/creating/created) counts as active: two launches at the
+    same time must not pass `max_jobs` because the first one is not running yet."""
     stale = float(cfg.policy("lease.stale_s"))
     active, orphans = [], []
     for vm, state in vms:
@@ -119,6 +154,9 @@ def classify(cfg, node, vms):
             continue
         if meta.get("END"):
             orphans.append((vm, "ended"))
+            continue
+        if state in TRANSIENT:
+            active.append(vm)      # it is being set up: it counts, or two launches together would fit
             continue
         if state and state != "running":
             orphans.append((vm, "frozen"))
