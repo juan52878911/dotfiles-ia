@@ -93,6 +93,71 @@ class Kindling(KindlingCase):
         stub = util.read_json(os.path.join(self.job_dir(), "summary.json"))
         self.assertEqual(stub["rc"], 0)
 
+    def uploaded(self):
+        """Sizes of what was uploaded as (a piece of) the job's in.bundle."""
+        return [int(l.split()[1]) for l in self.kling_log().splitlines()
+                if l.startswith("up-bytes") and "in.bundle" in l]
+
+    def vm_git(self, *a):
+        return sh("git", "-C", os.path.join(self.vmhome, "wt"), *a)
+
+    def test_head_behind_golden_uploads_nothing(self):
+        sh("git", "-C", self.repo, "reset", "-q", "--hard", "HEAD~1")
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k2"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.uploaded(), [], self.kling_log())
+
+    def test_diverged_head_sends_only_its_own_commits(self):
+        wt = os.path.join(self.goldens, "claude-api", "wt")      # the golden's base moves on its own
+        sh("git", "-C", wt, "checkout", "-q", "delega-base")
+        with open(os.path.join(wt, "golden-only.dat"), "wb") as f:
+            f.write(os.urandom(300_000))
+        sh("git", "-C", wt, "add", "-f", ".")
+        sh("git", "-C", wt, "-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-qm", "golden only")
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k3"])
+        self.assertEqual(rc, 0, out + err)
+        sizes = self.uploaded()
+        self.assertEqual(len(sizes), 1, self.kling_log())
+        self.assertLess(sizes[0], 100_000)
+        self.assertEqual(sh("git", "-C", self.repo, "show", "delega/k3:src/app/new.py"), "x = 1")
+        self.assertNotEqual(subprocess.run(["git", "-C", self.repo, "cat-file", "-e", "delega/k3:golden-only.dat"]).returncode, 0)
+
+    def test_bundle_over_the_upload_limit_arrives_whole_in_pieces(self):
+        with open(os.path.join(self.repo, "big.dat"), "wb") as f:
+            for _ in range(70):
+                f.write(os.urandom(1 << 20))
+        sh("git", "-C", self.repo, "add", "-f", ".")
+        sh("git", "-C", self.repo, "commit", "-qm", "big")
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k4"])
+        self.assertEqual(rc, 0, out + err)
+        sizes = [n for n in self.uploaded() if n > 0]
+        self.assertGreaterEqual(len(sizes), 2, self.kling_log())
+        self.assertTrue(all(n <= 64 << 20 for n in sizes))
+        self.assertGreater(sum(sizes), 70 << 20)
+        self.assertEqual(os.path.getsize(os.path.join(self.repo, "big.dat")),
+                         int(sh("git", "-C", self.repo, "cat-file", "-s", "delega/k4:big.dat")))
+
+    def test_with_ref_creates_the_branch_in_the_vm(self):
+        sh("git", "-C", self.repo, "branch", "claude/otra", "HEAD")
+        sh("git", "-C", self.repo, "checkout", "-q", "-b", "tmp")
+        with open(os.path.join(self.repo, "otra.txt"), "w") as f:
+            f.write("o\n")
+        sh("git", "-C", self.repo, "add", ".")
+        sh("git", "-C", self.repo, "commit", "-qm", "only in otra")
+        sh("git", "-C", self.repo, "branch", "-f", "claude/otra", "HEAD")
+        sh("git", "-C", self.repo, "checkout", "-q", "-")
+        from delega import kindling
+        with mock.patch.object(kindling, "destroy"):       # keep the VM's checkout to look at it
+            rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--branch", "delega/k5",
+                                         "--with-ref", "claude/otra"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.vm_git("log", "-1", "--format=%s", "claude/otra"), "only in otra")
+
+    def test_with_ref_unknown_branch_is_refused(self):
+        rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--with-ref", "no/existe"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn("no/existe", out + err)
+
     def test_token_reaches_worker_by_process_only(self):
         os.environ["STUB_SLEEP"] = "1"
         seen = {}

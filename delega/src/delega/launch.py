@@ -509,6 +509,8 @@ def build_parser():
     ap.add_argument("--db-mode", choices=("auto", "golden", "volume"),
                     help="golden: clone the data golden (databases already loaded); volume: restore from the "
                     "dump volume; auto (default): golden while it is fresh")
+    ap.add_argument("--with-ref", action="append", default=[], metavar="BRANCH",
+                    help="kindling only: also send this local branch to the VM (repeatable)")
     ap.add_argument("--no-lint", action="store_true",
                     help="skip the brief checks (done-when, cap, report; branch, live run, text)")
     ap.add_argument("--over-budget", action="store_true", help="launch even if the daily budget is spent")
@@ -909,7 +911,11 @@ class Launch:
         if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
             print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
-        kindling.push_head(repo_dir, node, chan, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
+        for r in a.with_ref:
+            if not _git(repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{r}^{{commit}}"):
+                raise Refused(REFUSED_RC, t("kindling.err.with_ref", ref=r))
+        kindling.push_head(repo_dir, node, chan, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"),
+                           refs=a.with_ref)
         wt = kindling.make_worktree(node, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha, ACCOUNT=node.get("account", ""),
                       CLAUDE_VERSION=vv or "")
