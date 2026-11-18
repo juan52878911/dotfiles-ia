@@ -449,5 +449,9 @@
  "launch.err.branch_in_use": "la rama {branch} está abierta en el worktree del trabajo {job} ({path}), que no ha terminado: espera, ciérralo (delega recover) o usa otra rama",
  "launch.warn.behind": "AVISO: HEAD local va {n} commit(s) por detrás de origin/{branch}; al nodo solo viaja HEAD",
  "launch.worktree.retired": "worktree del trabajo terminado {job} retirado para reutilizar {branch}",
- "lint.rounds": "vuelta {n} sobre la rama {branch} en 24 h; las anteriores costaron {cost} USD: comprueba que otra vuelta es lo correcto"
+ "lint.rounds": "vuelta {n} sobre la rama {branch} en 24 h; las anteriores costaron {cost} USD: comprueba que otra vuelta es lo correcto",
+ "engine.pi.forbidden": "el perfil '{profile}' prohíbe el motor {engines}: Pi/MiniMax solo corre en perfiles personales",
+ "engine.pi.cap_min": "tope de tiempo alcanzado ({min} min): se paró Pi",
+ "engine.pi.cap_turns": "tope de turnos alcanzado ({turns}): se paró Pi",
+ "engine.pi.no_kindling": "el nodo '{node}' es kindling: --engine pi necesita un nodo normal o --node local"
 }
