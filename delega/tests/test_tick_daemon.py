@@ -286,7 +286,7 @@ class Hardening(DaemonCase):
         c = sqlite3.connect(self.db)
         try:
             n = c.execute("SELECT COUNT(*) FROM eventos WHERE que = 'necesita_decision' "
-                          "AND datos LIKE '%job_sin_directorio%'").fetchone()[0]
+                          "AND datos LIKE '%lanzador_sin_ssh%'").fetchone()[0]
         finally:
             c.close()
         self.assertEqual(n, 1)
