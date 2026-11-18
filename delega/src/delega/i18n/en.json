@@ -483,5 +483,6 @@
  "relevo.push_failed": "could not push {ref} to the node's bare repo: {err}",
  "n2.no_alias": "task {id} was launched by '{host}', which is not a host reachable by ssh: not asking it ({n}/{max})",
  "wave.integrate_push_failed": "task {id}: merged into {into}, but it could not be pushed to the node's bare repo: {err}",
- "sync.fetch_failed": "branch {branch} of {repo}: `git fetch origin` failed, not pushing it to {node}: {err}"
+ "sync.fetch_failed": "branch {branch} of {repo}: `git fetch origin` failed, not pushing it to {node}: {err}",
+ "sync.branch_diverged": "{node}: {branch} in {repo}.git has diverged from this checkout: not pushed (decide which one wins)"
 }

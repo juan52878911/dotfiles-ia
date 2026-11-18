@@ -583,9 +583,10 @@ _LANZADOR_FALLOS = {}        # (org, task) -> consecutive cycles without an answ
 
 
 def _local_id():
-    """What the Mac (no `[relevo] node`) records as `lanzador`: an explicit id that is not a node."""
+    """What the Mac (no `[relevo] node`) records as `lanzador`: an explicit id that can never be a node
+    name (the `local:` prefix), even when the Mac's hostname is also the name of a node."""
     import socket
-    return socket.gethostname() or "local"
+    return "local:" + (socket.gethostname() or "mac")
 
 
 def _ask_lanzador(host, t):
@@ -663,7 +664,7 @@ def task_state(cfg, client, fl, env, t):
     - the job directory is here (or the task is this host's): `env.job_state`, the real thing;
     - the directory is not here and the `lanzador` is another host: ask it over ssh (`delega job-state`).
       No answer: None, and after LANZADOR_MAX_FALLOS cycles a decision. A `lanzador` that is not an ssh
-      alias (the Mac's old `<host>:tick`) is not asked: the same count, then a decision;
+      node of the config (the Mac's `local:<hostname>`, an old `<host>:tick`) is not asked: a decision;
     - a real job id with no directory where it should be (here, or the launcher says `no_encontrado`):
       a decision `job_sin_directorio` (once), never a failure of the job.
     The state of the job of ANOTHER host is never judged from this host's disk."""
@@ -842,8 +843,8 @@ def main_daemon(argv):
     something else: the name the OTHER daemons reach this machine by over ssh. It is written as `lanzador`
     on every task this daemon launches, and a daemon that takes the lease over asks that host
     (`ssh <host> delega job-state`) how the job goes instead of judging it from its own disk. By default it
-    is the node's name (`[relevo] node`); the Mac has none: it records no `lanzador`, and a task launched
-    there whose directory is not on the machine that holds the lease waits and then asks for a decision
+    is the node's name (`[relevo] node`); the Mac records `local:<hostname>`, never a node name, and a task
+    launched there whose directory is not on the machine that holds the lease waits and then asks for a decision
     (`necesita_decision`), it is never relaunched or marked red from afar."""
     import signal
     import socket

@@ -105,6 +105,30 @@ class F14(_Base):
         self.assertEqual(F.git(bare, "rev-parse", "refs/heads/main"), ahead)
         self.assertIn("NOT overwritten", msg)
 
+    def test_c_diverged_node_branch_is_a_failure_not_a_warning(self):           # R8
+        self.write_conf(NODES)
+        bare = os.path.join(self.home, "delega", "api.git")
+        os.makedirs(os.path.dirname(bare))
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, bare], check=True)
+        node_tip = F.commit_file(bare, F.git(bare, "rev-parse", "main"), "node.txt")
+        F.git(bare, "update-ref", "refs/heads/main", node_tip)
+        mine = F.commit_file(self.repo, F.git(self.repo, "rev-parse", "main"), "mac.txt")   # diverges
+        F.git(self.repo, "update-ref", "refs/heads/main", mine)
+        co = os.path.join(self.tmp.name, "co2")
+        subprocess.run(["git", "clone", "-q", self.repo, co], check=True)
+        node = config.load().node("sandbox")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok, msg = sync.push_branch(node, "api", "main", co)
+        self.assertFalse(ok)
+        self.assertEqual(F.git(bare, "rev-parse", "refs/heads/main"), node_tip)
+        self.assertIn("diverged", msg)
+
+    def test_a_mac_whose_hostname_is_a_node_name_is_still_not_that_node(self):   # R8
+        from unittest import mock
+        with mock.patch("socket.gethostname", return_value="sandbox"):
+            self.assertEqual(queue._local_id(), "local:sandbox")
+            self.test_a_mac_task_judged_by_a_node_is_not_relaunched_and_asks_for_a_decision()
+
 
 if __name__ == "__main__":
     unittest.main()

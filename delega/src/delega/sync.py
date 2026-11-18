@@ -176,11 +176,17 @@ def push_branch(node, repo, branch, checkout):
                 f"{ref}:refs/heads/{branch}"], capture_output=True, text=True, env=remote._git_env())
     if r.returncode != 0:
         if re.search(r"non-fast-forward|fetch first|\[rejected\]", (r.stderr or "") + (r.stdout or "")):
-            return True, i18n.t("sync.branch_ahead", node=node.get("name", ""), branch=branch, repo=repo)
+            # rejected: only fine when the node's branch already contains ours (it is ahead); a node
+            # branch that does not contain it has diverged and that is a failure, not a warning
+            sha = sp.run(["git", "-C", checkout, "rev-parse", ref], capture_output=True, text=True).stdout.strip()
+            anc = remote.ssh(node, f"git -C {bare} merge-base --is-ancestor {q(sha)} {q('refs/heads/' + branch)}")
+            if sha and anc.returncode == 0:
+                return True, i18n.t("sync.branch_ahead", node=node.get("name", ""), branch=branch, repo=repo)
+            return False, i18n.t("sync.branch_diverged", node=node.get("name", ""), branch=branch, repo=repo)
         return False, (r.stderr or r.stdout or "").strip()
     r = remote.ssh(node, f"git -C {bare} rev-parse -q --verify HEAD >/dev/null 2>&1 || "
                          f"git -C {bare} symbolic-ref HEAD {q('refs/heads/' + branch)}")
-    return (r.returncode == 0), (r.stderr or "").strip()
+    return (r.returncode == 0), ("" if r.returncode == 0 else (r.stderr or "").strip())
 
 
 def main(argv):
