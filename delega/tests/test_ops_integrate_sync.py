@@ -107,6 +107,19 @@ class IntegrateMergeTest(OpsCase):
         rec = self.audit_last()
         self.assertEqual((rec["event"], rec["result"], rec["merge"]), ("integrate", "merged", True))
 
+    def test_sha_merges_that_commit_but_the_job_and_message_use_the_branch(self):    # finding 10
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        pinned = self.git(self.repo, "rev-parse", "feat")
+        self.commit_on(self.repo, "feat", "late.txt", "later\n", base="feat")     # the branch moved after the job
+        self.git(self.repo, "checkout", "-q", "main")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--sha", pinned, "--node", "box")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()[2], pinned)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "late.txt")))
+        self.assertIn("Merge branch 'feat'", self.git(self.repo, "log", "-1", "--format=%s", "main"))
+        self.assertEqual(self.audit_last()["job"], os.path.basename(self.job))
+        self.assertTrue(os.path.exists(os.path.join(self.job, "integrate.log")))
+
     def test_red_verify_leaves_destination_and_exits_7(self):
         self.commit_on(self.repo, "feat", "c.txt", "new\n")               # b.txt never appears
         old = self.git(self.repo, "rev-parse", "main")

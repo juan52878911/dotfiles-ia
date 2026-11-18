@@ -25,6 +25,7 @@ The side effects (launch a job, look at a job, integrate) live in `Env`, so the 
 import fnmatch
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -190,15 +191,28 @@ def check_repo_dir(conn, flow, repo_dir):
     row = conn.execute("SELECT repo FROM flujos WHERE id = ?", (flow,)).fetchone()
     if row is None:
         raise mem.MemError(i18n.t("mem.unknown_flow", flow=flow))
+    check_origin(repo_dir, row["repo"])
+
+
+def check_origin(repo_dir, repo):
+    """MemError unless the `origin` of repo_dir is `repo`."""
     rc, origin = _git(repo_dir, "remote", "get-url", "origin")
-    if rc != 0 or not origin or norm_repo(origin) != norm_repo(row["repo"]):
-        raise mem.MemError(i18n.t("wave.repo_mismatch", dir=repo_dir, origin=origin or "-", repo=row["repo"]))
+    if rc != 0 or not origin or norm_repo(origin) != norm_repo(repo):
+        raise mem.MemError(i18n.t("wave.repo_mismatch", dir=repo_dir, origin=origin or "-", repo=repo))
 
 
-def check_profiles(conn, flow, org):
-    """A task whose profile belongs to another org than the base never runs from here."""
+def check_profiles(conn, flow, org, repo_dir=None):
+    """A task whose profile belongs to another org than the base never runs from here.
+    A task without a profile gets `profile_for(repo_dir)` at launch: that one is checked too."""
+    default = None
+    if repo_dir:
+        try:
+            from . import config
+            default = config.load().profile_for(repo_dir)
+        except Exception:
+            default = None
     for t in _tasks(conn, flow):
-        po = mem._profile_org((t["run_args"] or {}).get("profile"))
+        po = mem._profile_org((t["run_args"] or {}).get("profile") or default)
         if po and po != org:
             raise mem.MemError(i18n.t("wave.profile_org", id=t["id"], org=po, base=org))
 
@@ -250,7 +264,17 @@ class Env:
         return f"pend:{p.pid}:{stamp}"
 
     def _fetched_sha(self, job_dir, jid, branch):
-        """The sha the job brought to this repo, or None if its fetch did not succeed."""
+        """The sha the job brought to this repo, or None if its fetch did not succeed.
+        `launch` writes `FETCHED=<sha>` in meta when the fetch worked; `fetch.log` (empty = ok)
+        is only the fallback for old jobs without that key."""
+        from . import util
+        meta = util.read_meta(job_dir)
+        if "FETCHED" in meta:
+            sha = meta["FETCHED"].strip()
+            if not re.fullmatch(r"[0-9a-f]{7,64}", sha):
+                return None
+            rc, full = _git(self.repo_dir, "rev-parse", "--verify", "-q", f"{sha}^{{commit}}")
+            return full if rc == 0 and full else None
         try:
             with open(os.path.join(job_dir, "fetch.log"), encoding="utf-8") as f:
                 log = f.read().strip()
@@ -264,20 +288,43 @@ class Env:
         rc, sha = _git(self.repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}")
         return sha if rc == 0 and sha else None
 
+    def _job_dir(self, task):
+        """The newest job directory of the task (by real job id, or by branch for a `pend:` id)."""
+        from . import jobs, util
+        cfg = self.cfg()
+        jid = task.get("job_id") or ""
+        pend = jid.startswith("pend:")
+        stamp = jid.split(":")[2] if pend else ""
+        for d in reversed(jobs.job_dirs(cfg)):
+            same = (jobs.job_id(d) == jid) if not pend else (
+                util.read_meta(d).get("BRANCH") == task.get("rama") and jobs.job_id(d) >= stamp)
+            if same:
+                return d
+        return None
+
+    def log_tail(self, task, lines=80):
+        """The last lines of progress.log / stderr.log of the task's job ('' when there is none)."""
+        from . import util
+        d = self._job_dir(task)
+        out = []
+        for name in ("progress.log", "stderr.log"):
+            try:
+                with open(util.channel_file(d, name), encoding="utf-8", errors="replace") as f:
+                    tail = f.read().splitlines()[-lines:]
+            except (OSError, TypeError):
+                continue
+            if tail:
+                out.append(f"--- {name} ---\n" + "\n".join(tail))
+        return "\n".join(out)[-LOG_TAIL:]
+
     def job_state(self, task):
         """Returns (state, job_id, sha): state is running | ok | fail | queued; sha only when ok."""
         from . import jobs, util
         cfg = self.cfg()
         jid = task.get("job_id") or ""
         pend = jid.startswith("pend:")
-        pid, stamp = (int(jid.split(":")[1]), jid.split(":")[2]) if pend else (None, "")
-        found = None
-        for d in reversed(jobs.job_dirs(cfg)):
-            same = (jobs.job_id(d) == jid) if not pend else (
-                util.read_meta(d).get("BRANCH") == task.get("rama") and jobs.job_id(d) >= stamp)
-            if same:
-                found = d
-                break
+        pid = int(jid.split(":")[1]) if pend else None
+        found = self._job_dir(task)
         if found is None:
             if pend and _pid_alive(pid):
                 return "running", jid, None
@@ -297,8 +344,10 @@ class Env:
         sha = self._fetched_sha(found, real, task.get("rama"))
         return ("ok", real, sha) if sha else ("fail", real, None)
 
-    def integrate(self, branch, into, node):
+    def integrate(self, branch, into, node, sha=None):
         cmd = [sys.executable, "-m", "delega", "integrate", self.repo_dir, branch, "--merge", "--into", into]
+        if sha:
+            cmd += ["--sha", sha]
         if node and node != "auto":
             cmd += ["--node", node]
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -411,6 +460,9 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
         if not _set(conn, org, t["id"], "arreglo", "rojo", intentos=t["intentos"] + 1):
             continue
         brief = t["brief"] + "\n\n" + i18n.t("wave.retry_header")
+        tail = env.log_tail(t) if hasattr(env, "log_tail") else ""
+        if tail:
+            brief += "\n\n" + i18n.t("wave.retry_log") + "\n" + tail
         flags = run_flags(t["run_args"], t["zona"])
         if node and "node" not in t["run_args"]:
             flags += ["--node", node]
@@ -454,8 +506,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
     if not pending or any(t["estado"] != "ok" for t in pending):
         return 0
     for t in pending:
-        ref = _sha_of(conn, flow, t["id"]) or t["rama"]
-        rc, out = env.integrate(ref, into, node or (t["nodo"] if t["nodo"] != "auto" else None))
+        rc, out = env.integrate(t["rama"], into, node or (t["nodo"] if t["nodo"] != "auto" else None),
+                                sha=_sha_of(conn, flow, t["id"]))
         if rc == 0:
             _set(conn, org, t["id"], "hecha", "ok")
             say(i18n.t("wave.merged", id=t["id"], into=into))
@@ -553,9 +605,9 @@ def main(argv, env=None):
                 print(i18n.t("wave.planned", flow=flow, wave=wave, n=len(rows)))
             elif cmd == "step":
                 par = mem._number(vals.get("par", DEFAULT_PAR), "--par", int)
-                check_profiles(conn, flow, org)
+                repo_dir = vals.get("repo-dir") or os.getcwd()
+                check_profiles(conn, flow, org, repo_dir if env is None else None)
                 if env is None:
-                    repo_dir = vals.get("repo-dir") or os.getcwd()
                     check_repo_dir(conn, flow, repo_dir)
                     env = Env(repo_dir, org=org)
                 return step(conn, flow, env, par=par,

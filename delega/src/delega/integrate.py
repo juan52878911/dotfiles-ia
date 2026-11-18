@@ -174,7 +174,7 @@ def job_for_branch(cfg, branch):
 
 def main(argv):
     into, timeout, pos, a = "main", 1800, [], list(argv)
-    merge, node_name, allow_unverified = False, None, False
+    merge, node_name, allow_unverified, by_sha = False, None, False, None
     while a:
         x = a.pop(0)
         if x == "--into" and a:
@@ -183,6 +183,8 @@ def main(argv):
             merge = True
         elif x == "--allow-unverified":
             allow_unverified = True
+        elif x == "--sha" and a:
+            by_sha = a.pop(0)
         elif x == "--node" and a:
             node_name = a.pop(0)
         elif x == "--timeout" and a:
@@ -204,14 +206,16 @@ def main(argv):
     project = cfg.project_for(repo)
     prof = cfg.profile(cfg.profile_for(repo))
     into_sha = git(repo, "rev-parse", "--verify", "-q", into).stdout.strip() or into
-    branch_sha = git(repo, "rev-parse", "--verify", "-q", branch).stdout.strip() or branch
+    # --sha: verify and merge exactly that commit; the job and the merge message still use the branch
+    branch_sha = git(repo, "rev-parse", "--verify", "-q", f"{by_sha or branch}^{{commit}}").stdout.strip() \
+        or by_sha or branch
     if merge:
         other = checked_out_elsewhere(repo, into)
         if other:
             print(i18n.t("integrate.checked_out", into=into, path=other), file=sys.stderr)
             return 2
-    base = git(repo, "merge-base", into, branch).stdout.strip() or None
-    sha = git(repo, "rev-parse", "--short", branch).stdout.strip()
+    base = git(repo, "merge-base", into, branch_sha).stdout.strip() or None
+    sha = git(repo, "rev-parse", "--short", branch_sha).stdout.strip()
     job_dir = job_for_branch(cfg, branch) if merge else None
     job = os.path.basename(job_dir) if job_dir else None
     common = dict(job=job, profile=prof["name"], branch=branch, base=base, project=project, into=into, sha=sha)

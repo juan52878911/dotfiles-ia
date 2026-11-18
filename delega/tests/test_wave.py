@@ -31,7 +31,7 @@ class FakeEnv:
     def job_state(self, task):
         return self.states.get(task["id"], "ok"), task["job_id"]
 
-    def integrate(self, branch, into, node):
+    def integrate(self, branch, into, node, sha=None):
         tid = next(t for t, b, _ in self.launches if b == branch)
         self.integrations.append((tid, into, node))
         q = self.results.get(tid) or [(0, "ok")]
@@ -156,7 +156,7 @@ class WaveTest(unittest.TestCase):
         self.three()
         orig = self.env.integrate
 
-        def racing(branch, into, node):          # another orchestrator takes the task meanwhile
+        def racing(branch, into, node, sha=None):          # another orchestrator takes the task meanwhile
             rc = orig(branch, into, node)
             if rc[0] == 7:
                 mem.set_task(self.conn, "b", "arreglo", desde="ok", force=True, intentos=2, org="personal")
@@ -171,10 +171,11 @@ class WaveTest(unittest.TestCase):
         self.three()
         self.env.job_state = lambda t: ("ok", t["job_id"], "sha-" + t["id"])
         seen = []
-        self.env.integrate = lambda b, i, n: (seen.append(b), (0, "ok"))[1]
+        self.env.integrate = lambda b, i, n, sha=None: (seen.append((b, sha)), (0, "ok"))[1]
         for _ in range(4):
             self.step(par=3)
-        self.assertEqual(seen, ["sha-a", "sha-b", "sha-c"])
+        self.assertEqual([s for _, s in seen], ["sha-a", "sha-b", "sha-c"])
+        self.assertTrue(all(b.startswith("delega/wave-") for b, _ in seen))   # finding 10: the branch names the job
 
     def test_overlapping_zones_reject_whole_wave(self):
         with self.assertRaises(mem.MemError):

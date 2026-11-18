@@ -439,6 +439,10 @@ def _finish(cfg, job_dir, meta, node, poll_s, rc=None):
         if ok:
             last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", shown], capture_output=True,
                                   text=True).stdout.strip()
+            sha = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--verify", "-q", f"{shown}^{{commit}}"],
+                                 capture_output=True, text=True).stdout.strip()
+            if sha:                           # wave/clean read this instead of guessing from fetch.log
+                util.add_meta(job_dir, FETCHED=sha)
             print(t("launch.branch.fetched", branch=branch, last=last))
             if where == "merged":
                 print(t("launch.branch.merged", branch=branch))

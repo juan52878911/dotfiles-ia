@@ -46,12 +46,13 @@ def _branch_fetched(job_dir, meta=None):
     ``launch._finish`` creates ``fetch.log`` for every fetch attempt and writes git's
     error output there on failure.  Thus an existing empty file is positive proof that
     the job branch was brought to the Mac.  A missing file is deliberately not enough.
-    When the meta carries ``FETCHED`` (newer launches), it must hold a sha as well; jobs
-    whose meta has no such key keep the old rule.
+    When the meta carries ``FETCHED`` (newer launches) a sha there is the proof (ssh may
+    write warnings to fetch.log even when the fetch worked); jobs without that key keep the
+    old rule.
     """
     path = os.path.join(job_dir, "fetch.log")
-    if meta and "FETCHED" in meta and not re.fullmatch(r"[0-9a-f]{7,64}", meta["FETCHED"].strip()):
-        return False
+    if meta and "FETCHED" in meta:
+        return bool(re.fullmatch(r"[0-9a-f]{7,64}", meta["FETCHED"].strip()))
     try:
         return os.path.isfile(path) and os.path.getsize(path) == 0
     except OSError:
