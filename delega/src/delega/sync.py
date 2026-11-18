@@ -128,6 +128,52 @@ def sync_node(cfg, prof, node, tar_path):
     return True, ""
 
 
+def branch_pushes(cfg, prof):
+    """[(flow, repo, branch, checkout)] for the active flows of the profile's org that have a checkout on this
+    machine; flows without one are reported and skipped. Raises on an unreadable memory."""
+    from . import queue, relevo
+    org = cfg.profile_org(prof["name"])
+    client = queue.MemClient(cfg, org, "sync")
+    out, seen = [], set()
+    for fl in client.flows():
+        if fl.get("estado") != "activo" or fl.get("org", org) != org:
+            continue
+        co = queue._checkout(client.m, fl["repo"])
+        if not co:
+            print(f"{fl['repo']}: no checkout on this machine, branch not pushed", file=sys.stderr)  # TODO i18n
+            continue
+        key = (relevo.repo_basename(fl["repo"]), fl.get("rama_destino") or "main")
+        if key not in seen:
+            seen.add(key)
+            out.append((fl["id"], key[0], key[1], co))
+    return out
+
+
+def push_branch(node, repo, branch, checkout):
+    """Push the flow's destination branch to the node's bare repo (only that ref, only to the bare)."""
+    import subprocess as sp
+    from . import remote
+    sp.run(["git", "-C", checkout, "fetch", "-q", "origin", branch], capture_output=True, text=True)
+    ref = f"refs/remotes/origin/{branch}"
+    if sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref], capture_output=True).returncode != 0:
+        ref = f"refs/heads/{branch}"
+        if sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref], capture_output=True).returncode != 0:
+            return False, f"no {branch} in {checkout}"
+    q = shlex.quote
+    bare = q(remote.bare_rel(node, repo))
+    init = f"{{ test -d {bare} || {{ mkdir -p {q(remote.workdir(node))} && git init -q --bare {bare}; }}; }}"
+    r = remote.ssh(node, init)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "").strip()
+    r = sp.run(["git", "-C", checkout, "push", "-q", f"{remote.alias(node)}:{remote.bare_rel(node, repo)}",
+                f"+{ref}:refs/heads/{branch}"], capture_output=True, text=True, env=remote._git_env())
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "").strip()
+    r = remote.ssh(node, f"git -C {bare} rev-parse -q --verify HEAD >/dev/null 2>&1 || "
+                         f"git -C {bare} symbolic-ref HEAD {q('refs/heads/' + branch)}")
+    return (r.returncode == 0), (r.stderr or "").strip()
+
+
 def main(argv):
     profile, names, dry, tar_out, orch, a = None, [], False, None, False, list(argv)
     while a:
@@ -170,6 +216,12 @@ def main(argv):
             print(i18n.t("sync.tar", path=tar_out, n=len(staged)))
             return 0
         rc = 0
+        pushes = []
+        if orch:
+            try:
+                pushes = branch_pushes(cfg, prof)
+            except Exception as e:      # memory unreachable or not configured: the rest of the sync goes on
+                print(i18n.t("relevo.error", err=e), file=sys.stderr)
         for node in nodes:
             if prof["name"] not in node["profiles"]:
                 print(i18n.t("sync.not_allowed", node=node["name"], profile=prof["name"]), file=sys.stderr)
@@ -180,6 +232,8 @@ def main(argv):
                 for s in staged:
                     print("  " + s)
                 if orch:
+                    for _, repo, br, _co in pushes:
+                        print(f"  would push {br} -> {repo}.git")      # TODO i18n
                     from . import relevo
                     try:
                         relevo.derive_config(cfg, prof["name"], node["name"])
@@ -197,5 +251,12 @@ def main(argv):
                 from . import relevo
                 ok, err = relevo.install_on_node(cfg, prof, node)
                 print(i18n.t("sync.orch_done" if ok else "sync.orch_failed", node=node["name"], err=err))
+                for _, repo, br, co in pushes:
+                    try:
+                        pok, perr = push_branch(node, repo, br, co)
+                    except (OSError, subprocess.SubprocessError) as e:
+                        pok, perr = False, str(e)
+                    print(f"{node['name']}: {br} -> {repo}.git " + ("pushed" if pok else f"FAILED: {perr}"))  # TODO i18n
+                    ok = ok and pok
             rc = rc or (0 if ok else 1)
     return rc
