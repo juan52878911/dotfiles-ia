@@ -364,10 +364,22 @@ def _set_meta(conn, key, value):
 
 
 def _remember_owner_epoch(conn, owner, value):
-    """Remember the oldest epoch seen for an owner; promotion uses it as a fencing token."""
+    """Remember the epoch of the owner's LAST lease; promotion uses it as a fencing token.
+    The last one, not the oldest: an owner readmitted after a failback must not stay fenced."""
     conn.execute("INSERT INTO owner_epochs (dueno, epoca) VALUES (?,?) "
-                 "ON CONFLICT(dueno) DO UPDATE SET epoca = MIN(owner_epochs.epoca, excluded.epoca)",
+                 "ON CONFLICT(dueno) DO UPDATE SET epoca = excluded.epoca",
                  (owner, int(value)))
+
+
+def _check_fence(c, owner=None):
+    """Inside a write transaction: an owner fenced by a promotion writes nothing (rc 9)."""
+    owner = owner or owner_id()
+    fence = c.execute("SELECT epoca FROM owner_epochs WHERE dueno = ?", (owner,)).fetchone()
+    if fence is None:
+        return
+    current = int(_meta_value(c, "epoca", 1) or 1)
+    if int(fence["epoca"]) != current:
+        raise MemConflict(i18n.t("mem.fenced", owner=owner, epoca=int(fence["epoca"]), actual=current))
 
 
 def epoch(conn):
@@ -519,6 +531,7 @@ def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=Non
 
     def op(c):
         _check_org(c, org)
+        _check_fence(c)
         row = c.execute("SELECT * FROM tareas WHERE id = ?", (task,)).fetchone()
         if row is None:
             raise MemError(i18n.t("mem.unknown_task", task=task))
@@ -1033,6 +1046,7 @@ def add_event(conn, que, datos=None, task=None, once=False, quien=None):
         datos["tarea"] = task
 
     def op(c):
+        _check_fence(c, quien)
         if once and task:
             for r in c.execute("SELECT datos FROM eventos WHERE que = ?", (que,)).fetchall():
                 if json.loads(r["datos"] or "{}").get("tarea") == task:
@@ -1087,14 +1101,17 @@ def backup(conn, dest_file):
         out.close()
 
 
-def _promoted_snapshot(main):
-    """(epoch, stale tasks, leases) of the current main database, without changing it."""
-    if not os.path.exists(main):
-        return 1, [], []
-    try:
-        conn = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0)
-    except sqlite3.Error:
-        return 1, [], []
+def _promoted_snapshot(main, conn=None):
+    """(epoch, stale tasks, leases) of the current main database, without changing it.
+    With `conn` (already open, holding the write lock) it reads through it and leaves it open."""
+    own = conn is None
+    if own:
+        if not os.path.exists(main):
+            return 1, [], []
+        try:
+            conn = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0)
+        except sqlite3.Error:
+            return 1, [], []
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         current = 1
@@ -1109,7 +1126,7 @@ def _promoted_snapshot(main):
         if "tareas" in tables:
             stale = [(r[0], r[1], float(r[2])) for r in conn.execute(
                 "SELECT id, estado, actualizado FROM tareas "
-                "WHERE estado IN ('lanzada','pendiente')").fetchall()]
+                "WHERE estado IN ('lanzada','pendiente','arreglo')").fetchall()]
         leases = []
         if "leases" in tables:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(leases)").fetchall()}
@@ -1120,7 +1137,8 @@ def _promoted_snapshot(main):
     except sqlite3.Error:
         return 1, [], []
     finally:
-        conn.close()
+        if own:
+            conn.close()
 
 
 def cmd_backup(args, db, as_json):
@@ -1161,8 +1179,9 @@ def cmd_promote(args, db, as_json):
     The previous main is kept as `<main>.before-promote`; the epoch is advanced so the previous
     owner is fenced. Without --yes nothing is touched (rc 2)."""
     import tempfile
-    _, flags, vals = _parse(args, flags=("yes",), values=("from", "org"))
+    _, flags, vals = _parse(args, flags=("yes",), values=("from", "org", "owner"))
     org_arg = _org(vals, required=True)
+    new_owner = (vals.get("owner") or "").strip() or None
     src = vals.get("from")
     if not src:
         raise MemError(i18n.t("mem.promote_usage"))
@@ -1181,6 +1200,7 @@ def cmd_promote(args, db, as_json):
     conn = connect(src)                                  # refuses a missing file or a network filesystem
     tmp = None
     promoted = None
+    lock = None
     try:
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise MemError(i18n.t("mem.promote_corrupt", path=src))
@@ -1195,7 +1215,21 @@ def cmd_promote(args, db, as_json):
             copied_at = float(copied_raw)
         except (TypeError, ValueError):
             copied_at = os.path.getmtime(src)
-        current_epoch, current_tasks, current_leases = _promoted_snapshot(main)
+        # Hold the write lock of the main database for the whole operation: what the old owner
+        # writes between the snapshot and the replacement can no longer be lost silently.
+        if os.path.exists(main):
+            try:
+                lock = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None)
+                lock.row_factory = sqlite3.Row
+                lock.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error as e:
+                if lock is not None:
+                    lock.close()
+                    lock = None
+                if _db_is_busy(e):
+                    raise
+        current_epoch, current_tasks, current_leases = _promoted_snapshot(main, lock)
+        current_tasks = [x for x in current_tasks if x[2] > copied_at]   # only work after the copy
 
         # Build the promoted database in a temporary file through SQLite's backup API. The final
         # write into main uses the same API, so an open connection and its WAL/SHM files stay valid.
@@ -1212,15 +1246,17 @@ def cmd_promote(args, db, as_json):
 
         def prepare(c):
             stale = {task_id: (state, updated) for task_id, state, updated in current_tasks}
+            from_main = set(stale)          # the old owner moved these after the copy was made
             # Also honor a timestamp carried by the copy itself (for a hand-made or older copy).
             for row in c.execute(
-                    "SELECT id, estado, actualizado FROM tareas WHERE estado IN ('lanzada','pendiente')"
-            ).fetchall():
+                    "SELECT id, estado, actualizado FROM tareas "
+                    "WHERE estado IN ('lanzada','pendiente','arreglo')").fetchall():
                 if float(row["actualizado"]) > copied_at:
                     stale.setdefault(row["id"], (row["estado"], float(row["actualizado"])))
             for task_id, (state, updated) in stale.items():
                 row = c.execute("SELECT id, flujo, estado FROM tareas WHERE id = ?", (task_id,)).fetchone()
-                if row is None or row["estado"] not in ("lanzada", "pendiente"):
+                if row is None or row["estado"] in ("ok", "hecha", "bloqueada") or (
+                        row["estado"] not in ("lanzada", "pendiente", "arreglo") and task_id not in from_main):
                     continue
                 now = time.time()
                 c.execute("UPDATE tareas SET estado = 'bloqueada', actualizado = ? WHERE id = ?",
@@ -1238,6 +1274,8 @@ def cmd_promote(args, db, as_json):
             for rol, dueno, vence, latido, epoca in current_leases:
                 _remember_owner_epoch(c, dueno, int(epoca or 1))
             c.execute("DELETE FROM leases")
+            if new_owner:
+                c.execute("DELETE FROM owner_epochs WHERE dueno = ?", (new_owner,))
             _set_meta(c, "epoca", new_epoch)
             _set_meta(c, "copiado_en", repr(time.time()))
             _event(c, "mem.promote", {"desde": src, "anterior": main + ".before-promote" if os.path.exists(main)
@@ -1247,6 +1285,11 @@ def cmd_promote(args, db, as_json):
         write(promoted, prepare)
 
         kept = None
+        if lock is not None:
+            # fence the old owners in main itself and release the lock; from here on they are refused
+            # even in the instant before the copy lands
+            for row in lock.execute("SELECT dueno, epoca FROM leases").fetchall():
+                _remember_owner_epoch(lock, row["dueno"], int(row["epoca"] or 1))
         if os.path.exists(main):
             kept = main + ".before-promote"
             old = connect(main)
@@ -1254,6 +1297,13 @@ def cmd_promote(args, db, as_json):
                 backup(old, kept)                         # consistent snapshot, including WAL data
             finally:
                 old.close()
+        if lock is not None:
+            try:
+                _set_meta(lock, "epoca", new_epoch)
+                lock.execute("COMMIT")
+            finally:
+                lock.close()
+                lock = None
         destination = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0)
         destination.row_factory = sqlite3.Row
         destination.isolation_level = None
@@ -1263,6 +1313,12 @@ def cmd_promote(args, db, as_json):
             destination.close()
     finally:
         conn.close()
+        if lock is not None:
+            try:
+                lock.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            lock.close()
         if promoted is not None:
             promoted.close()
         if tmp:
@@ -1278,7 +1334,36 @@ def cmd_promote(args, db, as_json):
     return EXIT_OK
 
 
+def cmd_unfence(args, db, as_json):
+    """`delega mem unfence <owner> --yes --org <org>`: readmit an owner a promotion fenced
+    (a failback to the original host, or a copy restored on the same machine)."""
+    pos, flags, vals = _parse(args, flags=("yes",), values=("org",))
+    org = _org(vals, required=True)
+    if not pos:
+        raise MemError(i18n.t("mem.unfence_usage"))
+    owner = pos[0]
+    if "yes" not in flags:
+        msg = i18n.t("mem.unfence_dry", owner=owner)
+        _out({"ok": False, "cmd": "unfence", "error": msg}, [], as_json)
+        print(msg, file=sys.stderr)
+        return EXIT_USAGE
+    conn = connect(db_path(db, org=org))
+    try:
+        def op(c):
+            _check_org(c, org)
+            n = c.execute("DELETE FROM owner_epochs WHERE dueno = ?", (owner,)).rowcount
+            _event(c, "mem.unfence", {"dueno": owner, "quitado": bool(n)})
+            return bool(n)
+        removed = write(conn, op)
+    finally:
+        conn.close()
+    _out({"ok": True, "cmd": "unfence", "dueno": owner, "quitado": removed},
+         [i18n.t("mem.unfenced", owner=owner, removed=removed)], as_json)
+    return EXIT_OK
+
+
 ORDERS = {
+    "unfence": cmd_unfence,
     "install-daemon": cmd_install_daemon, "flows": cmd_flows,
     "init": cmd_init, "add-flow": cmd_add_flow, "add-task": cmd_add_task, "next": cmd_next, "set": cmd_set,
     "backup": cmd_backup, "promote": cmd_promote, "event": cmd_event,
