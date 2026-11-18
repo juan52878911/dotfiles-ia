@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -331,6 +332,27 @@ class MemTest(unittest.TestCase):
                            "--org", "trycore", "--db", self.db])
         self.assertEqual(rc, 0, err)
 
+    def test_ok_can_go_to_arreglo_or_bloqueada_only_with_compare_and_set(self):
+        self.init()
+        self.flow("f1")
+        self.task(flow="f1", brief="primero", task_id="t1")
+        self.task(flow="f1", brief="segundo", task_id="t2")
+        for task in ("t1", "t2"):
+            for old, new in (("pendiente", "lanzada"), ("lanzada", "ok")):
+                rc, _, err = _run(["set", task, "--estado", new, "--desde", old,
+                                   "--org", "trycore", "--db", self.db, "--json"])
+                self.assertEqual(rc, 0, err)
+
+        rc, _, err = _run(["set", "t1", "--estado", "arreglo",
+                           "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 2)
+        rc, _, err = _run(["set", "t1", "--estado", "arreglo", "--desde", "ok",
+                           "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        rc, _, err = _run(["set", "t2", "--estado", "bloqueada", "--desde", "ok",
+                           "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+
     def test_a_task_of_another_flow_is_not_ready(self):
         self.init()
         self.flow("f1")
@@ -405,6 +427,83 @@ class MemTest(unittest.TestCase):
         expected = os.path.join(self.tmp.name, ".local", "state", "delega", "memoria-acme.db")
         self.assertEqual(json.loads(out)["db"], expected)
         self.assertTrue(os.path.exists(expected))
+
+    # ── promotion: stale copies, epochs and open WAL connections ───────────
+    def test_promote_fences_the_old_owner_and_blocks_work_started_after_the_copy(self):
+        self.init()
+        self.flow("f1")
+        self.task(flow="f1", brief="después de la copia", task_id="t1")
+        claim = ["claim", "orquestador", "--owner", "old-owner", "--org", "trycore",
+                 "--db", self.db, "--json"]
+        rc, _, err = _run(claim)
+        self.assertEqual(rc, 0, err)
+        copy = os.path.join(self.tmp.name, "copy.db")
+        rc, _, err = _run(["backup", "--to", copy, "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+
+        conn = mem.connect(copy)
+        try:
+            copied_at = float(conn.execute("SELECT valor FROM meta WHERE clave = 'copiado_en'").fetchone()[0])
+        finally:
+            conn.close()
+        conn = mem.connect(self.db)
+        try:
+            epoch = int(conn.execute("SELECT valor FROM meta WHERE clave = 'epoca'").fetchone()[0])
+        finally:
+            conn.close()
+        rc, _, err = _run(["set", "t1", "--estado", "lanzada", "--desde", "pendiente",
+                           "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        conn = mem.connect(self.db)
+        try:
+            updated = float(conn.execute("SELECT actualizado FROM tareas WHERE id = 't1'").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertGreater(updated, copied_at)
+
+        rc, out, err = _run(["promote", "--from", copy, "--org", "trycore",
+                             "--db", self.db, "--yes", "--json"])
+        self.assertEqual(rc, 0, err)
+        conn = mem.connect(self.db)
+        try:
+            state = conn.execute("SELECT estado FROM tareas WHERE id = 't1'").fetchone()[0]
+            new_epoch = int(conn.execute("SELECT valor FROM meta WHERE clave = 'epoca'").fetchone()[0])
+            decisions = [json.loads(r[0]) for r in conn.execute(
+                "SELECT datos FROM eventos WHERE que = 'necesita_decision'")]
+        finally:
+            conn.close()
+        self.assertEqual(state, "bloqueada")
+        self.assertEqual(new_epoch, epoch + 1)
+        self.assertEqual([d["tarea"] for d in decisions], ["t1"])
+
+        rc, out, err = _run(claim)
+        self.assertEqual(rc, 9)
+        self.assertIn("epoch", err.lower())
+        self.assertFalse(json.loads(out)["ok"])
+        rc, _, err = _run(["claim", "orquestador", "--owner", "new-owner", "--org", "trycore",
+                           "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+
+    def test_promote_does_not_remove_wal_sidecars_of_an_open_connection(self):
+        self.init()
+        self.flow("f1")
+        copy = os.path.join(self.tmp.name, "copy.db")
+        rc, _, err = _run(["backup", "--to", copy, "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        conn = mem.connect(self.db)
+        try:
+            conn.execute("INSERT INTO meta (clave, valor) VALUES ('prueba', 'sidecars') "
+                         "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor")
+            self.assertTrue(os.path.exists(self.db + "-wal"))
+            self.assertTrue(os.path.exists(self.db + "-shm"))
+            rc, _, err = _run(["promote", "--from", copy, "--org", "trycore",
+                               "--db", self.db, "--yes", "--json"])
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.exists(self.db + "-wal"))
+            self.assertTrue(os.path.exists(self.db + "-shm"))
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            conn.close()
 
     # ── the database itself ─────────────────────────────────────────────────
     def test_the_migration_is_idempotent(self):

@@ -2,9 +2,11 @@
 (`<id>-<repo>/`) with a `meta` file; its channel lives there (local) or on the node (remote)."""
 import argparse
 import glob
+import hashlib
 import json
 import os
 import shlex
+import socket
 import sys
 import time
 
@@ -38,7 +40,26 @@ def resolve(cfg, pattern):
     return hits[-1]
 
 
-def owner_label():
+def orchestrator_label(state_dir):
+    """Stable identity of this orchestrator: hostname + the first 8 hex of the state-dir hash.
+
+    The state dir is part of the identity: two orchestrators on the same host (or two checkouts
+    with different state dirs) must not share ownership of the microVMs on a shared kindling host.
+    """
+    path = os.path.realpath(os.path.abspath(os.path.expanduser(os.path.expandvars(str(state_dir)))))
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
+    host = socket.gethostname().strip() or "unknown-host"
+    return f"{host}-{digest}"
+
+
+def owner_label(state_dir=None):
+    """The owner shown for jobs, or the canonical orchestrator identity when a state dir is given.
+
+    `DELEGA_OWNER` remains the human/job owner. VM ownership uses `owner_label(state_dir)`, because
+    that env var does not identify which orchestrator (and state dir) created a shared-host VM.
+    """
+    if state_dir is not None:
+        return orchestrator_label(state_dir)
     return os.environ.get("DELEGA_OWNER") or os.environ.get("ORQ_DUENO") or os.path.basename(os.getcwd())
 
 
@@ -546,7 +567,7 @@ def gc(cfg, node_names=None, yes=False, out=None):
     from . import kindling
     out = out or sys.stdout
     seen, n = set(), 0
-    me = owner_label()
+    me = owner_label(cfg.state_dir)
     for name in node_names or [k for k, v in cfg.nodes.items() if v.get("runner") == "kindling"]:
         node = cfg.node(name)
         host = remote.alias(node)
@@ -567,13 +588,11 @@ def gc(cfg, node_names=None, yes=False, out=None):
             if labels is None:
                 labels = kindling.host_labels(node)      # only when there is something to delete
             owner = kindling.owner_of(labels, vm)
-            if owner and owner != me:
-                # the VM is another orchestrator's (the host is shared): it may have a live job
-                print(t("kindling.gc.other_owner", vm=vm, host=host, owner=owner, me=me), file=out)
-                continue
-            if why == "unknown" and not owner:
-                # no job of ours and no owner label: it may be another state_dir's: do not touch it
-                print(t("kindling.gc.no_owner", vm=vm, host=host), file=out)
+            if owner != me:
+                # Only our canonical orchestrator label authorizes deletion. A legacy owner label,
+                # a missing label, or another orchestrator's label all mean "do not touch it".
+                key = "kindling.gc.other_owner" if owner else "kindling.gc.no_owner"
+                print(t(key, vm=vm, host=host, owner=owner, me=me), file=out)
                 continue
             n += 1
             if yes:

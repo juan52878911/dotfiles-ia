@@ -28,7 +28,8 @@ from . import remote, util
 DEFAULT_EGRESS = ["anthropic.com"]
 VM_PREFIX = "delega-"
 NOT_JOBS = ("delega-seed-", "delega-load-", "delega-bake-")   # seed sandboxes, volume loaders, data-golden bakes
-OWNER_LABEL = "delega.owner"     # which orchestrator launched the VM (a host can be shared)
+OWNER_LABEL = "delega.owner"     # legacy: the human/job owner
+ORCH_LABEL = "delega.orch"       # canonical orchestrator identity (a host can be shared)
 
 
 def is_kindling(node):
@@ -104,7 +105,7 @@ def host_labels(node):
     """{vm: {label: value}} of the delega VMs on the host (`kling ps -json`), {} if it does not answer.
 
     A host can be shared by two orchestrators (the personal one and Trycore's on the same kling): the
-    `delega.owner` label says whose VM it is, so `gc` never deletes the other's.
+    `delega.orch` label says whose VM it is, so `gc` never deletes the other's.
     """
     r = remote.ssh(remote.host_node(node), "kling ps -json", timeout=30)
     if r.returncode != 0:
@@ -126,8 +127,8 @@ def host_labels(node):
 
 
 def owner_of(labels, vm):
-    """The `delega.owner` label of a VM ("" if it has none): the orchestrator that launched it."""
-    return (labels.get(vm) or {}).get(OWNER_LABEL) or ""
+    """The canonical `delega.orch` label of a VM ("" if it has none)."""
+    return (labels.get(vm) or {}).get(ORCH_LABEL) or ""
 
 
 def job_dir_of(cfg, vm):
@@ -150,7 +151,12 @@ def classify(cfg, node, vms):
         d = job_dir_of(cfg, vm)
         meta = util.read_meta(d) if d else {}
         if not d:
-            orphans.append((vm, "unknown"))
+            # The job belongs to another state dir/orchestrator. A running or starting VM still
+            # occupies the host, so it counts against max_jobs; only a stopped one is an orphan.
+            if state in TRANSIENT or state in ("running", ""):
+                active.append(vm)
+            else:
+                orphans.append((vm, "unknown"))
             continue
         if meta.get("END"):
             orphans.append((vm, "ended"))
@@ -221,8 +227,16 @@ def create(node, vm, image, ttl=None, on_ttl="freeze", labels=None):
     on_ttl="remove": VMs with real data) when it runs out, whatever happens to this machine."""
     q = shlex.quote
     allow = ",".join(node.get("egress_allow", DEFAULT_EGRESS))
+    labels = dict(labels or {})
+    if ORCH_LABEL not in labels:
+        from . import config, jobs
+        try:
+            state_dir = config.load().state_dir
+        except config.ConfigError:
+            state_dir = os.environ.get("DELEGA_STATE_DIR") or "~/.local/state/delega"
+        labels[ORCH_LABEL] = jobs.owner_label(state_dir)
     extra = f" -ttl {int(ttl)}m -on-ttl {q(on_ttl)}" if ttl else ""
-    extra += "".join(f" -label {q(f'{k}={v}')}" for k, v in (labels or {}).items())
+    extra += "".join(f" -label {q(f'{k}={v}')}" for k, v in labels.items())
     r = remote.ssh(remote.host_node(node), f"kling run -name {q(vm)} -from {q(image)} -egress allowlist "
                                           f"-allow {q(allow)}{extra} -wait-ready",
                    timeout=int(node.get("create_timeout_s", 300)))  # sin reflink el clon copia el disco entero
