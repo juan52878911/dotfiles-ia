@@ -277,6 +277,20 @@ class Hardening(DaemonCase):
         self.cycle()
         self.assertEqual(self.states(), {"t1": "ok", "t2": "rojo", "t3": "lanzada"})
 
+    def test_lanzada_with_a_missing_job_directory_asks_for_a_decision_once(self):
+        self.add_task("t1")
+        self.assertEqual(self.client("a").set("t1", "lanzada", job_id="20260101-000009-gone")[0], 0)
+        self.cycle()
+        self.cycle()
+        self.assertNotEqual(self.states()["t1"], "rojo")   # relevo may escalate it to bloqueada
+        c = sqlite3.connect(self.db)
+        try:
+            n = c.execute("SELECT COUNT(*) FROM eventos WHERE que = 'necesita_decision' "
+                          "AND datos LIKE '%job_sin_directorio%'").fetchone()[0]
+        finally:
+            c.close()
+        self.assertEqual(n, 1)
+
     def test_flow_with_waves_goes_to_wave_step_and_not_to_the_plain_launch(self):
         from delega import wave
         self.add_task("t1")
