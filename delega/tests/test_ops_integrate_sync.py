@@ -133,6 +133,81 @@ class IntegrateMergeTest(OpsCase):
         self.assertEqual(self.log(), "")                                   # no ssh at all
         self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 3)
 
+    def test_dest_moved_during_verify_aborts_with_8_and_keeps_destination(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        def slow_verify(cfg, node, repo, sha, commands, timeout):
+            self.commit_on(self.repo, "main", "late.txt", "x\n", base="main")   # main advances meanwhile
+            return [(c, 0, 0.0) for c in commands]
+        with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        moved = self.git(self.repo, "rev-parse", "main")
+        self.assertEqual(rc, 8, out + err)
+        self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 2)  # no merge commit
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "late.txt")))
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), moved)
+        self.assertEqual(self.audit_last()["result"], "dest_moved")
+
+    def test_dest_moved_when_not_checked_out_keeps_new_commits(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.git(self.repo, "checkout", "-q", "feat")                           # main is not the current branch
+        def slow_verify(cfg, node, repo, sha, commands, timeout):
+            self.git(self.repo, "update-ref", "refs/heads/main",
+                     self.git(self.repo, "commit-tree", "main^{tree}", "-p", "main", "-m", "late"))
+            return [(c, 0, 0.0) for c in commands]
+        with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 8, out + err)
+        self.assertEqual(self.git(self.repo, "log", "-1", "--format=%s", "main"), "late")
+
+    def test_remote_ref_cleaned_when_worktree_add_fails(self):
+        from delega import remote
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        real = remote.ssh
+        def flaky(node, cmd, **kw):
+            if "worktree add" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "boom")
+            return real(node, cmd, **kw)
+        with mock.patch.object(remote, "ssh", side_effect=flaky):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 2, out + err)
+        bare = os.path.join(self.node_home, "delega", "repo.git")
+        self.assertEqual(self.git(bare, "branch", "--list", "delega-integrate/*"), "")
+
+    def test_unreachable_cleanup_is_audited(self):
+        from delega import launch
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        with mock.patch.object(launch, "ssh_retry", side_effect=launch.NoContact(5, "down")):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        recs = [json.loads(l) for l in open(os.path.join(self.state, "audit.jsonl")).read().splitlines()]
+        self.assertTrue(any(r.get("result") == "cleanup_failed" for r in recs), recs)
+
+    def test_merge_without_verify_refused_unless_allowed(self):
+        repo = self.make_repo("plain")                                          # no project -> no verify
+        self.commit_on(repo, "feat", "b.txt", "new\n")
+        old = self.git(repo, "rev-parse", "main")
+        rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge")
+        self.assertEqual(rc, 7, out + err)
+        self.assertEqual(self.git(repo, "rev-parse", "main"), old)
+        rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge", "--allow-unverified")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotEqual(self.git(repo, "rev-parse", "main"), old)
+
+    def test_refuses_when_destination_open_in_other_worktree(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.git(self.repo, "checkout", "-q", "feat")
+        other = os.path.join(self.root, "other-wt")
+        self.git(self.repo, "worktree", "add", "-q", other, "main")
+        old = self.git(self.repo, "rev-parse", "main")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("other-wt", err)
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), old)
+
+    def test_remote_worktree_names_carry_a_unique_suffix(self):
+        import re
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.run_cli(integrate.main, self.repo, "feat", "--node", "box")
+        self.assertTrue(re.search(r"integrate-[0-9a-f]{12}-[0-9a-f]{8}", self.log()), self.log())
 
 class SyncTest(OpsCase):
     def setUp(self):
