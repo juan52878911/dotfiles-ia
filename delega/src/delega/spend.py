@@ -34,7 +34,7 @@ def jobs_of(cfg, day=None):
         d = os.path.join(cfg.state_dir, name)
         if not (os.path.isdir(d) and name[:1].isdigit() and (not day or name.startswith(day))):
             continue
-        meta = util.read_meta(d)
+        meta = util.read_meta(d) or util.read_json(os.path.join(d, "escalado.json"), {}) or {}   # relevo's Claude runs
         out.append({"dir": d, "id": name, "owner": meta.get("OWNER") or "?",
                     "profile": meta.get("PROFILE") or "", "project": meta.get("PROJECT") or "?",
                     "cost": job_cost(d)})

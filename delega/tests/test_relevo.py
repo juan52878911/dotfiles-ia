@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -97,8 +98,13 @@ class Base(unittest.TestCase):
         script(os.path.join(self.bin, "git"),
                f'if [ "$1" = clone ] && [ "$2" = --bare ]; then echo "clone $3 $4" >> {self.calls}; '
                f'mkdir -p "$4"; exit 0; fi\nexec {real_git} "$@"\n')
-        for fake in ("ws", "claude"):
-            script(os.path.join(self.bin, fake), f'echo "{fake} $(echo "$*" | tr \'\\n\' \' \')" >> {self.calls}\n')
+        script(os.path.join(self.bin, "ws"),
+               f'if [ "$1" = contexto ]; then echo "contexto activo: trycore"; exit 0; fi\n'
+               f'echo "ws $(echo "$*" | tr \'\\n\' \' \')" >> {self.calls}\n')
+        script(os.path.join(self.bin, "claude"),
+               f'echo "claude $(echo "$*" | tr \'\\n\' \' \')" >> {self.calls}\n'
+               f'echo "env gh=${{GH_TOKEN-unset}} gt=${{GITHUB_TOKEN-unset}} ssh=${{SSH_AUTH_SOCK-unset}}" >> {self.calls}\n'
+               'echo \'{"total_cost_usd": 1.25}\'\n')
         self.conf = os.path.join(r, "config.toml")
         with open(self.conf, "w") as f:
             f.write(self.CONF.replace("{db}", self.db))
@@ -197,10 +203,78 @@ class NodeDaemon(Base):
             self.assertIn(want, calls[0])
         
     def test_ws_exec_when_it_exists_else_plain_claude(self):
-        self.assertEqual(relevo.claude_argv("b")[:4], ["ws", "exec", "claude", "-p"])    # fake ws on PATH
+        self.assertEqual(relevo.claude_argv("b", "trycore")[:4], ["ws", "exec", "claude", "-p"])    # fake ws on PATH
         os.remove(os.path.join(self.bin, "ws"))
         with mock.patch("shutil.which", lambda name, *a, **k: None if name == "ws" else "/usr/bin/" + name):
-            self.assertEqual(relevo.claude_argv("b")[:2], ["claude", "-p"])   # el ws real del equipo no cuenta
+            self.assertEqual(relevo.claude_argv("b", "trycore")[:2], ["claude", "-p"])   # el ws real del equipo no cuenta
+
+    def no_ws(self):
+        os.remove(os.path.join(self.bin, "ws"))
+        real = shutil.which
+        p = mock.patch("shutil.which", lambda name, *a, **k: None if name == "ws" else real(name, *a, **k))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_escalation_is_read_only_and_without_push_credentials(self):
+        argv = relevo.claude_argv("b", "trycore")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+        allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowed-tools")]
+        self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(delega mem *)"])
+        self.assertEqual(argv[:3], ["ws", "exec", "claude"])
+        self.assertEqual(relevo.claude_argv("b", "otraorg")[:2], ["claude", "-p"])   # context cannot be pinned
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "x", "GITHUB_TOKEN": "y", "SSH_AUTH_SOCK": "/s"}):
+            env = relevo.claude_env()
+        for k in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
+            self.assertNotIn(k, env)
+        self.assertIn("PATH", env)
+        # the real path: the process that is started has neither the options missing nor the variables
+        self.no_ws()
+        self.add_task("t1")
+        self.red("t1")
+        self.red("t1")
+        client = queue.MemClient(self.cfg, "trycore", "node")
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "x", "GITHUB_TOKEN": "y", "SSH_AUTH_SOCK": "/s"}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            relevo.escalate(self.cfg, client)
+        lines = self.log(2)
+        self.assertIn("env gh=unset gt=unset ssh=unset", lines)
+
+    def test_escalation_is_audited_and_its_cost_counts_in_spend(self):
+        from delega import spend
+        self.no_ws()
+        self.add_task("t1")
+        self.red("t1")
+        self.red("t1")
+        client = queue.MemClient(self.cfg, "trycore", "node")
+        with contextlib.redirect_stdout(io.StringIO()):
+            relevo.escalate(self.cfg, client)
+        rec = [json.loads(l) for l in open(os.path.join(self.state, "audit.jsonl"))]
+        esc = [r for r in rec if r["event"] == "escalate"]
+        self.assertEqual((len(esc), esc[0]["cap_usd"], esc[0]["task"]), (1, relevo.CAP_USD, "t1"))
+        self.log(2)
+        end = time.time() + 5
+        while time.time() < end and spend.total(self.cfg, None) == 0:
+            time.sleep(0.05)
+        self.assertEqual(spend.total(self.cfg, None), 1.25)
+        self.assertEqual(spend.total(self.cfg, None, profile="trycore"), 1.25)
+
+    def test_failed_spawn_keeps_the_task_retryable(self):
+        self.add_task("t1")
+        self.red("t1")
+        self.red("t1")
+        client = queue.MemClient(self.cfg, "trycore", "node")
+        with mock.patch.object(relevo, "spawn", side_effect=OSError("no claude")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(relevo.escalate(self.cfg, client), [])
+        self.assertEqual(self.requests(), [])                      # no `once` event: nothing is dead
+        self.assertEqual(self.task_state("t1"), "bloqueada")
+        c = sqlite3.connect(self.db)
+        self.assertEqual(c.execute("SELECT COUNT(*) FROM eventos WHERE que = 'escalado_fallido'").fetchone()[0], 1)
+        c.close()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(relevo.escalate(self.cfg, client), ["t1"])      # next cycle retries
+            self.assertEqual(relevo.escalate(self.cfg, client), [])
+        self.assertEqual(len(self.requests()), 1)
 
     def test_needs_decision_event_and_no_second_request(self):
         self.add_task("t1")

@@ -14,6 +14,7 @@ EXIT_CONFLICTS = 1
 EXIT_VERIFY = 5
 EXIT_MERGE_VERIFY = 7      # --merge: suite red, destination untouched
 EXIT_MERGE_CONFLICTS = 8   # --merge: conflicts, destination untouched
+EXIT_DEST_MOVED = 11       # --merge: the destination moved meanwhile (retry; not a conflict), untouched
 IDENT = {"GIT_AUTHOR_NAME": "delega", "GIT_AUTHOR_EMAIL": "delega@localhost",
          "GIT_COMMITTER_NAME": "delega", "GIT_COMMITTER_EMAIL": "delega@localhost"}
 
@@ -237,6 +238,16 @@ def main(argv):
             return EXIT_MERGE_VERIFY
         return finish(cfg, repo, into, branch, tree, merge, job_dir, [], common, unverified=True,
                       into_sha=into_sha, branch_sha=branch_sha)
+    if node_name:
+        try:
+            node = cfg.node(node_name)
+        except config.ConfigError as e:
+            print(e, file=sys.stderr)
+            return 2
+        if prof["name"] not in node["profiles"]:
+            print(i18n.t("integrate.node_profile", node=node_name, profile=prof["name"]), file=sys.stderr)
+            audit.record(cfg, "integrate", result="node_profile_refused", node=node_name, **common)
+            return 2
     try:
         mc = merged_commit(repo, tree, into_sha, branch_sha)
         if node_name:
@@ -275,7 +286,7 @@ def finish(cfg, repo, into, branch, tree, merge, job_dir, results, common, faile
     except DestMoved as e:
         print(e, file=sys.stderr)
         audit.record(cfg, "integrate", result="dest_moved", verified=not unverified, **extra, **common)
-        return EXIT_MERGE_CONFLICTS
+        return EXIT_DEST_MOVED
     except RuntimeError as e:
         print(i18n.t("integrate.git_failed", err=e), file=sys.stderr)
         return 2

@@ -40,14 +40,18 @@ def _end_age(meta, now=None):
     return max(0.0, (now or time.time()) - ended)
 
 
-def _branch_fetched(job_dir):
+def _branch_fetched(job_dir, meta=None):
     """Whether launch's branch fetch succeeded.
 
     ``launch._finish`` creates ``fetch.log`` for every fetch attempt and writes git's
     error output there on failure.  Thus an existing empty file is positive proof that
     the job branch was brought to the Mac.  A missing file is deliberately not enough.
+    When the meta carries ``FETCHED`` (newer launches), it must hold a sha as well; jobs
+    whose meta has no such key keep the old rule.
     """
     path = os.path.join(job_dir, "fetch.log")
+    if meta and "FETCHED" in meta and not re.fullmatch(r"[0-9a-f]{7,64}", meta["FETCHED"].strip()):
+        return False
     try:
         return os.path.isfile(path) and os.path.getsize(path) == 0
     except OSError:
@@ -77,7 +81,10 @@ def _channel(meta, node):
 def _lease_cmd(channel):
     """Read the remote lease and the node clock; missing lease has an empty stderr."""
     path = shlex.quote(f"{channel}/lease.json")
-    return f"cat {path} 2>/dev/null && echo && date +%s"
+    chan = shlex.quote(channel)
+    # rc 3: the directory is readable and has no lease; rc 4: cannot tell (unreadable directory)
+    return (f"if test -e {path}; then cat {path} && echo && date +%s; "
+            f"elif test -d {chan} && test -x {chan} && test -r {chan}; then exit 3; else exit 4; fi")
 
 
 def _lease_state(cfg, node, channel, meta):
@@ -87,9 +94,11 @@ def _lease_state(cfg, node, channel, meta):
         return None, (result.stderr or result.stdout or f"ssh rc={result.returncode}").strip()
     lease, age = remote.lease_age(result)
     if lease is None:
-        # `cat` returns 1 when this old job has no lease file.  Any other failure is
-        # ambiguous and must not authorize a delete.
-        return (False, None) if result.returncode == 1 else (None, (result.stderr or "").strip())
+        # rc 3 is the only proof of "no lease file" (old job).  Anything else (unreadable
+        # directory, permission denied on the file, garbage) must not authorize a delete.
+        if result.returncode == 3:
+            return False, None
+        return None, (result.stderr or "").strip() or f"lease unreadable (rc={result.returncode})"
     if lease.get("final"):
         return False, None
     try:
@@ -168,7 +177,7 @@ def clean(cfg, node_names=None, older_than_s=DEFAULT_OLDER_THAN_S, yes=False, ou
         age = _end_age(meta, now)
         if age is None or age < older_than_s:
             continue
-        if not _branch_fetched(job_dir):
+        if not _branch_fetched(job_dir, meta):
             continue
         channel = _channel(meta, nodes[node_name])
         if not channel:
