@@ -178,6 +178,26 @@ class NodeDaemon(Base):
         self.assertEqual(relevo.origin(self.cfg, REMOTE), work)
         self.assertEqual(git("log", "-1", "--format=%s"), "second")         # refreshed from the bare
 
+    def test_node_bare_without_head_uses_the_flow_branch_or_main(self):
+        # what delega leaves on a node: `git init --bare` (HEAD -> master, missing) plus pushed branches
+        bare = os.path.join(self.home, "delega", "api.git")
+        g = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True)
+        g("init", "-q", "--bare", "-b", "master", bare)
+        g("-C", bare, "fetch", "-q", self.seed, "+main:main", "+main:delega/x")
+        work = relevo.origin(self.cfg, REMOTE)
+        self.assertIsNotNone(work)
+        head = lambda: g("-C", work, "rev-parse", "HEAD").stdout.strip()
+        main = g("-C", bare, "rev-parse", "main").stdout.strip()
+        self.assertEqual(head(), main)
+        g("-C", self.seed, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "dev")
+        g("-C", bare, "fetch", "-q", self.seed, "+main:dev")
+        self.assertEqual(relevo.origin(self.cfg, REMOTE, "dev"), work)
+        self.assertNotEqual(head(), main)                                   # the flow's branch wins
+        for b in ("main", "dev"):
+            g("-C", bare, "update-ref", "-d", f"refs/heads/{b}")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(relevo.origin(self.cfg, REMOTE, "dev"))        # no base at all: refuse
+
     def test_without_relevo_node_the_mac_checkouts_are_used(self):
         self.assertIsNone(relevo.origin(config.Config({"profiles": {"p": {"owner": "self"}}}), REMOTE))
 

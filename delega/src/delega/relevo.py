@@ -118,10 +118,11 @@ def repo_basename(remote):
     return re.sub(r"\.git$", "", remote.strip().rstrip("/")).rsplit("/", 1)[-1].rsplit(":", 1)[-1]
 
 
-def origin(cfg, remote):
+def origin(cfg, remote, branch=None):
     """Checkout this node launches a flow's tasks from: `~/<workdir>/relevo/<repo>`, a plain clone of the
     node's bare `~/<workdir>/<repo>.git` (cloned from the remote when missing), with `origin` set to the
-    flow's remote and HEAD detached at the bare's HEAD, refreshed on every call. `launch` needs a working
+    flow's remote and HEAD detached at the flow's destination `branch` in the bare (else `main`, `master`
+    or the bare's HEAD), refreshed on every call. `launch` needs a working
     checkout: from a bare repo it would name the repo after its parent folder and have no HEAD to push.
     None when this is not a node's config (the Mac keeps its checkouts) or a git step fails."""
     name = node_name(cfg)
@@ -154,13 +155,17 @@ def origin(cfg, remote):
         if r.returncode != 0:
             shutil.rmtree(work, ignore_errors=True)
             return fail(r)
-    for step in (("-C", work, "remote", "set-url", "origin", remote),
-                 ("-C", work, "fetch", "-q", bare, "HEAD"),
-                 ("-C", work, "checkout", "-q", "--detach", "--force", "FETCH_HEAD")):
-        r = git(*step)
-        if r.returncode != 0:
-            return fail(r)
-    return work
+    r = git("-C", work, "remote", "set-url", "origin", remote)
+    if r.returncode != 0:
+        return fail(r)
+    for ref in [f"refs/heads/{b}" for b in (branch, "main", "master") if b] + ["HEAD"]:
+        r = git("-C", work, "fetch", "-q", bare, ref)
+        if r.returncode == 0:
+            break
+    else:
+        return fail(r)
+    r = git("-C", work, "checkout", "-q", "--detach", "--force", "FETCH_HEAD")
+    return work if r.returncode == 0 else fail(r)
 
 
 # ── asking Claude to decide ─────────────────────────────────────────────────────────────────────

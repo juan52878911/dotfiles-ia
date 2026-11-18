@@ -521,7 +521,7 @@ def _flow_env(cfg, client, fl):
     """The `wave.Env` of a flow: its repo checkout (the node's bare repo on a node, the local checkout
     of `[memoria.<org>].repos` on the Mac), never the cwd of the daemon; the origin must be the flow's repo."""
     from . import mem, wave
-    repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"])
+    repo = relevo.origin(cfg, fl["repo"], fl.get("rama_destino")) or _checkout(client.m, fl["repo"])
     if not repo:
         raise mem.MemError(i18n.t("tick.no_checkout", id=fl["id"], repo=fl["repo"]))
     wave.check_origin(repo, fl["repo"])
@@ -619,7 +619,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
         _reconcile_tasks(cfg, client, fl, by_flow.get(fl["id"], []))
         for t in client.ready(fl["id"]):
             ra = t.get("run_args") or {}
-            repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"], ra.get("_checkout"))
+            repo = relevo.origin(cfg, fl["repo"], fl.get("rama_destino")) or _checkout(client.m, fl["repo"], ra.get("_checkout"))
             if not repo:
                 print(i18n.t("tick.no_checkout", id=t["id"], repo=fl["repo"]), file=sys.stderr)
                 continue
