@@ -165,11 +165,44 @@ def _pid_alive(pid):
     return True
 
 
+def _git(repo_dir, *args):
+    r = subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def norm_repo(repo):
+    """`git@host:owner/name.git`, `https://host/owner/name` and `owner/name` -> `owner/name`."""
+    r = (repo or "").strip().rstrip("/")
+    if r.endswith(".git"):
+        r = r[:-4]
+    parts = [x for x in r.replace(":", "/").split("/") if x]
+    return "/".join(parts[-2:]).lower()
+
+
+def check_repo_dir(conn, flow, repo_dir):
+    """rc 2 (MemError) unless the `origin` of repo_dir is the repo of the flow."""
+    row = conn.execute("SELECT repo FROM flujos WHERE id = ?", (flow,)).fetchone()
+    if row is None:
+        raise mem.MemError(i18n.t("mem.unknown_flow", flow=flow))
+    rc, origin = _git(repo_dir, "remote", "get-url", "origin")
+    if rc != 0 or not origin or norm_repo(origin) != norm_repo(row["repo"]):
+        raise mem.MemError(i18n.t("wave.repo_mismatch", dir=repo_dir, origin=origin or "-", repo=row["repo"]))
+
+
+def check_profiles(conn, flow, org):
+    """A task whose profile belongs to another org than the base never runs from here."""
+    for t in _tasks(conn, flow):
+        po = mem._profile_org((t["run_args"] or {}).get("profile"))
+        if po and po != org:
+            raise mem.MemError(i18n.t("wave.profile_org", id=t["id"], org=po, base=org))
+
+
 class Env:
     """The real world: `delega run` in the background, the job directories, `delega integrate`."""
 
-    def __init__(self, repo_dir):
+    def __init__(self, repo_dir, org=None):
         self.repo_dir = os.path.abspath(repo_dir)
+        self.org = org
         self._cfg = None
 
     def cfg(self):
@@ -178,24 +211,56 @@ class Env:
             self._cfg = config.load()
         return self._cfg
 
+    def _wave_dir(self):
+        d = os.path.join(self.cfg().state_dir, "wave", self.org or "_")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _stem(self, task):
+        return f"{task.get('flujo', 'f')}-{task['id']}"
+
     def launch(self, task, brief, branch, flags):
-        """Start `delega run` detached. Returns the provisional job id `pend:<pid>:<stamp>`."""
+        """Start `delega run` detached. Returns the provisional job id `pend:<pid>:<stamp>`.
+        The brief goes to a file (`delega run` takes a path); the exit code of the run goes to
+        `<stem>.rc` (6 = node full: the task goes back to `pendiente`)."""
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - 5))
         env = dict(os.environ)
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        logdir = os.path.join(self.cfg().state_dir, "wave")
-        os.makedirs(logdir, exist_ok=True)
-        with open(os.path.join(logdir, f"{task['id']}.log"), "ab") as out:
-            p = subprocess.Popen([sys.executable, "-m", "delega", "run", self.repo_dir, brief,
-                                  "--branch", branch, *flags],
+        env["DELEGA_FROM_QUEUE"] = "1"          # a full node fails with rc 6 instead of queueing
+        wdir = self._wave_dir()
+        stem = self._stem(task)
+        brief_path = os.path.join(wdir, stem + ".md")
+        with open(brief_path, "w", encoding="utf-8") as f:
+            f.write(brief)
+        rcfile = os.path.join(wdir, stem + ".rc")
+        if os.path.exists(rcfile):
+            os.remove(rcfile)
+        cmd = [sys.executable, "-m", "delega", "run", self.repo_dir, brief_path, "--branch", branch, *flags]
+        with open(os.path.join(wdir, stem + ".log"), "ab") as out:
+            p = subprocess.Popen(["sh", "-c", '"$@"; echo $? > "$RCFILE"', "sh", *cmd],
                                  stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                 start_new_session=True, env=env, cwd=self.repo_dir)
+                                 start_new_session=True, env=dict(env, RCFILE=rcfile), cwd=self.repo_dir)
         return f"pend:{p.pid}:{stamp}"
 
+    def _fetched_sha(self, job_dir, jid, branch):
+        """The sha the job brought to this repo, or None if its fetch did not succeed."""
+        try:
+            with open(os.path.join(job_dir, "fetch.log"), encoding="utf-8") as f:
+                log = f.read().strip()
+        except OSError:
+            return None
+        rc, sha = _git(self.repo_dir, "rev-parse", "--verify", "-q", f"refs/delega/{jid}^{{commit}}")
+        if rc == 0 and sha:
+            return sha                         # the branch was open in a worktree: it came to the ref
+        if log:
+            return None                        # git said something: the fetch failed
+        rc, sha = _git(self.repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}")
+        return sha if rc == 0 and sha else None
+
     def job_state(self, task):
-        """Returns (state, job_id): state is running | ok | fail."""
-        from . import integrate, jobs, util
+        """Returns (state, job_id, sha): state is running | ok | fail | queued; sha only when ok."""
+        from . import jobs, util
         cfg = self.cfg()
         jid = task.get("job_id") or ""
         pend = jid.startswith("pend:")
@@ -209,13 +274,22 @@ class Env:
                 break
         if found is None:
             if pend and _pid_alive(pid):
-                return "running", jid
-            return "fail", jid
+                return "running", jid, None
+            try:
+                with open(os.path.join(self._wave_dir(), self._stem(task) + ".rc")) as f:
+                    if f.read().strip() == "6":
+                        return "queued", jid, None
+            except OSError:
+                pass
+            return "fail", jid, None
         real = jobs.job_id(found)
         if not util.read_meta(found).get("END"):
-            return "running", real
+            return "running", real, None
         summ = util.read_json(os.path.join(found, "summary.json"), {}) or {}
-        return ("ok" if summ.get("rc") == 0 else "fail"), real
+        if summ.get("rc") != 0:
+            return "fail", real, None
+        sha = self._fetched_sha(found, real, task.get("rama"))
+        return ("ok", real, sha) if sha else ("fail", real, None)
 
     def integrate(self, branch, into, node):
         cmd = [sys.executable, "-m", "delega", "integrate", self.repo_dir, branch, "--merge", "--into", into]
@@ -258,6 +332,14 @@ def _set(conn, org, task, estado, desde, force=False, **kw):
         return False
 
 
+def _sha_of(conn, flow, task):
+    """The sha the last job of the task brought (event `wave.sha`), or None."""
+    for e in reversed(mem.log_events(conn, limit=0, flow=flow)):
+        if e["que"] == "wave.sha" and e["datos"].get("tarea") == task:
+            return e["datos"].get("sha")
+    return None
+
+
 def _conflict_files(out):
     return [ln.strip() for ln in out.splitlines() if ln.startswith("  ")]
 
@@ -274,12 +356,24 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
     for t in _tasks(conn, flow):
         if t["estado"] not in ("lanzada", "arreglo"):
             continue
-        state, jid = env.job_state(t)
+        res = env.job_state(t)
+        state, jid = res[0], res[1]
+        sha = res[2] if len(res) > 2 else None
         if state == "running":
             if jid != t["job_id"]:
                 _set(conn, org, t["id"], t["estado"], t["estado"], job_id=jid)
             continue
+        if state == "queued":
+            # the node was full: `delega run` did not start (rc 6). Give the attempt back.
+            back = "pendiente" if t["estado"] == "lanzada" else (
+                "ok" if _sha_of(conn, flow, t["id"]) else "rojo")
+            if _set(conn, org, t["id"], back, t["estado"], force=True, job_id="",
+                    intentos=max(t["intentos"] - 1, 0)):
+                say(i18n.t("wave.requeued", id=t["id"]))
+            continue
         if state == "ok":
+            if sha:
+                _event(conn, "wave.sha", {"flujo": flow, "tarea": t["id"], "sha": sha})
             if t["estado"] == "arreglo":     # the fix job came back: arreglo -> lanzada -> ok
                 if not _set(conn, org, t["id"], "lanzada", "arreglo", job_id=jid, intentos=t["intentos"]):
                     continue
@@ -295,6 +389,29 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             if not _set(conn, org, t["id"], "rojo", "lanzada", job_id=jid):
                 continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="rojo"))
+
+    # 1b. a failed job: one retry as a fix, then a decision
+    inflight = sum(1 for t in _tasks(conn, flow) if t["estado"] in ("lanzada", "arreglo"))
+    for t in _tasks(conn, flow):
+        if t["estado"] != "rojo":
+            continue
+        if t["intentos"] >= 2:
+            if _set(conn, org, t["id"], "bloqueada", "rojo", error="failed twice"):
+                _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_repetido"})
+                say(i18n.t("wave.blocked", id=t["id"]))
+            continue
+        if inflight >= par:
+            continue
+        if not _set(conn, org, t["id"], "arreglo", "rojo", intentos=t["intentos"] + 1):
+            continue
+        brief = t["brief"] + "\n\n" + i18n.t("wave.retry_header")
+        flags = run_flags(t["run_args"], t["zona"])
+        if node and "node" not in t["run_args"]:
+            flags += ["--node", node]
+        jid = env.launch(t, brief, t["rama"], flags)
+        _set(conn, org, t["id"], "arreglo", "arreglo", job_id=jid)
+        inflight += 1
+        say(i18n.t("wave.retry_launched", id=t["id"]))
 
     tasks = _tasks(conn, flow)
     open_waves = sorted({t["ola"] for t in tasks if t["estado"] != "hecha"})
@@ -331,7 +448,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
     if not pending or any(t["estado"] != "ok" for t in pending):
         return 0
     for t in pending:
-        rc, out = env.integrate(t["rama"], into, node or (t["nodo"] if t["nodo"] != "auto" else None))
+        ref = _sha_of(conn, flow, t["id"]) or t["rama"]
+        rc, out = env.integrate(ref, into, node or (t["nodo"] if t["nodo"] != "auto" else None))
         if rc == 0:
             _set(conn, org, t["id"], "hecha", "ok")
             say(i18n.t("wave.merged", id=t["id"], into=into))
@@ -340,9 +458,12 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             flags = run_flags(t["run_args"], t["zona"])
             if node and "node" not in t["run_args"]:
                 flags += ["--node", node]
+            # integration found it red after the job said ok: ok -> arreglo is not a transition of mem,
+            # so it is forced, but only from `ok` (CAS). Claim first, launch only if this step won.
+            if not _set(conn, org, t["id"], "arreglo", "ok", force=True, intentos=t["intentos"] + 1):
+                return 0
             jid = env.launch(t, brief, t["rama"], flags)
-            # integration found it red after the job said ok: a manual correction (forzar)
-            _set(conn, org, t["id"], "arreglo", "ok", force=True, job_id=jid, intentos=t["intentos"] + 1)
+            _set(conn, org, t["id"], "arreglo", "arreglo", job_id=jid)
             say(i18n.t("wave.fix_launched", id=t["id"]))
             return 0
         elif rc == 7:
@@ -350,6 +471,9 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_tras_arreglo",
                                                "registro": out[-LOG_TAIL:]})
             say(i18n.t("wave.blocked", id=t["id"]))
+            return 0
+        elif rc == 11:      # the target moved (another job): retry on the next step
+            say(i18n.t("wave.retarget", id=t["id"], into=into))
             return 0
         elif rc == 8:
             files = _conflict_files(out)
@@ -423,7 +547,12 @@ def main(argv, env=None):
                 print(i18n.t("wave.planned", flow=flow, wave=wave, n=len(rows)))
             elif cmd == "step":
                 par = mem._number(vals.get("par", DEFAULT_PAR), "--par", int)
-                return step(conn, flow, env or Env(vals.get("repo-dir") or os.getcwd()), par=par,
+                check_profiles(conn, flow, org)
+                if env is None:
+                    repo_dir = vals.get("repo-dir") or os.getcwd()
+                    check_repo_dir(conn, flow, repo_dir)
+                    env = Env(repo_dir, org=org)
+                return step(conn, flow, env, par=par,
                             into=vals.get("into"), node=vals.get("node"), org=org)
             else:
                 tasks, lines = status_table(conn, flow)
