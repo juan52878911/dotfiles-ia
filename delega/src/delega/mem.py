@@ -45,7 +45,8 @@ Exit codes
     0  done
     2  usage or validation error (unknown order, unknown flow or task, a local path instead
        of a git remote, a missing or mismatched org, an unknown or invalid task transition)
-    9  the lease is held by someone else, or a compare-and-set found a different task state
+    9  the lease is held by someone else, its owner has a stale epoch, or a compare-and-set
+       found a different task state
    10  the database is busy or locked; the caller should retry
 
 Concurrency
@@ -62,7 +63,9 @@ Schema (`PRAGMA user_version`; the migration is idempotent, so `init` can be rep
     tareas   id, flujo, ola, brief, zona, deps, run_args, estado, intentos, job_id, nodo,
              rama, creado, actualizado             estado ∈ pendiente|lanzada|ok|rojo|arreglo|
              bloqueada|hecha; deps and run_args are JSON
-    leases   rol, dueno (stable owner id), vence_en, latido
+    leases   rol, dueno (stable owner id), vence_en, latido, epoca
+    meta     clave, valor                           the orchestration epoch is meta.epoca
+    owner_epochs dueno, epoca                       owners fenced by a promotion
     eventos  id, ts, quien, que, datos (JSON)      only INSERT (triggers)
 """
 import json
@@ -77,7 +80,7 @@ import time
 
 from . import i18n
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB_DIR = "~/.local/state/delega"
 DEFAULT_DB_TEMPLATE = DEFAULT_DB_DIR + "/memoria-{org}.db"
 BUSY_TIMEOUT_MS = 5000
@@ -88,7 +91,7 @@ DONE = "hecha"
 TRANSITIONS = {
     "pendiente": frozenset(("lanzada", "bloqueada")),
     "lanzada": frozenset(("ok", "rojo", "bloqueada")),
-    "ok": frozenset(("hecha",)),
+    "ok": frozenset(("hecha", "arreglo", "bloqueada")),
     "rojo": frozenset(("arreglo", "bloqueada")),
     "arreglo": frozenset(("lanzada", "bloqueada")),
     "bloqueada": frozenset(("pendiente",)),
@@ -98,7 +101,7 @@ EXIT_OK, EXIT_USAGE, EXIT_LEASE, EXIT_BUSY = 0, 2, 9, 10
 NET_FS = ("nfs", "nfs4", "cifs", "smbfs", "smb3", "sshfs", "webdav", "davfs", "afpfs", "9p",
           "ftpfs", "glusterfs", "ceph", "fuse.sshfs")
 
-SCHEMA_V1 = [
+SCHEMA = [
     """CREATE TABLE IF NOT EXISTS org (
         id      INTEGER PRIMARY KEY CHECK (id = 1),
         org     TEXT NOT NULL,
@@ -136,7 +139,16 @@ SCHEMA_V1 = [
         rol       TEXT PRIMARY KEY,
         dueno     TEXT NOT NULL,
         vence_en  REAL NOT NULL,
-        latido    REAL NOT NULL
+        latido    REAL NOT NULL,
+        epoca     INTEGER NOT NULL DEFAULT 1
+    )""",
+    """CREATE TABLE IF NOT EXISTS meta (
+        clave TEXT PRIMARY KEY,
+        valor TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS owner_epochs (
+        dueno TEXT PRIMARY KEY,
+        epoca INTEGER NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS eventos (
         id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -284,7 +296,12 @@ def connect(path, create=False):
 
 
 def migrate(conn):
-    """Create or update the schema. Idempotent: the version lives in `PRAGMA user_version`."""
+    """Create or update the schema. Idempotent: the version lives in `PRAGMA user_version`.
+
+    The orchestration epoch deliberately does not live in `user_version`: that is the schema
+    version. It is a row in `meta`, so promoting a copy can fence the previous owner without
+    pretending that the database schema changed.
+    """
     ver = conn.execute("PRAGMA user_version").fetchone()[0]
     if ver > SCHEMA_VERSION:
         raise MemError(i18n.t("mem.db_newer", ver=ver, want=SCHEMA_VERSION))
@@ -292,8 +309,12 @@ def migrate(conn):
         return ver
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for stmt in SCHEMA_V1:
+        for stmt in SCHEMA:
             conn.execute(stmt)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(leases)").fetchall()}
+        if "epoca" not in columns:
+            conn.execute("ALTER TABLE leases ADD COLUMN epoca INTEGER NOT NULL DEFAULT 1")
+        conn.execute("INSERT OR IGNORE INTO meta (clave, valor) VALUES ('epoca', '1')")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.execute("COMMIT")
     except Exception:
@@ -329,6 +350,32 @@ def _event(conn, que, datos=None, quien=None):
 def get_org(conn):
     row = conn.execute("SELECT org FROM org WHERE id = 1").fetchone()
     return row["org"] if row else None
+
+
+def _meta_value(conn, key, default=None):
+    """One value from the small key/value `meta` table."""
+    row = conn.execute("SELECT valor FROM meta WHERE clave = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _set_meta(conn, key, value):
+    conn.execute("INSERT INTO meta (clave, valor) VALUES (?,?) "
+                 "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor", (key, str(value)))
+
+
+def _remember_owner_epoch(conn, owner, value):
+    """Remember the oldest epoch seen for an owner; promotion uses it as a fencing token."""
+    conn.execute("INSERT INTO owner_epochs (dueno, epoca) VALUES (?,?) "
+                 "ON CONFLICT(dueno) DO UPDATE SET epoca = MIN(owner_epochs.epoca, excluded.epoca)",
+                 (owner, int(value)))
+
+
+def epoch(conn):
+    """Current orchestration epoch (1 until the first promotion)."""
+    try:
+        return int(float(_meta_value(conn, "epoca", "1")))
+    except (TypeError, ValueError):
+        return 1
 
 
 def init_db(conn, org):
@@ -478,6 +525,10 @@ def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=Non
         current = row["estado"]
         if desde is not None and current != desde:
             raise MemConflict(i18n.t("mem.state_conflict", expected=desde, current=current, task=task))
+        if current == "ok" and estado in ("arreglo", "bloqueada") and desde is None:
+            # An ok task can be reopened/blocked after integration, but only with an explicit
+            # compare-and-set: without it, a stale worker could silently undo a completed job.
+            raise MemError(i18n.t("mem.bad_transition", current=current, target=estado))
         if not force and current != estado and estado not in TRANSITIONS.get(current, frozenset()):
             raise MemError(i18n.t("mem.bad_transition", current=current, target=estado))
         new_attempts = row["intentos"] + (1 if estado == "lanzada" and current != estado else 0)
@@ -511,30 +562,49 @@ def _validate_ttl(ttl):
 
 def claim_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None, org=None):
     """Take (or renew) the lease of a role. The lease of another owner that has not expired is
-    never taken: the caller gets `estado = ocupada` and exit code 9."""
+    never taken: the caller gets `estado = ocupada` and exit code 9.
+
+    A lease records the epoch in which it was taken. After a promotion, the previous owner keeps
+    its old epoch and is refused (rc 9); a different new owner may take the role immediately.
+    """
     owner = owner or owner_id()
     ttl = _validate_ttl(ttl)
     now = time.time()
     vence = now + ttl
+    migrate(conn)
 
     def op(c):
         _check_org(c, org)
+        current = epoch(c)
+        fence = c.execute("SELECT epoca FROM owner_epochs WHERE dueno = ?", (owner,)).fetchone()
+        if fence is not None and int(fence["epoca"]) != current:
+            return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": 0,
+                    "epoca": int(fence["epoca"]), "epoca_actual": current}
         row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
         if row is None:
-            c.execute("INSERT INTO leases (rol, dueno, vence_en, latido) VALUES (?,?,?,?)",
-                      (rol, owner, vence, now))
-            _event(c, "lease.claim", {"rol": rol, "dueno": owner, "vence_en": vence})
-            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence}
+            c.execute("INSERT INTO leases (rol, dueno, vence_en, latido, epoca) VALUES (?,?,?,?,?)",
+                      (rol, owner, vence, now, current))
+            _remember_owner_epoch(c, owner, current)
+            _event(c, "lease.claim", {"rol": rol, "dueno": owner, "vence_en": vence, "epoca": current})
+            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence, "epoca": current}
+        row_epoch = int(row["epoca"] or 1)
         if row["dueno"] == owner:
+            if row_epoch != current:
+                return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": row["vence_en"],
+                        "epoca": row_epoch, "epoca_actual": current}
             c.execute("UPDATE leases SET vence_en = ?, latido = ? WHERE rol = ?", (vence, now, rol))
-            _event(c, "lease.renew", {"rol": rol, "dueno": owner, "vence_en": vence})
-            return {"rol": rol, "dueno": owner, "estado": "renovada", "vence_en": vence}
-        if row["vence_en"] <= now:
-            c.execute("UPDATE leases SET dueno = ?, vence_en = ?, latido = ? WHERE rol = ?",
-                      (owner, vence, now, rol))
-            _event(c, "lease.take", {"rol": rol, "dueno": owner, "vence_en": vence, "antes": row["dueno"]})
-            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence}
-        return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"]}
+            _remember_owner_epoch(c, owner, current)
+            _event(c, "lease.renew", {"rol": rol, "dueno": owner, "vence_en": vence, "epoca": current})
+            return {"rol": rol, "dueno": owner, "estado": "renovada", "vence_en": vence, "epoca": current}
+        if row_epoch < current or row["vence_en"] <= now:
+            c.execute("UPDATE leases SET dueno = ?, vence_en = ?, latido = ?, epoca = ? WHERE rol = ?",
+                      (owner, vence, now, current, rol))
+            _remember_owner_epoch(c, owner, current)
+            _event(c, "lease.take", {"rol": rol, "dueno": owner, "vence_en": vence, "antes": row["dueno"],
+                                     "epoca": current})
+            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence, "epoca": current}
+        return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"],
+                "epoca": row_epoch, "epoca_actual": current}
 
     return write(conn, op)
 
@@ -545,23 +615,36 @@ def heartbeat_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None, org=None):
     ttl = _validate_ttl(ttl)
     now = time.time()
     vence = now + ttl
+    migrate(conn)
 
     def op(c):
         _check_org(c, org)
+        current = epoch(c)
+        fence = c.execute("SELECT epoca FROM owner_epochs WHERE dueno = ?", (owner,)).fetchone()
+        if fence is not None and int(fence["epoca"]) != current:
+            return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": 0,
+                    "epoca": int(fence["epoca"]), "epoca_actual": current}
         row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
         if row is None:
             raise MemError(i18n.t("mem.lease_missing", rol=rol))
+        row_epoch = int(row["epoca"] or 1)
         if row["dueno"] == owner:
+            if row_epoch != current:
+                return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": row["vence_en"],
+                        "epoca": row_epoch, "epoca_actual": current}
             c.execute("UPDATE leases SET vence_en = ?, latido = ? WHERE rol = ?", (vence, now, rol))
-            _event(c, "lease.renew", {"rol": rol, "dueno": owner, "vence_en": vence})
-            return {"rol": rol, "dueno": owner, "estado": "renovada", "vence_en": vence}
-        if row["vence_en"] <= now:
-            c.execute("UPDATE leases SET dueno = ?, vence_en = ?, latido = ? WHERE rol = ?",
-                      (owner, vence, now, rol))
+            _remember_owner_epoch(c, owner, current)
+            _event(c, "lease.renew", {"rol": rol, "dueno": owner, "vence_en": vence, "epoca": current})
+            return {"rol": rol, "dueno": owner, "estado": "renovada", "vence_en": vence, "epoca": current}
+        if row_epoch < current or row["vence_en"] <= now:
+            c.execute("UPDATE leases SET dueno = ?, vence_en = ?, latido = ?, epoca = ? WHERE rol = ?",
+                      (owner, vence, now, current, rol))
+            _remember_owner_epoch(c, owner, current)
             _event(c, "lease.take", {"rol": rol, "dueno": owner, "vence_en": vence,
-                                     "antes": row["dueno"]})
-            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence}
-        return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"]}
+                                     "antes": row["dueno"], "epoca": current})
+            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence, "epoca": current}
+        return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"],
+                "epoca": row_epoch, "epoca_actual": current}
 
     return write(conn, op)
 
@@ -570,17 +653,28 @@ def release_lease(conn, rol, owner=None, org=None):
     """Give a lease back. The lease of another owner that has not expired is never released."""
     owner = owner or owner_id()
     now = time.time()
+    migrate(conn)
 
     def op(c):
         _check_org(c, org)
+        current = epoch(c)
+        fence = c.execute("SELECT epoca FROM owner_epochs WHERE dueno = ?", (owner,)).fetchone()
+        if fence is not None and int(fence["epoca"]) != current:
+            return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": 0,
+                    "epoca": int(fence["epoca"]), "epoca_actual": current}
         row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
         if row is None:
             return {"rol": rol, "estado": "nada"}
+        row_epoch = int(row["epoca"] or 1)
+        if row["dueno"] == owner and row_epoch != current:
+            return {"rol": rol, "dueno": owner, "estado": "epoca_vieja", "vence_en": row["vence_en"],
+                    "epoca": row_epoch, "epoca_actual": current}
         if row["dueno"] != owner and row["vence_en"] > now:
-            return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"]}
+            return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"],
+                    "epoca": row_epoch, "epoca_actual": current}
         c.execute("DELETE FROM leases WHERE rol = ?", (rol,))
-        _event(c, "lease.release", {"rol": rol, "dueno": row["dueno"]})
-        return {"rol": rol, "dueno": row["dueno"], "estado": "liberada"}
+        _event(c, "lease.release", {"rol": rol, "dueno": row["dueno"], "epoca": current})
+        return {"rol": rol, "dueno": row["dueno"], "estado": "liberada", "epoca": current}
 
     return write(conn, op)
 
@@ -677,6 +771,23 @@ def _owner(vals):
     if not owner:
         raise MemError(i18n.t("mem.owner_required"))
     return owner
+
+
+def _lease_failure(res, rol, as_json):
+    """Print the rc=9 answer for a held or epoch-fenced lease."""
+    if res.get("estado") == "epoca_vieja":
+        msg = i18n.t("mem.epoch_stale", rol=rol, owner=res.get("dueno") or "?",
+                     epoca=res.get("epoca") or 1, actual=res.get("epoca_actual") or 1)
+    else:
+        msg = i18n.t("mem.lease_held", rol=rol, owner=res.get("dueno") or "?",
+                     when=_stamp(res.get("vence_en") or 0))
+    payload = {"ok": False, "cmd": "lease", "rol": rol, "dueno": res.get("dueno"),
+               "vence_en": res.get("vence_en"), "estado": res.get("estado"),
+               "epoca": res.get("epoca"), "epoca_actual": res.get("epoca_actual"), "error": msg}
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False))
+    print(msg, file=sys.stderr)
+    return EXIT_LEASE
 
 
 def cmd_init(args, db, as_json):
@@ -806,15 +917,10 @@ def cmd_claim(args, db, as_json):
         res = claim_lease(conn, rol, ttl, owner=owner, org=org)
     finally:
         conn.close()
-    if res["estado"] == "ocupada":
-        msg = i18n.t("mem.lease_held", rol=rol, owner=res["dueno"], when=_stamp(res["vence_en"]))
-        if as_json:
-            print(json.dumps({"ok": False, "cmd": "claim", "rol": rol, "dueno": res["dueno"],
-                              "vence_en": res["vence_en"], "error": msg}, ensure_ascii=False))
-        print(msg, file=sys.stderr)
-        return EXIT_LEASE
+    if res["estado"] in ("ocupada", "epoca_vieja"):
+        return _lease_failure(res, rol, as_json)
     payload = {"ok": True, "cmd": "claim", "rol": rol, "dueno": res["dueno"], "estado": res["estado"],
-               "vence_en": res["vence_en"]}
+               "vence_en": res["vence_en"], "epoca": res.get("epoca")}
     key = {"tomada": "mem.lease_taken", "renovada": "mem.lease_renewed"}.get(res["estado"], "mem.lease_taken")
     _out(payload, [i18n.t(key, rol=rol, owner=res["dueno"], when=_stamp(res["vence_en"]))], as_json)
     return EXIT_OK
@@ -833,15 +939,10 @@ def cmd_heartbeat(args, db, as_json):
         res = heartbeat_lease(conn, rol, ttl, owner=owner, org=org)
     finally:
         conn.close()
-    if res["estado"] == "ocupada":
-        msg = i18n.t("mem.lease_held", rol=rol, owner=res["dueno"], when=_stamp(res["vence_en"]))
-        if as_json:
-            print(json.dumps({"ok": False, "cmd": "heartbeat", "rol": rol, "dueno": res["dueno"],
-                              "vence_en": res["vence_en"], "error": msg}, ensure_ascii=False))
-        print(msg, file=sys.stderr)
-        return EXIT_LEASE
+    if res["estado"] in ("ocupada", "epoca_vieja"):
+        return _lease_failure(res, rol, as_json)
     payload = {"ok": True, "cmd": "heartbeat", "rol": rol, "dueno": res["dueno"], "estado": res["estado"],
-               "vence_en": res["vence_en"]}
+               "vence_en": res["vence_en"], "epoca": res.get("epoca")}
     key = {"tomada": "mem.lease_taken_over", "renovada": "mem.lease_renewed"}.get(res["estado"], "mem.lease_taken")
     _out(payload, [i18n.t(key, rol=rol, owner=res["dueno"], when=_stamp(res["vence_en"]))], as_json)
     return EXIT_OK
@@ -871,14 +972,9 @@ def cmd_release(args, db, as_json):
         res = release_lease(conn, rol, owner=owner, org=org)
     finally:
         conn.close()
-    if res["estado"] == "ocupada":
-        msg = i18n.t("mem.lease_held", rol=rol, owner=res["dueno"], when=_stamp(res["vence_en"]))
-        if as_json:
-            print(json.dumps({"ok": False, "cmd": "release", "rol": rol, "dueno": res["dueno"],
-                              "vence_en": res["vence_en"], "error": msg}, ensure_ascii=False))
-        print(msg, file=sys.stderr)
-        return EXIT_LEASE
-    payload = {"ok": True, "cmd": "release", "rol": rol, "estado": res["estado"]}
+    if res["estado"] in ("ocupada", "epoca_vieja"):
+        return _lease_failure(res, rol, as_json)
+    payload = {"ok": True, "cmd": "release", "rol": rol, "estado": res["estado"], "epoca": res.get("epoca")}
     key = "mem.lease_released" if res["estado"] == "liberada" else "mem.lease_none"
     _out(payload, [i18n.t(key, rol=rol)], as_json)
     return EXIT_OK
@@ -973,15 +1069,58 @@ def _is_remote_dest(dest):
 
 
 def backup(conn, dest_file):
-    """Consistent copy of the open database into `dest_file` (sqlite's online backup = `.backup`)."""
+    """Consistent copy of the open database into `dest_file` (sqlite's online backup = `.backup`).
+
+    The copy records when it was made. Promotion uses that timestamp to find work that started
+    after the copy and must not be replayed from the stale snapshot.
+    """
     os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
-    if os.path.exists(dest_file):
-        os.remove(dest_file)
-    out = sqlite3.connect(dest_file)
+    out = sqlite3.connect(dest_file, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    out.row_factory = sqlite3.Row
+    out.isolation_level = None
     try:
+        copied_at = time.time()
         conn.backup(out)
+        migrate(out)
+        _set_meta(out, "copiado_en", repr(copied_at))
     finally:
         out.close()
+
+
+def _promoted_snapshot(main):
+    """(epoch, stale tasks, leases) of the current main database, without changing it."""
+    if not os.path.exists(main):
+        return 1, [], []
+    try:
+        conn = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0)
+    except sqlite3.Error:
+        return 1, [], []
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        current = 1
+        if "meta" in tables:
+            row = conn.execute("SELECT valor FROM meta WHERE clave = 'epoca'").fetchone()
+            if row:
+                try:
+                    current = int(float(row[0]))
+                except (TypeError, ValueError):
+                    pass
+        stale = []
+        if "tareas" in tables:
+            stale = [(r[0], r[1], float(r[2])) for r in conn.execute(
+                "SELECT id, estado, actualizado FROM tareas "
+                "WHERE estado IN ('lanzada','pendiente')").fetchall()]
+        leases = []
+        if "leases" in tables:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(leases)").fetchall()}
+            epoch_col = "epoca" if "epoca" in cols else "1"
+            leases = [tuple(r) for r in conn.execute(
+                f"SELECT rol, dueno, vence_en, latido, {epoch_col} FROM leases").fetchall()]
+        return current, stale, leases
+    except sqlite3.Error:
+        return 1, [], []
+    finally:
+        conn.close()
 
 
 def cmd_backup(args, db, as_json):
@@ -1019,9 +1158,9 @@ def cmd_backup(args, db, as_json):
 
 def cmd_promote(args, db, as_json):
     """`delega mem promote --from <copy> --yes [--db <main>]`: the copy becomes the main database.
-    The previous main is kept as `<main>.before-promote`; the leases are cleared so a daemon can take
-    over. Without --yes nothing is touched (rc 2)."""
-    import shutil
+    The previous main is kept as `<main>.before-promote`; the epoch is advanced so the previous
+    owner is fenced. Without --yes nothing is touched (rc 2)."""
+    import tempfile
     _, flags, vals = _parse(args, flags=("yes",), values=("from", "org"))
     org_arg = _org(vals, required=True)
     src = vals.get("from")
@@ -1035,7 +1174,13 @@ def cmd_promote(args, db, as_json):
         return EXIT_USAGE
     if src == main:
         raise MemError(i18n.t("mem.promote_same", path=main))
+    if network_fs(os.path.dirname(main) or "."):
+        raise MemError(i18n.t("mem.netfs", path=main, fs=network_fs(os.path.dirname(main) or ".")))
+    os.makedirs(os.path.dirname(main) or ".", exist_ok=True)
+
     conn = connect(src)                                  # refuses a missing file or a network filesystem
+    tmp = None
+    promoted = None
     try:
         if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise MemError(i18n.t("mem.promote_corrupt", path=src))
@@ -1044,29 +1189,91 @@ def cmd_promote(args, db, as_json):
             raise MemError(i18n.t("mem.promote_corrupt", path=src))
         if org != org_arg:
             raise MemError(i18n.t("mem.org_mismatch", org=org_arg, base=org))
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        migrate(conn)
+        copied_raw = _meta_value(conn, "copiado_en")
+        try:
+            copied_at = float(copied_raw)
+        except (TypeError, ValueError):
+            copied_at = os.path.getmtime(src)
+        current_epoch, current_tasks, current_leases = _promoted_snapshot(main)
+
+        # Build the promoted database in a temporary file through SQLite's backup API. The final
+        # write into main uses the same API, so an open connection and its WAL/SHM files stay valid.
+        fd, tmp = tempfile.mkstemp(prefix=".promote-", suffix=".db", dir=os.path.dirname(main) or ".")
+        os.close(fd)
+        promoted = sqlite3.connect(tmp, timeout=BUSY_TIMEOUT_MS / 1000.0)
+        promoted.row_factory = sqlite3.Row
+        promoted.isolation_level = None
+        conn.backup(promoted)
+        migrate(promoted)
+        source_epoch = epoch(promoted)
+        new_epoch = max(source_epoch, current_epoch) + 1
+        blocked = []
+
+        def prepare(c):
+            stale = {task_id: (state, updated) for task_id, state, updated in current_tasks}
+            # Also honor a timestamp carried by the copy itself (for a hand-made or older copy).
+            for row in c.execute(
+                    "SELECT id, estado, actualizado FROM tareas WHERE estado IN ('lanzada','pendiente')"
+            ).fetchall():
+                if float(row["actualizado"]) > copied_at:
+                    stale.setdefault(row["id"], (row["estado"], float(row["actualizado"])))
+            for task_id, (state, updated) in stale.items():
+                row = c.execute("SELECT id, flujo, estado FROM tareas WHERE id = ?", (task_id,)).fetchone()
+                if row is None or row["estado"] not in ("lanzada", "pendiente"):
+                    continue
+                now = time.time()
+                c.execute("UPDATE tareas SET estado = 'bloqueada', actualizado = ? WHERE id = ?",
+                          (now, task_id))
+                _event(c, "task.set", {"tarea": task_id, "flujo": row["flujo"], "estado": "bloqueada",
+                                       "estado_anterior": row["estado"], "motivo": "promote_desactualizada"})
+                _event(c, "necesita_decision", {"tarea": task_id, "flujo": row["flujo"],
+                                                "motivo": "promote_desactualizada", "copiado_en": copied_at,
+                                                "actualizado": updated})
+                blocked.append(task_id)
+            # The leases are released, but their owners keep a fencing token with the old epoch.
+            # A different new owner can take the role immediately; the old owner is refused.
+            for row in c.execute("SELECT dueno, epoca FROM leases").fetchall():
+                _remember_owner_epoch(c, row["dueno"], int(row["epoca"] or 1))
+            for rol, dueno, vence, latido, epoca in current_leases:
+                _remember_owner_epoch(c, dueno, int(epoca or 1))
+            c.execute("DELETE FROM leases")
+            _set_meta(c, "epoca", new_epoch)
+            _set_meta(c, "copiado_en", repr(time.time()))
+            _event(c, "mem.promote", {"desde": src, "anterior": main + ".before-promote" if os.path.exists(main)
+                                      else None, "epoca": new_epoch, "copiado_en": copied_at,
+                                      "bloqueadas": blocked})
+
+        write(promoted, prepare)
+
+        kept = None
+        if os.path.exists(main):
+            kept = main + ".before-promote"
+            old = connect(main)
+            try:
+                backup(old, kept)                         # consistent snapshot, including WAL data
+            finally:
+                old.close()
+        destination = sqlite3.connect(main, timeout=BUSY_TIMEOUT_MS / 1000.0)
+        destination.row_factory = sqlite3.Row
+        destination.isolation_level = None
+        try:
+            promoted.backup(destination)
+        finally:
+            destination.close()
     finally:
         conn.close()
-    if network_fs(os.path.dirname(main) or "."):
-        raise MemError(i18n.t("mem.netfs", path=main, fs=network_fs(os.path.dirname(main) or ".")))
-    os.makedirs(os.path.dirname(main) or ".", exist_ok=True)
-    kept = None
-    if os.path.exists(main):
-        kept = main + ".before-promote"
-        shutil.copy2(main, kept)
-    tmp = main + ".promoting"
-    shutil.copy2(src, tmp)
-    for ext in ("-wal", "-shm"):                         # a stale journal of the old main must not apply to the copy
-        if os.path.exists(main + ext):
-            os.remove(main + ext)
-    os.replace(tmp, main)
-    conn = connect(main)
-    try:
-        write(conn, lambda c: (c.execute("DELETE FROM leases"),
-                               _event(c, "mem.promote", {"desde": src, "anterior": kept})))
-    finally:
-        conn.close()
-    _out({"ok": True, "cmd": "promote", "org": org, "principal": main, "anterior": kept},
+        if promoted is not None:
+            promoted.close()
+        if tmp:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(tmp + suffix)
+                except FileNotFoundError:
+                    pass
+
+    _out({"ok": True, "cmd": "promote", "org": org, "principal": main, "anterior": kept,
+          "epoca": new_epoch, "bloqueadas": blocked},
          [i18n.t("mem.promoted", org=org, main=main)], as_json)
     return EXIT_OK
 

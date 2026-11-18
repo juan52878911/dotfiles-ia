@@ -9,7 +9,7 @@ from unittest import mock
 
 from launch_env import FAKES, LaunchCase, sh
 
-from delega import util
+from delega import jobs, util
 
 TOKEN = "tok-s3cret-123"
 OWNER = "tester"          # the orchestrator label of these tests ($DELEGA_OWNER)
@@ -52,10 +52,12 @@ account = "dev@example.com (token)"
 """
         super().write_config()
 
-    def fake_vm(self, name, job=None, lease_age=None, end=False, final=False, state=None, owner=OWNER):
+    def fake_vm(self, name, job=None, lease_age=None, end=False, final=False, state=None, owner=OWNER,
+                orchestrator="ours"):
         """A VM on the fake host (no golden home) and, with job, its job dir here and lease inside it.
-        With state, the state the host reports (starting, creating…); with owner, the `delega.owner`
-        label it carries (None: no label at all)."""
+        With state, the state the host reports (starting, creating…); with owner, the legacy
+        `delega.owner` label; with orchestrator, the canonical `delega.orch` label ("ours", another
+        name, or None for no label)."""
         import json
         import time
         reg = os.path.join(self.node_home, ".kling-vms")
@@ -63,8 +65,15 @@ account = "dev@example.com (token)"
         info = {}
         if state:
             info["state"] = state
+        labels = {}
         if owner:
-            info["labels"] = {"delega.owner": owner}
+            labels["delega.owner"] = owner
+        if orchestrator == "ours":
+            labels["delega.orch"] = jobs.orchestrator_label(self.state)
+        elif orchestrator:
+            labels["delega.orch"] = orchestrator
+        if labels:
+            info["labels"] = labels
         with open(os.path.join(reg, name), "w") as f:
             json.dump(info, f)
         if job:
@@ -310,7 +319,7 @@ class Kindling(KindlingCase):
         from delega import config, kindling
         self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
         self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
-        self.fake_vm("delega-20260101-000000-d")                                     # not a job of ours
+        self.fake_vm("delega-20260101-000000-d", state="frozen")                     # not a job of ours
         self.fake_vm("delega-20260101-000000-e", "20260101-000000-e", lease_age=3600)  # broker gone
         self.fake_vm("delega-20260101-000000-f", "20260101-000000-f", lease_age=1, final=True)  # finished
         cfg = config.load()
@@ -327,7 +336,7 @@ class Kindling(KindlingCase):
         from delega import config, jobs
         self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
         self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
-        self.fake_vm("delega-20260101-000000-d")
+        self.fake_vm("delega-20260101-000000-d", state="frozen")
         self.fake_vm("delega-20260101-000000-e", "20260101-000000-e", lease_age=3600)
         reg = os.path.join(self.node_home, ".kling-vms")
         before = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
@@ -353,9 +362,10 @@ class Kindling(KindlingCase):
 
         from delega import config, jobs
         self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
-        self.fake_vm("delega-20260101-000000-d", owner=OWNER)          # ours, but its job dir is gone
-        self.fake_vm("delega-20260101-000000-x", owner="trycore")      # another orchestrator's
-        self.fake_vm("delega-20260101-000000-y", owner=None)           # no label: it may be another's
+        self.fake_vm("delega-20260101-000000-d", owner=OWNER, state="frozen")  # ours, job dir is gone
+        self.fake_vm("delega-20260101-000000-x", owner="trycore", orchestrator="trycore", state="frozen")
+        self.fake_vm("delega-20260101-000000-y", owner=None, orchestrator=None, state="frozen")
+        self.fake_vm("delega-20260101-000000-z", owner=OWNER, orchestrator=None, state="frozen")
         reg = os.path.join(self.node_home, ".kling-vms")
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -366,11 +376,22 @@ class Kindling(KindlingCase):
         with contextlib.redirect_stdout(buf):
             self.assertEqual(jobs.gc(config.load(), yes=True), 2)       # only ours
         left = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
-        self.assertEqual(left, ["delega-20260101-000000-x", "delega-20260101-000000-y"])
+        self.assertEqual(left, ["delega-20260101-000000-x", "delega-20260101-000000-y",
+                                "delega-20260101-000000-z"])
         out = buf.getvalue()
         self.assertIn("another orchestrator (trycore)", out)
         self.assertIn("no owner label", out)
         self.assertEqual(out.count("deleted"), 2)      # only ours
+
+    def test_a_live_vm_of_another_orchestrator_counts_for_max_jobs(self):
+        from delega import config, kindling
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-b", orchestrator="other")
+        cfg = config.load()
+        res = kindling.probe(cfg, cfg.node("vm"), cfg.profile("work"))
+        self.assertFalse(res["ok"])
+        self.assertIn("max_jobs=2", res["reason"])
+        self.assertIn("2 delega VMs with a live job", res["reason"])
 
     def test_a_vm_being_set_up_counts_as_a_live_job(self):
         # two launches at once: the first VM is still being created. If it did not count, both would
@@ -389,7 +410,8 @@ class Kindling(KindlingCase):
         self.assertEqual(rc, 0, out + err)
         job = util.read_meta(self.job_dir())["VM"][len("delega-"):]
         # cap 10 min + grace 300 s + margin 30 min
-        self.assertIn(f"-ttl 45m -on-ttl freeze -label delega.job={job} -label delega.owner=tester -wait-ready",
+        self.assertIn(f"-ttl 45m -on-ttl freeze -label delega.job={job} -label delega.owner=tester "
+                      f"-label delega.orch={jobs.orchestrator_label(self.state)} -wait-ready",
                       self.kling_log())
 
     def cut_ssh_on_first_poll(self, how):

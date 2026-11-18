@@ -241,6 +241,7 @@
  "mem.db_missing": "there is no memory database at {path}: run `delega mem init --db {path} --org <org>`",
  "mem.db_newer": "the memory database has schema v{ver}, newer than this delega (v{want}): update delega",
  "mem.exported": "memory exported to {out}",
+ "mem.epoch_stale": "the lease '{rol}' belongs to {owner} at epoch {epoca}, but the memory is now at epoch {actual}: a promotion fenced that owner",
  "mem.flow_added": "flow {id} added ({repo})",
  "mem.flow_exists": "the flow '{id}' already exists",
  "mem.init_exists": "the memory at {path} was already initialized (org {org})",

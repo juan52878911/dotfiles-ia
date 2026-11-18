@@ -241,6 +241,7 @@
  "mem.db_missing": "no hay base de memoria en {path}: ejecuta «delega mem init --db {path} --org <org>»",
  "mem.db_newer": "la base de memoria tiene el esquema v{ver}, más nuevo que este delega (v{want}): actualiza delega",
  "mem.exported": "memoria exportada a {out}",
+ "mem.epoch_stale": "la lease «{rol}» es de {owner} en la época {epoca}, pero la memoria ya está en la época {actual}: una promoción vetó a ese dueño",
  "mem.flow_added": "flujo {id} añadido ({repo})",
  "mem.flow_exists": "el flujo «{id}» ya existe",
  "mem.init_exists": "la memoria en {path} ya estaba inicializada (org {org})",
