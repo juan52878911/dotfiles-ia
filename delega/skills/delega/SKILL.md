@@ -211,7 +211,7 @@ the Claude transcripts (`--preset claude-sessions`), use it instead of reading l
 ## Relevo: another team keeps orchestrating if the Mac falls
 
 - **Mac**: config with every profile, the daemon (`delega tick --daemon`) and the lease holder by default.
-- **Memory server** (CT 110 `orq@192.168.2.27` for personal): the org's SQLite, used with `ssh host delega mem … --json`.
+- **Memory server** (one small server per org, e.g. `orq@<host>`): the org's SQLite, used with `ssh host delega mem … --json`.
 - **Relevo node** (trycorepc / dev-trycore for Trycore, the CT for personal): `delega.pyz`, the wrapper
   `~/.local/bin/delega`, a config **derived** from the Mac's (one profile, its nodes, `[memoria.<org>]`, policy;
   no keychain `token_command`, nothing of other profiles) and its own daemon.

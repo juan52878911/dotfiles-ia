@@ -531,13 +531,13 @@ class Orgs(DaemonCase):
         m = self.cfg.memoria_for("trycore")
         self.assertTrue(m["local"])
         cfg = config.Config({"profiles": {"p": {"owner": "self"}},
-                             "memoria": {"personal": {"host": "orq@192.168.2.27", "path": "/x/m.db"}}})
+                             "memoria": {"personal": {"host": "orq@memoria.example", "path": "/x/m.db"}}})
         self.assertFalse(cfg.memoria_for("personal")["local"])
         self.assertEqual(cfg.resolve_org(), "personal")
 
     def test_remote_client_goes_through_ssh_json(self):
         cfg = config.Config({"profiles": {"p": {"owner": "self"}},
-                             "memoria": {"personal": {"host": "orq@192.168.2.27", "path": "/x/m.db"}}})
+                             "memoria": {"personal": {"host": "orq@memoria.example", "path": "/x/m.db"}}})
         calls = []
 
         def fake_run(argv, **k):

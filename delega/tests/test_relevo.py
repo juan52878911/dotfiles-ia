@@ -43,7 +43,7 @@ token_command = ["security", "find-generic-password", "-s", "claude-trycore-toke
 account = "dev@example.com (token)"
 config_dirs = { trycore = "~/.claude-trycore" }
 [nodes.ct110]
-ssh = "orq@192.168.2.27"
+ssh = "orq@memoria.example"
 profiles = ["personal"]
 token_command = ["security", "find-generic-password", "-s", "claude-personal", "-w"]
 [memoria.trycore]
@@ -51,7 +51,7 @@ host = "orq@db.example.com"
 path = "/srv/m.db"
 repos = { "acme/api" = "/Users/mac/api" }
 [memoria.personal]
-host = "orq@192.168.2.27"
+host = "orq@memoria.example"
 path = "/srv/p.db"
 """
 NODE = """
@@ -319,7 +319,7 @@ class Derived(Base):
         self.assertNotIn("security find-generic-password", text)
         self.assertNotIn("find-generic-password", text)
         self.assertNotIn("token_command", text)
-        self.assertNotIn("192.168.2.27", text)
+        self.assertNotIn("memoria.example", text)
         self.assertNotIn("/Users/mac", text)
         path = os.path.join(self.tmp.name, "derived.toml")
         with open(path, "w") as f:
@@ -334,7 +334,7 @@ class Derived(Base):
     def test_personal_config_for_the_ct(self):
         text, _ = relevo.derive_config(config.load(), "personal", "ct110")
         self.assertNotIn("trycore", text.lower())
-        self.assertIn("orq@192.168.2.27", text)
+        self.assertIn("orq@memoria.example", text)
         self.assertIn("budget", text)
 
     def test_leak_is_refused(self):
