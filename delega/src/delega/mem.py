@@ -231,6 +231,9 @@ def is_remote(repo):
 
 
 # ── the filesystem of the database (never a network filesystem) ──────────────
+_MOUNT_CACHE = None
+
+
 def mounts():
     """[(mount point, fs type)] of the mounted filesystems ([] if it cannot be read)."""
     out = []
@@ -243,17 +246,23 @@ def mounts():
         return out
     except OSError:
         pass
+    global _MOUNT_CACHE
+    if _MOUNT_CACHE is not None:          # sin /proc (macOS): `mount` una vez por proceso, no en cada conexión
+        return list(_MOUNT_CACHE)
     try:
         r = subprocess.run(["mount"], check=False, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+        text = r.stdout if isinstance(r.stdout, str) else ""
+    except Exception:                     # Popen sustituido, sin `mount`, tiempo agotado…: no hay datos
         return out
-    for line in (r.stdout or "").splitlines():
+    for line in text.splitlines():
         if " on " not in line:
             continue
         left, _, right = line.partition(" on ")
         opts = right.strip()
         fstype = opts.split("(")[-1].split(",")[0].strip() if "(" in opts else (opts.split() or [""])[0]
         out.append((left.strip(), fstype))
+    if r.returncode == 0 and out:
+        _MOUNT_CACHE = list(out)
     return out
 
 

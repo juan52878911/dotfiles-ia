@@ -203,6 +203,18 @@ CAP = {"has_data": False, "new": 9, "live": 0, "slots": 9}
 class Hardening(DaemonCase):
     """F7: reconciliation, waves, per-org files, migrated items, org of the profile, one escalation."""
 
+    def setUp(self):
+        super().setUp()
+        # en macOS mem.mounts() lanza `mount`, que estas pruebas contarían como un Popen más
+        p = mock.patch("delega.mem.mounts", lambda: [])
+        p.start()
+        self.addCleanup(p.stop)
+        # sin el `ws` real del equipo: si está en PATH, repo_match llama a `ws contexto` y estas pruebas lo contarían
+        path = os.pathsep.join([os.path.dirname(sys.executable), "/usr/bin", "/bin"])
+        e = mock.patch.dict(os.environ, {"PATH": path})
+        e.start()
+        self.addCleanup(e.stop)
+
     def cycle(self, client=None, launch=None, **extra):
         client = client or self.client("a")
         patches = [mock.patch("delega.quota.capacity", lambda cfg, name, **k: CAP),
