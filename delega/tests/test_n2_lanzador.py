@@ -46,6 +46,9 @@ class Base(DaemonCase):
                 f.write(body)
             os.chmod(p, os.stat(p).st_mode | stat.S_IXUSR)
         os.environ["PATH"] = bindir + os.pathsep + os.environ["PATH"]
+        home = os.path.join(r, "home")                 # the remote command puts $HOME/.local/bin first:
+        os.makedirs(home, exist_ok=True)               # a real delega there (the Mac) must not answer
+        os.environ["HOME"] = home
         os.environ["FAKE_STATE_hosta"] = self.state_a
         os.environ["FAKE_DOWN"] = ""
         os.environ["PYTHONPATH"] = SRC

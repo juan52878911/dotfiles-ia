@@ -140,7 +140,7 @@ def branch_pushes(cfg, prof):
             continue
         co = queue._checkout(client.m, fl["repo"])
         if not co:
-            print(f"{fl['repo']}: no checkout on this machine, branch not pushed", file=sys.stderr)  # TODO i18n
+            print(i18n.t("sync.branch_no_checkout", repo=fl["repo"]), file=sys.stderr)
             continue
         key = (relevo.repo_basename(fl["repo"]), fl.get("rama_destino") or "main")
         if key not in seen:
@@ -233,7 +233,7 @@ def main(argv):
                     print("  " + s)
                 if orch:
                     for _, repo, br, _co in pushes:
-                        print(f"  would push {br} -> {repo}.git")      # TODO i18n
+                        print(i18n.t("sync.branch_dry", branch=br, repo=repo))
                     from . import relevo
                     try:
                         relevo.derive_config(cfg, prof["name"], node["name"])
@@ -256,7 +256,8 @@ def main(argv):
                         pok, perr = push_branch(node, repo, br, co)
                     except (OSError, subprocess.SubprocessError) as e:
                         pok, perr = False, str(e)
-                    print(f"{node['name']}: {br} -> {repo}.git " + ("pushed" if pok else f"FAILED: {perr}"))  # TODO i18n
+                    print(i18n.t("sync.branch_pushed", node=node["name"], branch=br, repo=repo) if pok
+                          else i18n.t("sync.branch_failed", node=node["name"], branch=br, repo=repo, err=perr))
                     ok = ok and pok
             rc = rc or (0 if ok else 1)
     return rc
