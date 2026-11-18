@@ -18,6 +18,7 @@ COMMANDS = {
     "adopt":     ("jobs",      "re-attach to a remote job after the orchestrator died (waits for it)"),
     "recover":   ("jobs",      "close a remote job now: rc, branch (kling cp), scan, delete its VM"),
     "gc":        ("jobs",      "list / delete (--yes) delega VMs whose job ended or is unknown here"),
+    "clean":     ("clean",     "list / delete (--yes) old closed job directories on nodes"),
     "handoff":   ("handoff",   "draft a fresh brief to continue a job without --resume"),
     "scan":      ("scan",      "look for forbidden terms in a branch, a brief or a text"),
     "queue":     ("queue",     "queue a brief with a priority / list the queue"),
