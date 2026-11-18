@@ -14,18 +14,22 @@ delega.pyz. What comes back: the channel files and a bundle with the job branch.
 by `token_command` on this machine, goes through ssh stdin to the host and into the worker's
 environment with `kling exec -e`: it is never written to a disk, here, on the host or in the VM.
 """
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 
-from . import remote
+from . import remote, util
 
 DEFAULT_EGRESS = ["anthropic.com"]
 VM_PREFIX = "delega-"
 NOT_JOBS = ("delega-seed-", "delega-load-", "delega-bake-")   # seed sandboxes, volume loaders, data-golden bakes
+OWNER_LABEL = "delega.owner"     # legacy: the human/job owner
+ORCH_LABEL = "delega.orch"       # canonical orchestrator identity (a host can be shared)
 
 
 def is_kindling(node):
@@ -72,13 +76,110 @@ def read_token(node):
     return tok
 
 
-def live_vms(node):
-    """Number of delega VMs alive on the host, or None if it does not answer."""
+STATES = ("running", "frozen", "stopped", "failed", "starting", "creating", "created", "paused")
+TRANSIENT = ("starting", "creating", "created")   # the VM is still being set up: it is alive, not frozen
+LAUNCH_WINDOW_S = 900       # a VM whose job has no lease yet still counts this long (it is being set up)
+
+
+def host_vms(node):
+    """[(vm, state)] of the delega job VMs on the host (`kling ps`), or None if it does not answer."""
     r = remote.ssh(remote.host_node(node), "kling ps", timeout=30)
     if r.returncode != 0:
         return None
-    return sum(1 for line in r.stdout.splitlines()
-               if any(w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS) for w in line.split()))
+    out = []
+    for line in r.stdout.splitlines():
+        words = line.split()
+        for w in words:
+            if w.startswith(VM_PREFIX) and not w.startswith(NOT_JOBS):
+                out.append((w, next((x for x in words if x in STATES), "")))
+    return out
+
+
+def live_vms(node):
+    """Number of delega VMs on the host (alive or not), or None if it does not answer."""
+    vms = host_vms(node)
+    return None if vms is None else len(vms)
+
+
+def host_labels(node):
+    """{vm: {label: value}} of the delega VMs on the host (`kling ps -json`), {} if it does not answer.
+
+    A host can be shared by two orchestrators (the personal one and Trycore's on the same kling): the
+    `delega.orch` label says whose VM it is, so `gc` never deletes the other's.
+    """
+    r = remote.ssh(remote.host_node(node), "kling ps -json", timeout=30)
+    if r.returncode != 0:
+        return {}
+    try:
+        data = json.loads(r.stdout or "[]")
+    except ValueError:
+        return {}
+    out = {}
+    for mc in data if isinstance(data, list) else []:
+        if not isinstance(mc, dict):
+            continue
+        name = mc.get("name") or ""
+        if not name.startswith(VM_PREFIX) or name.startswith(NOT_JOBS):
+            continue
+        labels = mc.get("labels")
+        out[name] = labels if isinstance(labels, dict) else {}
+    return out
+
+
+def owner_of(labels, vm):
+    """The canonical `delega.orch` label of a VM ("" if it has none)."""
+    return (labels.get(vm) or {}).get(ORCH_LABEL) or ""
+
+
+def job_dir_of(cfg, vm):
+    """This machine's job dir for a VM `delega-<id>`, or None (job unknown to this state_dir)."""
+    from . import jobs
+    jid = vm[len(VM_PREFIX):]
+    return next((d for d in jobs.job_dirs(cfg) if jobs.job_id(d) == jid), None)
+
+
+def classify(cfg, node, vms):
+    """Split the host's delega VMs into (active, orphans). Active = a job of this state_dir without END
+    whose lease (read inside the VM) was renewed within `lease.stale_s`, or that is still being set up.
+    orphans = [(vm, why)], why: ended (job has END), unknown (no such job here), frozen (stopped by its
+    ttl, or by hand), stale (lease too old or final) or no_lease. Only ended and unknown are `gc`'s.
+    A VM that is still being set up (starting/creating/created) counts as active: two launches at the
+    same time must not pass `max_jobs` because the first one is not running yet."""
+    stale = float(cfg.policy("lease.stale_s"))
+    active, orphans = [], []
+    for vm, state in vms:
+        d = job_dir_of(cfg, vm)
+        meta = util.read_meta(d) if d else {}
+        if not d:
+            # The job belongs to another state dir/orchestrator. A running or starting VM still
+            # occupies the host, so it counts against max_jobs; only a stopped one is an orphan.
+            if state in TRANSIENT or state in ("running", ""):
+                active.append(vm)
+            else:
+                orphans.append((vm, "unknown"))
+            continue
+        if meta.get("END"):
+            orphans.append((vm, "ended"))
+            continue
+        if state in TRANSIENT:
+            active.append(vm)      # it is being set up: it counts, or two launches together would fit
+            continue
+        if state and state != "running":
+            orphans.append((vm, "frozen"))
+            continue
+        chan = meta.get("CHANNEL")
+        lease, age = remote.lease_age(remote.ssh(dict(node, vm=vm), remote.lease_cmd(chan), timeout=30)) \
+            if chan else (None, None)
+        if lease:
+            fresh = not lease.get("final") and age < stale
+            (active.append(vm) if fresh else orphans.append((vm, "stale")))
+            continue
+        try:
+            young = time.time() - os.path.getmtime(os.path.join(d, "meta")) < LAUNCH_WINDOW_S
+        except OSError:
+            young = False
+        (active.append(vm) if young else orphans.append((vm, "no_lease")))
+    return active, orphans
 
 
 def has_golden(node, repo):
@@ -92,15 +193,18 @@ def probe(cfg, node, profile, requires=()):
     res = {"ok": False, "reason": "", "fix": "", "kind": "", "email": node.get("account") or "",
            "compute": {}, "node": node["name"], "vms": None, "claude_version": None}
     a = remote.alias(node)
-    n = live_vms(node)
-    if n is None:
+    vms = host_vms(node)
+    if vms is None:
         res.update(kind="unreachable", reason=f"{a}: kling does not answer", fix=f"ssh {a} kling ps")
         return res
-    res["vms"] = n
+    active, orphans = classify(cfg, node, vms)
+    n = len(active)
+    res["vms"], res["orphans"] = n, orphans
     mx = node.get("max_jobs")
     if mx and n >= mx:
-        res.update(kind="resources", reason=f"{a}: {n} delega VMs alive (max_jobs={mx})",
-                   fix=f"ssh {a} kling ps  # kling rm the orphans")
+        extra = f"; orphans not counted: {', '.join(f'{v} ({w})' for v, w in orphans)}" if orphans else ""
+        res.update(kind="resources", reason=f"{a}: {n} delega VMs with a live job (max_jobs={mx}){extra}",
+                   fix=f"delega ps --all  # wait, or close finished jobs; then delega gc --node {node['name']}")
         return res
     for c in requires:
         res["compute"][c] = "unsupported"
@@ -111,13 +215,37 @@ def probe(cfg, node, profile, requires=()):
     return res
 
 
-def create(node, vm, image):
+def ttl_min(cfg, caps, profile=None, project=None):
+    """Lifetime of a job VM: the job's time cap + its grace + `kindling.ttl_margin_min`."""
+    cap = float(caps.get("DELEGA_JOB_MAX_MIN") or cfg.policy("job.max_min", profile, project))
+    grace = float(caps.get("DELEGA_JOB_GRACE_S") or cfg.policy("job.grace_s", profile, project)) / 60
+    return int(cap + grace + float(cfg.policy("kindling.ttl_margin_min", profile, project)) + 0.999)
+
+
+def create(node, vm, image, ttl=None, on_ttl="freeze", labels=None):
+    """`kling run` the job VM from `image`. With ttl (minutes) the host freezes it (or removes it,
+    on_ttl="remove": VMs with real data) when it runs out, whatever happens to this machine."""
     q = shlex.quote
     allow = ",".join(node.get("egress_allow", DEFAULT_EGRESS))
+    labels = dict(labels or {})
+    if ORCH_LABEL not in labels:
+        from . import config, jobs
+        try:
+            state_dir = config.load().state_dir
+        except config.ConfigError:
+            state_dir = os.environ.get("DELEGA_STATE_DIR") or "~/.local/state/delega"
+        labels[ORCH_LABEL] = jobs.owner_label(state_dir)
+    extra = f" -ttl {int(ttl)}m -on-ttl {q(on_ttl)}" if ttl else ""
+    extra += "".join(f" -label {q(f'{k}={v}')}" for k, v in labels.items())
     r = remote.ssh(remote.host_node(node), f"kling run -name {q(vm)} -from {q(image)} -egress allowlist "
-                                          f"-allow {q(allow)} -wait-ready",
+                                          f"-allow {q(allow)}{extra} -wait-ready",
                    timeout=int(node.get("create_timeout_s", 300)))  # sin reflink el clon copia el disco entero
     return remote.must(r, f"kling run {vm} from {image}")
+
+
+def no_room(err):
+    """`kling run` refused the VM for lack of host memory (the probe counts VMs, not MiB)."""
+    return "doesn't fit" in err
 
 
 def destroy(node, vm):
@@ -126,14 +254,22 @@ def destroy(node, vm):
                timeout=120)
 
 
-def push_head(repo_dir, node, chan, job_id, git=None):
-    """Bring this repo's HEAD into the VM checkout as refs/heads/delega-base-<id>. Only what HEAD has
-    on top of the golden's base travels (all of HEAD if it does not descend from it). Returns the ref."""
+CHUNK = 60 << 20     # kling cp refuses uploads over 64 MiB: a bigger bundle travels in pieces of this size
+
+
+def _git(repo_dir, *args):
+    return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True)
+
+
+def push_head(repo_dir, node, chan, job_id, git=None, refs=()):
+    """Bring this repo's HEAD into the VM checkout as refs/heads/delega-base-<id>, and each of `refs`
+    (local branches) as a branch of the same name. Only what the golden's base lacks travels: nothing
+    if a tip is an ancestor of the base, else the tip --not its merge-base with the base. A bundle over
+    CHUNK is cut in pieces and joined inside the VM. Returns the ref."""
     q, wt = shlex.quote, vm_repo(node)
     ref = f"delega-base-{job_id}"
     base = remote.must(remote.ssh(node, f"git -C {q(wt)} rev-parse {q(base_ref(node))}"),
                        "golden base ref").stdout.strip()
-    head = subprocess.run(["git", "-C", repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     setup = ""
     if git and git.get("user_email"):
         setup += f" && git -C {q(wt)} config user.email {q(git['user_email'])}"
@@ -141,22 +277,46 @@ def push_head(repo_dir, node, chan, job_id, git=None):
         setup += f" && git -C {q(wt)} config user.name {q(git['user_name'])}"
     if git and git.get("strip_trailers"):
         setup += " && " + remote.strip_trailers_hook(q(wt + "/.git"))
-    if head == base:
-        remote.must(remote.ssh(node, f"git -C {q(wt)} branch -f {q(ref)} {q(base)}{setup}"), "branch from golden")
-        return ref
-    anc = subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, "HEAD"],
-                         capture_output=True).returncode == 0
-    tmp = tempfile.mkdtemp(prefix="delega-")
-    bundle = os.path.join(tmp, "in.bundle")
-    try:
-        remote.must(subprocess.run(["git", "-C", repo_dir, "bundle", "create", "-q", bundle,
-                                    f"{base}..HEAD" if anc else "HEAD"], capture_output=True, text=True),
-                    "git bundle")
-        remote.must(remote.scp_to(node, bundle, f"{chan}/in.bundle"), "upload bundle")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    remote.must(remote.ssh(node, f"git -C {q(wt)} fetch -q \"$HOME\"/{q(chan + '/in.bundle')} "
-                                 f"+HEAD:refs/heads/{q(ref)}{setup}"), "git fetch bundle")
+    tips = [("HEAD", ref)] + [(f"refs/heads/{r}", r) for r in refs]
+    local, ship, excl = [], [], []        # local: the VM already has the commit; ship: goes in the bundle
+    for src, dst in tips:
+        sha = remote.must(_git(repo_dir, "rev-parse", "--verify", src + "^{commit}"), f"rev-parse {src}").stdout.strip()
+        if _git(repo_dir, "merge-base", "--is-ancestor", sha, base).returncode == 0 or sha == base:
+            local.append((sha, dst))
+            continue
+        ship.append((src, dst))
+        mb = _git(repo_dir, "merge-base", base, sha)
+        if mb.returncode == 0 and mb.stdout.strip():
+            excl.append(mb.stdout.strip())
+    cmds = [f"git -C {q(wt)} branch -f {q(dst)} {q(sha)}" for sha, dst in local]
+    if ship:
+        tmp = tempfile.mkdtemp(prefix="delega-")
+        bundle = os.path.join(tmp, "in.bundle")
+        try:
+            remote.must(subprocess.run(["git", "-C", repo_dir, "bundle", "create", "-q", bundle,
+                                        *[s for s, _ in ship], *(["--not", *dict.fromkeys(excl)] if excl else [])],
+                                       capture_output=True, text=True), "git bundle")
+            size = os.path.getsize(bundle)
+            if size <= CHUNK:
+                remote.must(remote.scp_to(node, bundle, f"{chan}/in.bundle"), "upload bundle")
+            else:
+                names = []
+                with open(bundle, "rb") as f:
+                    for i in range(0, size, CHUNK):
+                        part = f"{bundle}.part{i // CHUNK:04d}"
+                        with open(part, "wb") as o:
+                            o.write(f.read(CHUNK))
+                        names.append(os.path.basename(part))
+                        remote.must(remote.scp_to(node, part, f"{chan}/{names[-1]}"), "upload bundle")
+                        os.unlink(part)
+                joined = " ".join(q(f"{chan}/{n}") for n in names)
+                remote.must(remote.ssh(node, f"cd \"$HOME\" && cat {joined} > {q(chan + '/in.bundle')} && rm -f {joined}"),
+                            "join bundle")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        specs = " ".join(f"+{q(s)}:refs/heads/{q(d)}" for s, d in ship)
+        cmds.append(f"git -C {q(wt)} fetch -q \"$HOME\"/{q(chan + '/in.bundle')} {specs}")
+    remote.must(remote.ssh(node, " && ".join(cmds) + setup), "git fetch bundle")
     return ref
 
 

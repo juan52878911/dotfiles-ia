@@ -71,6 +71,169 @@ class IntegrateTest(OpsCase):
         self.assertIn("only the merge was checked", out)
 
 
+FAKES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes")
+
+
+class IntegrateMergeTest(OpsCase):
+    TOML = TOML.replace("{bundle}", "/nonexistent")
+
+    def setUp(self):
+        super().setUp()
+        self.node_home = os.path.join(self.root, "nodehome")
+        os.environ.update(DELEGA_SSH=os.path.join(FAKES, "ssh"), FAKE_NODE_HOME=self.node_home)
+        self.repo = self.make_repo(origin="https://example.com/acme/app.git")
+        self.job = self.make_job("20260101-000000-1111-x", {"BRANCH": "feat"})
+
+    def audit_last(self):
+        return json.loads(open(os.path.join(self.state, "audit.jsonl")).read().splitlines()[-1])
+
+    def log(self):
+        p = os.path.join(self.node_home, ".ssh.log")
+        return open(p).read() if os.path.exists(p) else ""
+
+    def test_green_on_node_merges_no_ff_and_exits_0(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.git(self.repo, "checkout", "-q", "main")
+        old = self.git(self.repo, "rev-parse", "main")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()[1:],
+                         [old, self.git(self.repo, "rev-parse", "feat")])   # real merge commit
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "b.txt")))
+        self.assertIn("test -f b.txt", self.log())                         # ran through ssh
+        bare = os.path.join(self.node_home, "delega", "repo.git")
+        self.assertEqual(self.git(bare, "worktree", "list").count("\n"), 0)  # temp worktree gone
+        self.assertEqual(self.git(bare, "branch", "--list", "delega-integrate/*"), "")
+        rec = self.audit_last()
+        self.assertEqual((rec["event"], rec["result"], rec["merge"]), ("integrate", "merged", True))
+
+    def test_sha_merges_that_commit_but_the_job_and_message_use_the_branch(self):    # finding 10
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        pinned = self.git(self.repo, "rev-parse", "feat")
+        self.commit_on(self.repo, "feat", "late.txt", "later\n", base="feat")     # the branch moved after the job
+        self.git(self.repo, "checkout", "-q", "main")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--sha", pinned, "--node", "box")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()[2], pinned)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "late.txt")))
+        self.assertIn("Merge branch 'feat'", self.git(self.repo, "log", "-1", "--format=%s", "main"))
+        self.assertEqual(self.audit_last()["job"], os.path.basename(self.job))
+        self.assertTrue(os.path.exists(os.path.join(self.job, "integrate.log")))
+
+    def test_red_verify_leaves_destination_and_exits_7(self):
+        self.commit_on(self.repo, "feat", "c.txt", "new\n")               # b.txt never appears
+        old = self.git(self.repo, "rev-parse", "main")
+        rc, out, _ = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 7, out)
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), old)
+        self.assertIn("FAIL", open(os.path.join(self.job, "integrate.log")).read())
+        self.assertEqual(self.audit_last()["result"], "verify_failed")
+
+    def test_conflict_leaves_destination_and_exits_8(self):
+        self.commit_on(self.repo, "feat", "a.txt", "mine\n")
+        self.commit_on(self.repo, "main", "a.txt", "theirs\n", base="main")
+        old = self.git(self.repo, "rev-parse", "main")
+        rc, out, _ = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 8)
+        self.assertIn("a.txt", out)
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), old)
+        self.assertEqual(self.audit_last()["result"], "conflicts")
+
+    def test_without_node_runs_local(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--into", "main")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.log(), "")                                   # no ssh at all
+        self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 3)
+
+    def test_dest_moved_during_verify_aborts_with_11_and_keeps_destination(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        def slow_verify(cfg, node, repo, sha, commands, timeout):
+            self.commit_on(self.repo, "main", "late.txt", "x\n", base="main")   # main advances meanwhile
+            return [(c, 0, 0.0) for c in commands]
+        with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        moved = self.git(self.repo, "rev-parse", "main")
+        self.assertEqual(rc, 11, out + err)
+        self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 2)  # no merge commit
+        self.assertTrue(os.path.exists(os.path.join(self.repo, "late.txt")))
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), moved)
+        self.assertEqual(self.audit_last()["result"], "dest_moved")
+
+    def test_dest_moved_when_not_checked_out_keeps_new_commits(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.git(self.repo, "checkout", "-q", "feat")                           # main is not the current branch
+        def slow_verify(cfg, node, repo, sha, commands, timeout):
+            self.git(self.repo, "update-ref", "refs/heads/main",
+                     self.git(self.repo, "commit-tree", "main^{tree}", "-p", "main", "-m", "late"))
+            return [(c, 0, 0.0) for c in commands]
+        with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 11, out + err)
+        self.assertEqual(self.git(self.repo, "log", "-1", "--format=%s", "main"), "late")
+
+    def test_node_of_another_profile_is_refused_before_any_push(self):
+        from delega import remote
+        self.write_config(TOML.replace("{bundle}", "/nonexistent")
+                          + '[nodes.other]\nssh = "other"\nprofiles = ["private"]\n'
+                          + '[profiles.private]\nowner = "self"\nnodes = ["other"]\n')
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        with mock.patch.object(remote, "ssh", side_effect=AssertionError("must not reach the node")):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "other")
+        self.assertEqual(rc, 2, out + err)
+        self.assertEqual(self.audit_last()["result"], "node_profile_refused")
+        self.assertFalse(os.path.exists(os.path.join(self.node_home, "delega", "repo.git")))
+
+    def test_remote_ref_cleaned_when_worktree_add_fails(self):
+        from delega import remote
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        real = remote.ssh
+        def flaky(node, cmd, **kw):
+            if "worktree add" in cmd:
+                return subprocess.CompletedProcess(cmd, 1, "", "boom")
+            return real(node, cmd, **kw)
+        with mock.patch.object(remote, "ssh", side_effect=flaky):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 2, out + err)
+        bare = os.path.join(self.node_home, "delega", "repo.git")
+        self.assertEqual(self.git(bare, "branch", "--list", "delega-integrate/*"), "")
+
+    def test_unreachable_cleanup_is_audited(self):
+        from delega import launch
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        with mock.patch.object(launch, "ssh_retry", side_effect=launch.NoContact(5, "down")):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        recs = [json.loads(l) for l in open(os.path.join(self.state, "audit.jsonl")).read().splitlines()]
+        self.assertTrue(any(r.get("result") == "cleanup_failed" for r in recs), recs)
+
+    def test_merge_without_verify_refused_unless_allowed(self):
+        repo = self.make_repo("plain")                                          # no project -> no verify
+        self.commit_on(repo, "feat", "b.txt", "new\n")
+        old = self.git(repo, "rev-parse", "main")
+        rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge")
+        self.assertEqual(rc, 7, out + err)
+        self.assertEqual(self.git(repo, "rev-parse", "main"), old)
+        rc, out, err = self.run_cli(integrate.main, repo, "feat", "--merge", "--allow-unverified")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotEqual(self.git(repo, "rev-parse", "main"), old)
+
+    def test_refuses_when_destination_open_in_other_worktree(self):
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.git(self.repo, "checkout", "-q", "feat")
+        other = os.path.join(self.root, "other-wt")
+        self.git(self.repo, "worktree", "add", "-q", other, "main")
+        old = self.git(self.repo, "rev-parse", "main")
+        rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("other-wt", err)
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), old)
+
+    def test_remote_worktree_names_carry_a_unique_suffix(self):
+        import re
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        self.run_cli(integrate.main, self.repo, "feat", "--node", "box")
+        self.assertTrue(re.search(r"integrate-[0-9a-f]{12}-[0-9a-f]{8}", self.log()), self.log())
+
 class SyncTest(OpsCase):
     def setUp(self):
         super().setUp()

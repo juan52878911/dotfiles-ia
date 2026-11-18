@@ -7,7 +7,10 @@ path the node config gives as vm_home): one cloned VM at a time. Inside a VM, ab
 root dir, except the home and the mounted volumes ($HOME/.kling-volumes/<name>). `exec` only passes the
 variables named with -e from the host environment, like the real one, and runs tests/fakes/kling-bin/
 fake-dbctl wherever the command says /usr/local/bin/delega-db. `save` copies a cloned VM back as a golden.
-Calls are logged to $HOME/.kling.log.
+`run` records -ttl/-on-ttl/-label in the machine file; `exec` cuts stdout at 8 MiB like the real one.
+`ps` prints the table (ID NAME STATE) or, with -json, the machines with their labels (as the real
+one does). $FAKE_KLING_NO_ROOM makes `run` refuse for lack of memory. Calls are logged to
+$HOME/.kling.log.
 """
 import json
 import os
@@ -21,6 +24,8 @@ reg = os.path.join(home, ".kling-vms")
 vols = os.path.join(home, ".kling-volumes")
 vmhome = os.environ["FAKE_KLING_VMHOME"]
 goldens = os.environ.get("FAKE_KLING_GOLDENS", os.path.join(home, ".kling-goldens"))
+MAX_OUTPUT = int(os.environ.get("FAKE_KLING_MAX_OUTPUT", 8 << 20))
+MAX_UPLOAD = int(os.environ.get("FAKE_KLING_MAX_UPLOAD", 64 << 20))   # real kling: 67108864 bytes
 DBCTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-dbctl")
 
 
@@ -44,6 +49,12 @@ def vm_info(n):
 def vm_save(n, info):
     with open(vm_file(n), "w") as f:
         json.dump(info, f)
+
+
+def vm_state(n):
+    """The state of a machine: what the file says, or frozen/running (the real kling knows more)."""
+    info = vm_info(n) or {}
+    return info.get("state") or ("frozen" if info.get("frozen") else "running")
 
 
 def root(n):
@@ -82,11 +93,20 @@ def mounts(a):
 
 def create(a):
     name = flag(a, "-name")
+    if os.environ.get("FAKE_KLING_NO_ROOM"):      # the host's memory is spent (max_jobs not reached)
+        print("error: doesn't fit: the microVM asks for 4096 MiB and the host only has 4037 MiB left",
+              file=sys.stderr)
+        return 1
     for m, v in mounts(a).items():
         if not os.path.isdir(os.path.join(vols, v)):
             print(f"kling: no volume {v}", file=sys.stderr)
             return 1
     info = {"mounts": mounts(a), "frozen": False}
+    if "-ttl" in a:
+        info.update(ttl=flag(a, "-ttl"), on_ttl=flag(a, "-on-ttl", "freeze"))
+    labels = [a[i + 1] for i, x in enumerate(a) if x == "-label"]
+    if labels:
+        info["labels"] = dict(x.split("=", 1) for x in labels)
     if "-from" in a:
         image = flag(a, "-from")
         src = os.path.join(goldens, image)
@@ -137,6 +157,11 @@ def cp(src, dst):
     if dn is None:
         sys.stdout.buffer.write(data)
         return 0
+    if dn and len(data) > MAX_UPLOAD:
+        print(f"kling: upload is over the {MAX_UPLOAD} byte limit", file=sys.stderr)
+        return 1
+    if dn:
+        log("up-bytes", str(len(data)), dst)
     out = vmap(dn, dp) if dn else dp
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "wb") as f:
@@ -172,7 +197,14 @@ def exec_(a):
     argv = [vargs(vm, x) for x in a[i + 1:]]
     cwd = vmap(vm, cwd) if cwd else (vmhome if info.get("home") else root(vm))
     os.makedirs(cwd, exist_ok=True)
-    return subprocess.run(argv, cwd=cwd, env=env).returncode
+    r = subprocess.run(argv, cwd=cwd, env=env, stdout=subprocess.PIPE)
+    out = r.stdout or b""
+    if len(out) > MAX_OUTPUT:      # like the real one: stdout is cut (-max-output, 8 MiB by default)
+        out = out[:MAX_OUTPUT]
+        print("kling: output truncated at the limit (-max-output)", file=sys.stderr)
+    sys.stdout.buffer.write(out)
+    sys.stdout.flush()
+    return r.returncode
 
 
 def main(a):
@@ -182,11 +214,14 @@ def main(a):
     cmd = a[0]
     if cmd == "ps":
         names = sorted(n for n in os.listdir(reg) if not n.endswith(".root"))
+        if "-json" in a:      # the real kling answers with the machines and their labels
+            print(json.dumps([{"id": n, "name": n, "state": vm_state(n),
+                               "labels": (vm_info(n) or {}).get("labels") or {}} for n in names]))
+            return 0
         if "-q" not in a:
             print("ID NAME STATE")
         for n in names:
-            st = "frozen" if (vm_info(n) or {}).get("frozen") else "running"
-            print(n if "-q" in a else f"x {n} {st}")
+            print(n if "-q" in a else f"x {n} {vm_state(n)}")
         return 0
     if cmd == "run":
         return create(a)

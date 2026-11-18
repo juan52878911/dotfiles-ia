@@ -56,6 +56,7 @@ To add a machine, run `nodes/linux.sh` on it (or `nodes/windows-wsl/` for a Wind
 |---|---|
 | `run` | launch a job (local or on a node) with caps, identity check and brief lint |
 | `ps` / `watch` / `say` / `adopt` | see, follow, talk to, and re-attach to jobs |
+| `recover` / `gc` | close a remote job now (branch via `kling cp`, VM deleted) / delete VMs left by closed jobs |
 | `nodes` / `doctor` | state of the nodes / pre-flight checklist with fixes |
 | `quota` | how many workers fit before the usage windows fill up |
 | `spend` | list-price cost by day, profile, project or orchestrator, against the budget |

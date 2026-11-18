@@ -261,9 +261,10 @@ class FailureTests(LaunchCase):
         self.new_job(id="20260101-000001-1", NODE="local", REPO="a", ZONE="x/*")
         self.new_job(id="20260101-000002-1", NODE="local", REPO="b", ZONE="y/*")
         rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local"])
-        self.assertEqual(rc, 5)
+        self.assertEqual(rc, 6)                       # full: queued, no job folder of its own
         self.assertIn("max_local_jobs", err)
-        self.assertClosed()
+        self.assertIn("queued as", err)
+        self.assertEqual(len(self.jobs_in_state()), 2)
 
     def test_remote_version_skew(self):
         os.environ["FAKE_VERSION_REMOTE"] = "3.0.1"
@@ -398,6 +399,7 @@ class RemoteRunTests(LaunchCase):
             self.assertTrue(os.path.exists(os.path.join(d, f)), f)
         self.assertEqual(sh("git", "-C", self.repo, "log", "--format=%s", "-1", meta["BRANCH"]), "stub work")
         self.assertIn(f"branch {meta['BRANCH']} fetched", out)
+        self.assertEqual(util.read_meta(d)["FETCHED"], sh("git", "-C", self.repo, "rev-parse", meta["BRANCH"]))  # finding 9
         self.assertIn("no forbidden terms", out)
         self.assertIn("RC=0", out)
         self.assertIn("final report", out)
@@ -462,6 +464,62 @@ class RemoteRunTests(LaunchCase):
         self.assertEqual(rc, 0, out + err)
         log = sh("git", "-C", self.repo, "log", "--format=%s", "delega/shared")
         self.assertEqual(log.splitlines()[0], "stub work")
+
+    def _first_round(self, branch="delega/shared"):
+        rc, out, err = self.run_cli(self.remote_args() + ["--branch", branch])
+        self.assertEqual(rc, 0, out + err)
+        time.sleep(1.1)   # job ids are per second + pid: keep them distinct
+        return self.job_dir()
+
+    def test_branch_of_an_ended_job_retires_its_worktree_and_goes_on(self):
+        first = self._first_round()
+        wt1 = os.path.join(self.node_home, util.read_meta(first)["CHANNEL"], "wt")
+        self.assertTrue(os.path.isdir(wt1))
+        os.environ["STUB_COMMIT_TEXT"] = "second round"
+        rc, out, err = self.run_cli(self.remote_args() + ["--branch", "delega/shared"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("retired", out)
+        self.assertFalse(os.path.isdir(wt1))
+
+    def test_branch_of_a_live_job_is_refused_with_5(self):
+        first = self._first_round()
+        util.add_meta(first, END="")          # the job is not over
+        wt1 = os.path.join(self.node_home, util.read_meta(first)["CHANNEL"], "wt")
+        rc, out, err = self.run_cli(self.remote_args() + ["--branch", "delega/shared", "--zone", "docs/*"])
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn("has not ended", err)
+        self.assertTrue(os.path.isdir(wt1))
+
+    def _open_locally(self, branch="delega/shared"):
+        wt = os.path.join(self.root, "local-wt")
+        sh("git", "-C", self.repo, "worktree", "add", "-q", wt, branch)
+        return wt
+
+    def test_branch_open_in_a_local_worktree_is_fast_forwarded(self):
+        self._first_round()
+        wt = self._open_locally()
+        before = sh("git", "-C", wt, "rev-parse", "HEAD")
+        os.environ["STUB_COMMIT_TEXT"] = "second round"
+        rc, out, err = self.run_cli(self.remote_args() + ["--branch", "delega/shared"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("fast-forwarded", out)
+        self.assertNotEqual(sh("git", "-C", wt, "rev-parse", "HEAD"), before)
+        self.assertEqual(sh("git", "-C", wt, "rev-parse", "HEAD"), sh("git", "-C", self.repo, "rev-parse", "delega/shared"))
+        self.assertEqual(read(os.path.join(wt, "result.txt")).strip(), "second round")
+
+    def test_branch_open_in_a_dirty_local_worktree_goes_to_a_ref_with_a_warning(self):
+        self._first_round()
+        wt = self._open_locally()
+        with open(os.path.join(wt, "result.txt"), "a") as f:
+            f.write("local edit\n")
+        before = sh("git", "-C", wt, "rev-parse", "HEAD")
+        os.environ["STUB_COMMIT_TEXT"] = "second round"
+        rc, out, err = self.run_cli(self.remote_args() + ["--branch", "delega/shared"])
+        self.assertEqual(rc, 0, out + err)
+        job = jobs.job_id(self.job_dir())
+        self.assertIn(f"refs/delega/{job}", err)
+        self.assertEqual(sh("git", "-C", wt, "rev-parse", "HEAD"), before)
+        self.assertEqual(sh("git", "-C", self.repo, "show", f"refs/delega/{job}:result.txt").strip(), "second round")
 
     def test_resume_returns_to_the_same_worktree(self):
         rc, out, err = self.run_cli(self.remote_args())
@@ -544,3 +602,40 @@ class RemoteRunTests(LaunchCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BehindOriginTests(LaunchCase):
+    def test_head_behind_origin_warns(self):
+        sh("git", "-C", self.repo, "commit", "-q", "--allow-empty", "-m", "newer")
+        sh("git", "-C", self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        sh("git", "-C", self.repo, "reset", "-q", "--hard", "HEAD~1")
+        rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("1 commit(s) behind origin/main", err)
+
+    def test_head_in_step_with_origin_is_quiet(self):
+        sh("git", "-C", self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local"])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("behind", err)
+
+
+class RecoverForceTests(LaunchCase):
+    def test_given_rc_is_used_and_not_waited_for(self):
+        from unittest import mock
+        d = self.new_job(NODE="box", CHANNEL="delega/jobs/J", BRANCH="", REPO="api")
+        with mock.patch.object(launch, "_finish", return_value=0) as fin, \
+                mock.patch.object(launch, "wait_for_rc", side_effect=AssertionError("waited")):
+            launch.wait_and_finish(self.cfg(), d, rc=launch.RC_BROKER_LOST)
+        self.assertEqual(fin.call_args[0][-1], launch.RC_BROKER_LOST)
+
+    def test_force_with_a_fresh_lease_and_no_rc_file_closes_instead_of_waiting(self):
+        from unittest import mock
+        d = self.new_job(NODE="box", CHANNEL="delega/jobs/J", BRANCH="", REPO="api")
+        fake = subprocess.CompletedProcess([], 1, "", "")          # no rc file
+        with mock.patch.object(remote, "ssh", return_value=fake), \
+                mock.patch.object(remote, "lease_age", return_value=({"final": False}, 1.0)), \
+                mock.patch.object(launch, "_finish", return_value=0) as fin, \
+                mock.patch.object(launch, "wait_for_rc", side_effect=AssertionError("waited")):
+            self.assertEqual(jobs.recover(self.cfg(), d, force=True), 0)
+        self.assertEqual(fin.call_args[0][-1], launch.RC_BROKER_LOST)

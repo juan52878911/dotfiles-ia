@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unittest
 
 try:
@@ -160,6 +161,36 @@ cap_usd = 1
         rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local", "--role", "poet"])
         self.assertEqual(rc, 2)
         self.assertIn("poet", err)
+
+
+class RoundsRuleTests(LaunchCase):
+    def earlier(self, n, branch="delega/x", hours_ago=1, cost=1.5):
+        t0 = time.time() - hours_ago * 3600
+        for i in range(n):
+            ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(t0 - i))
+            d = self.new_job(id=f"{ts}-{i}", NODE="local", BRANCH=branch, END="1")
+            with open(os.path.join(d, "summary.json"), "w") as f:
+                json.dump({"cost_usd": cost}, f)
+
+    def test_second_round_is_quiet_third_warns_with_cost(self):
+        self.earlier(1)
+        self.assertEqual(lint.check_rounds(self.cfg(), "delega/x"), [])
+        self.earlier(1, hours_ago=2)
+        (code, p), = lint.check_rounds(self.cfg(), "delega/x")
+        self.assertEqual((code, p["n"], p["cost"]), ("rounds", 3, "3.00"))
+
+    def test_other_branches_and_old_rounds_do_not_count(self):
+        self.earlier(2, branch="delega/other")
+        self.earlier(2, hours_ago=30)
+        self.assertEqual(lint.check_rounds(self.cfg(), "delega/x"), [])
+        self.assertEqual(lint.check_rounds(self.cfg(), ""), [])
+
+    def test_launch_prints_the_warning_and_goes_on(self):
+        self.earlier(2)
+        rc, _, err = self.run_cli([self.repo, self.brief, "--node", "local", "--branch", "delega/x"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("round 3 on branch delega/x", err)
+        self.assertIn("3.00 USD", err)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,15 @@ class Refused(Exception):
         self.rc, self.msg, self.event, self.fields = rc, msg, event, fields
 
 
+FULL_RC = 6
+
+
+class Full(Refused):
+    """No room on the node right now: nothing was started, the brief waits in the queue."""
+    def __init__(self, msg, **fields):
+        super().__init__(FULL_RC, msg, event="full", **fields)
+
+
 # ── optional collaborators (other modules; called through the documented contract) ──
 def _spend_total(cfg, day, profile=None, project=None):
     from . import spend
@@ -241,7 +250,7 @@ def _home(rel):
     return '"$HOME"/' + shlex.quote(rel)
 
 
-def build_run_sh(node, profile, caps, chan, wt, argv_claude):
+def build_run_sh(node, profile, caps, chan, wt, argv_claude, engine=None, pi_model=None):
     """run.sh for a node: exports caps, locale and the profile's config dir, runs the broker in the worktree
     (directly, or with the worker inside `docker run` when node.runner == "docker")."""
     py = node.get("python", "python3")
@@ -253,6 +262,14 @@ def build_run_sh(node, profile, caps, chan, wt, argv_claude):
         lines.append(f"export CLAUDE_CONFIG_DIR={_home(cd)}")
     lines.append(f"cd {_home(wt)} || {{ echo 99 > {_home(chan)}/rc; exit; }}")
     launcher = nodes.launcher_for(profile, node)
+    if engine == "pi":      # Pi runs on the host, never in the claude docker image
+        from .engines import pi as pi_engine
+        broker = f"PYTHONPATH={_home(pyz)} {shlex.quote(py)} -m delega.engines.pi"
+        worker = " ".join(shlex.quote(x) for x in pi_engine.pi_argv(pi_model))
+        lines.append(f"{broker} run {_home(chan)} {_home(chan + '/brief.md')} -- {worker}"
+                     f" < /dev/null 2>> {_home(chan)}/stderr.log")
+        lines.append(f"rc=$?; test -f {_home(chan)}/rc || echo $rc > {_home(chan)}/rc")
+        return "\n".join(lines) + "\n"
     if node.get("runner", "host") == "docker":
         image = node.get("docker_image")
         if not image:
@@ -290,58 +307,102 @@ def print_summary(job_dir, rc):
     print(res.get("result", ""))
 
 
-RC_NOT_STARTED, RC_BROKER_LOST = 98, 97
+RC_NOT_STARTED, RC_BROKER_LOST, RC_NO_CONTACT = 98, 97, 96
+SSH_DOWN = (255, 124)        # ssh could not reach the host / timed out: retry, never conclude anything
+
+
+class NoContact(Exception):
+    """The host did not answer after every retry. The job is left as it is (VM included)."""
+    def __init__(self, waited_s, err):
+        super().__init__(err)
+        self.waited_s, self.err = waited_s, err
+
+
+def retry_delays(cfg):
+    """Waits between ssh retries: retry_s doubling up to retry_max_s, `ssh.retries` of them."""
+    n, first, top = int(cfg.policy("ssh.retries")), float(cfg.policy("ssh.retry_s")), float(cfg.policy("ssh.retry_max_s"))
+    return [min(first * 2 ** i, top) for i in range(n)]
+
+
+def ssh_retry(cfg, node, cmd, timeout=30, delays=None):
+    """remote.ssh that retries while ssh itself fails (rc 255/124) and raises NoContact when it gives up.
+    A non-zero rc of the command (file missing, VM gone) is an answer and is returned as is."""
+    delays = retry_delays(cfg) if delays is None else delays
+    waited = 0.0
+    for i in range(len(delays) + 1):
+        r = remote.ssh(node, cmd, timeout=timeout)
+        if r.returncode not in SSH_DOWN:
+            return r
+        if i == len(delays):
+            break
+        print(t("launch.ssh_retry", host=remote.alias(node), n=i + 1, total=len(delays), s=int(delays[i]),
+                err=((r.stderr or "").strip().splitlines() or ["?"])[-1]), file=sys.stderr)
+        time.sleep(delays[i])
+        waited += delays[i]
+    raise NoContact(waited, ((r.stderr or "").strip().splitlines() or ["?"])[-1])
 
 
 def wait_for_rc(cfg, node, chan, poll_s, on_poll=None):
     """rc of the remote job. Never waits forever: if the broker shows no sign of life (no lease
     nor state file) within DELEGA_START_TIMEOUT_S → 98 (run.sh did not start); if its lease went
-    stale without an rc (broker killed, node rebooted) → 97. Transient ssh failures are retried."""
+    stale without an rc (broker killed, node rebooted) → 97. ssh failures are retried with growing
+    waits (`ssh.retries`, `ssh.retry_s`, `ssh.retry_max_s`); if the host stays silent → 96: nothing is
+    concluded about the worker, which may well be running."""
     q = shlex.quote(chan)
     start_timeout = float(os.environ.get("DELEGA_START_TIMEOUT_S", 180))
     stale = float(cfg.policy("lease.stale_s"))
     t0 = time.time()
-    while True:
-        if on_poll:
-            on_poll()
-        if remote.ssh(node, f"test -f {q}/rc", timeout=30).returncode == 0:
-            r = remote.ssh(node, f"cat {q}/rc", timeout=30)
-            try:
-                return int(r.stdout.strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                return 1
-        lease = remote.ssh(node, f"cat {q}/lease.json", timeout=30)
-        if lease.returncode == 0:
-            try:
-                d = json.loads(lease.stdout)
-                if not d.get("final") and time.time() - float(d.get("renewed", 0)) > stale:
+    try:
+        while True:
+            if on_poll:
+                on_poll()
+            if ssh_retry(cfg, node, f"test -f {q}/rc").returncode == 0:
+                r = ssh_retry(cfg, node, f"cat {q}/rc")
+                try:
+                    return int(r.stdout.strip().splitlines()[-1])
+                except (ValueError, IndexError):
+                    return 1
+            lease = ssh_retry(cfg, node, remote.lease_cmd(chan))
+            if lease.returncode == 0:
+                d, age = remote.lease_age(lease)      # by the node's clock, not this machine's
+                if d and not d.get("final") and age > stale:
                     return RC_BROKER_LOST
-            except ValueError:
-                pass
-        elif time.time() - t0 > start_timeout:
-            alive = remote.ssh(node, f"test -f {q}/state.json || test -f {q}/estado.json", timeout=30)
-            if alive.returncode != 0:
-                return RC_NOT_STARTED
-        time.sleep(poll_s)
+            elif time.time() - t0 > start_timeout:
+                alive = ssh_retry(cfg, node, f"test -f {q}/state.json || test -f {q}/estado.json")
+                if alive.returncode != 0:
+                    return RC_NOT_STARTED
+            time.sleep(poll_s)
+    except NoContact as e:
+        node.setdefault("_no_contact", (e.waited_s, e.err))
+        return RC_NO_CONTACT
 
 
-def wait_and_finish(cfg, job_dir, poll_s=None):
+def wait_and_finish(cfg, job_dir, poll_s=None, rc=None):
     """Remote job: wait for rc, copy the channel back, close the job, fetch the branch, scan, report.
-    Shared by `delega run` and `delega adopt`. Returns the worker's rc (9 on forbidden terms in the branch)."""
+    Shared by `delega run`, `delega adopt` and `delega recover` (which passes the rc it read: no wait).
+    Returns the worker's rc (9 on forbidden terms in the branch, 96 if the host stopped answering)."""
     meta = util.read_meta(job_dir)
     node = remote.job_node(cfg, meta)
+    given, rc = rc, None
     try:
-        return _finish(cfg, job_dir, meta, node, poll_s)
+        rc = _finish(cfg, job_dir, meta, node, poll_s, given)
+        return rc
     finally:
-        if node.get("vm") and not node.get("keep_vm"):
+        # without contact the VM (and the work in it) stays: `delega adopt`/`recover` closes it later
+        if node.get("vm") and not node.get("keep_vm") and rc != RC_NO_CONTACT:
             kindling.destroy(node, node["vm"])
 
 
-def _finish(cfg, job_dir, meta, node, poll_s):
+def _finish(cfg, job_dir, meta, node, poll_s, rc=None):
     chan = meta["CHANNEL"]
     poll_s = float(os.environ.get("DELEGA_WAIT_POLL_S", 20)) if poll_s is None else poll_s
     # the node cannot see this machine's Nod collector: its envelopes are pulled and forwarded from here
-    rc = wait_for_rc(cfg, node, chan, poll_s, on_poll=lambda: nod.pull_and_forward(cfg, job_dir, meta))
+    if rc is None:
+        rc = wait_for_rc(cfg, node, chan, poll_s, on_poll=lambda: nod.pull_and_forward(cfg, job_dir, meta))
+    else:
+        nod.pull_and_forward(cfg, job_dir, meta)
+    if rc == RC_NO_CONTACT:
+        return _disconnected(cfg, job_dir, meta, node)
     for f in COPY_BACK:
         remote.scp_from(node, f"{chan}/{f}", job_dir + "/")
     nod.forward(job_dir, meta, nod.job_terms(job_dir))
@@ -361,23 +422,53 @@ def _finish(cfg, job_dir, meta, node, poll_s):
     if branch and repo_dir and os.path.isdir(repo_dir):
         if node.get("vm"):
             ok, log = kindling.fetch_branch(repo_dir, node, chan, job_dir, branch)
+            source = os.path.join(job_dir, "out.bundle")
         else:
             ok, log = remote.fetch_branch(repo_dir, node, meta.get("REPO", ""), branch)
+            source = f"{remote.alias(node)}:{remote.bare_rel(node, meta.get('REPO', ''))}"
+        where, shown = None, branch
+        if not ok and remote.is_checked_out_error(log):
+            # the branch is open in a worktree here: git will not move it; bring it to refs/delega/<id>
+            ok, log2, where = remote.fetch_into(repo_dir, source, branch, job_id_of(job_dir),
+                                                None if node.get("vm") else remote._git_env())
+            log += log2
+            if ok and where == "ref":
+                shown = f"refs/delega/{job_id_of(job_dir)}"
         with open(os.path.join(job_dir, "fetch.log"), "w") as f:
             f.write(log)
         if ok:
-            last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", branch], capture_output=True,
+            last = subprocess.run(["git", "-C", repo_dir, "log", "--oneline", "-1", shown], capture_output=True,
                                   text=True).stdout.strip()
+            sha = subprocess.run(["git", "-C", repo_dir, "rev-parse", "--verify", "-q", f"{shown}^{{commit}}"],
+                                 capture_output=True, text=True).stdout.strip()
+            if sha:                           # wave/clean read this instead of guessing from fetch.log
+                util.add_meta(job_dir, FETCHED=sha)
             print(t("launch.branch.fetched", branch=branch, last=last))
+            if where == "merged":
+                print(t("launch.branch.merged", branch=branch))
+            elif where == "ref":
+                print(t("launch.branch.in_ref", branch=branch, ref=shown), file=sys.stderr)
             terms = _terms(profile.get("forbidden_terms_file"))
-            hits = _report_scan(repo_dir, branch, meta.get("BASE"), terms)
+            hits = _report_scan(repo_dir, shown, meta.get("BASE"), terms)
             _audit(cfg, "scan", job=job_id_of(job_dir), branch=branch, node=meta["NODE"],
                    result="hits" if hits else "clean" if terms else "no_terms",
                    dbs=meta.get("DBS") or None)
         else:
-            print(t("launch.branch.fetch_failed", branch=branch, log=os.path.join(job_dir, "fetch.log")))
+            first = next((x.strip() for x in log.splitlines() if x.strip()), "?")
+            print(t("launch.branch.fetch_failed", branch=branch, first=first, log=os.path.join(job_dir, "fetch.log")))
     print_summary(job_dir, rc)
     return 9 if hits and rc == 0 else rc
+
+
+def _disconnected(cfg, job_dir, meta, node):
+    """The host stopped answering: mark the job `disconnected` (no END) and say how to pick it up."""
+    waited, err = node.get("_no_contact", (0, "?"))
+    job = job_id_of(job_dir)
+    util.add_meta(job_dir, DISCONNECTED=int(time.time()))
+    _audit(cfg, "disconnected", job=job, node=meta.get("NODE"), vm=meta.get("VM") or None, err=err)
+    print(t("launch.disconnected", host=remote.alias(node), min=max(1, round(waited / 60)), err=err,
+            where=t("launch.disconnected.vm", vm=node["vm"]) if node.get("vm") else "", job=job), file=sys.stderr)
+    return RC_NO_CONTACT
 
 
 def _report_scan(repo_dir, branch, base, terms):
@@ -425,6 +516,8 @@ def build_parser():
     ap.add_argument("--mode", help="permission mode for the worker (default: policy permission_mode.default; "
                     "modes in permission_mode.deny are refused)")
     ap.add_argument("--model", help="model (default: the role's model, else the profile's)")
+    ap.add_argument("--engine", choices=("claude", "pi"), default="claude",
+                    help="worker engine (default claude); pi = `pi -p --mode json` (MiniMax), personal profiles only")
     ap.add_argument("--role", help="worker (default), reviewer, summarizer…: model and cost cap from [roles.<role>]; "
                     "a role with require_cap_usd is refused without --cap-usd")
     ap.add_argument("--worktree", metavar="NAME", help="local runs only: passed to claude --worktree")
@@ -443,6 +536,8 @@ def build_parser():
     ap.add_argument("--db-mode", choices=("auto", "golden", "volume"),
                     help="golden: clone the data golden (databases already loaded); volume: restore from the "
                     "dump volume; auto (default): golden while it is fresh")
+    ap.add_argument("--with-ref", action="append", default=[], metavar="BRANCH",
+                    help="kindling only: also send this local branch to the VM (repeatable)")
     ap.add_argument("--no-lint", action="store_true",
                     help="skip the brief checks (done-when, cap, report; branch, live run, text)")
     ap.add_argument("--over-budget", action="store_true", help="launch even if the daily budget is spent")
@@ -458,15 +553,25 @@ def main(argv):
     except _config.ConfigError as e:
         print(f"delega: {e}", file=sys.stderr)
         return 3
-    return Launch(cfg, args).run()
+    return Launch(cfg, args, argv).run()
+
+
+def queue_args(argv, args):
+    """`delega run` options of argv without the two positionals, to relaunch it from the queue."""
+    rest, pos = list(argv), [args.repo, args.brief]
+    for x in pos:
+        if x in rest:
+            rest.remove(x)
+    return rest
 
 
 class Launch:
-    def __init__(self, cfg, args):
-        self.cfg, self.args = cfg, args
+    def __init__(self, cfg, args, argv=None):
+        self.cfg, self.args, self.argv = cfg, args, list(argv or [])
         self.job_dir = None
         self.started = False
         self.vm = None          # kindling: node dict with the job's microVM, once created
+        self.pi_model = None
         self.dbs = []           # database specs the job gets (kindling only)
         self.budget = (0.0, 0.0)
 
@@ -477,9 +582,33 @@ class Launch:
                reason=e.msg[:200], rc=e.rc, **e.fields)
         return e.rc
 
+    def full(self, e):
+        """Host full: the job folder goes (nothing ran), the brief is queued once and `delega tick`
+        launches it when there is room. From the queue itself, or with queue.when_full = "fail", it
+        only fails, with the fix."""
+        _audit(self.cfg, e.event, reason=e.msg[:200], rc=e.rc, **e.fields)
+        if self.job_dir and os.path.isdir(self.job_dir):
+            import shutil
+            shutil.rmtree(self.job_dir, ignore_errors=True)
+        self.job_dir = None
+        a = self.args
+        rest = queue_args(self.argv, a)
+        if os.environ.get("DELEGA_FROM_QUEUE") or self.cfg.policy("queue.when_full") == "fail":
+            cmd = " ".join(shlex.quote(x) for x in ["delega", "queue", "add", a.repo, a.brief]
+                           + (["--", *rest] if rest else []))
+            print("ERROR: " + t("launch.full.fail", reason=e.msg, cmd=cmd), file=sys.stderr)
+            return e.rc
+        from . import queue
+        item, new = queue.add_once(self.cfg, a.repo, a.brief, run_args=rest)
+        print(t("launch.full.queued" if new else "launch.full.already", reason=e.msg, id=item["id"]),
+              file=sys.stderr)
+        return e.rc
+
     def run(self):
         try:
             return self._run()
+        except Full as e:
+            return self.full(e)
         except Refused as e:
             return self.fail(e)
         except _config.ConfigError as e:
@@ -515,6 +644,13 @@ class Launch:
         profile = cfg.profile(pname)
         project = cfg.project_for(repo_dir)
         pol = lambda k: cfg.policy(k, profile, project)
+        engine = a.engine or "claude"
+        if engine == "pi":
+            from .engines import pi as pi_engine
+            why = pi_engine.refuse_reason(profile, a.model)
+            if why:
+                raise Refused(REFUSED_RC, why)
+            self.pi_model = a.model        # explicit only: role/profile models are Claude's
         role = role_settings(cfg, profile, a.role or "worker")
         if a.role and role is None:
             raise Refused(REFUSED_RC, t("launch.err.role_unknown", role=a.role))
@@ -544,6 +680,7 @@ class Launch:
             if missing:
                 raise Refused(REFUSED_RC, t("launch.err.lint", missing="; ".join(t("launch.lint." + m) for m in missing)))
             found = lint.check_for(brief_text, cfg, profile, project, a.requires)
+            found += [("warn", c, p) for c, p in lint.check_rounds(cfg, a.branch)]
             for level, code, params in found:
                 print(t("launch.lint_rule." + level, msg=t("lint." + code, **params)), file=sys.stderr)
             if found:
@@ -558,6 +695,7 @@ class Launch:
         clash = zone_conflict(cfg, repo, zone)
         if clash:
             raise Refused(REFUSED_RC, t("launch.err.zone", job=os.path.basename(clash[0]), mine=clash[1], theirs=clash[2]))
+        self._warn_behind(repo_dir, a.branch)
         # 6. forbidden terms in the brief (never print what matched)
         terms = _terms(profile.get("forbidden_terms_file"))
         hits = _scan_text(brief_text, terms)
@@ -611,7 +749,7 @@ class Launch:
         # 9-11. identity, compute, version
         if node_name == "local":
             if not a.resume and jobs.live_counts(cfg, exclude=self.job_dir).get("local", 0) >= pol("max_local_jobs"):
-                raise Refused(5, t("launch.err.local_full", n=pol("max_local_jobs")))
+                raise Full(t("launch.err.local_full", n=pol("max_local_jobs")))
             p = nodes.local_probe(cfg, profile, a.requires)
             node = None
         else:
@@ -621,7 +759,9 @@ class Launch:
             p = nodes.probe(cfg, node, profile, a.requires)
             mx = node.get("max_jobs")
             if not a.resume and mx and jobs.live_counts(cfg, exclude=self.job_dir).get(node_name, 0) >= mx:
-                raise Refused(5, t("launch.err.node_full", node=node_name, n=mx))
+                raise Full(t("launch.err.node_full", node=node_name, n=mx))
+        if not p["ok"] and p["kind"] == "resources":
+            raise Full(t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
         if not p["ok"]:
             raise Refused(4 if p["kind"] == "identity" else 5,
                           t("launch.err.node_not_ok", node=node_name, reason=p["reason"], fix=p["fix"]))
@@ -631,6 +771,8 @@ class Launch:
                 raise Refused(5, t("launch.err.version", node=node_name, remote=p.get("claude_version"), local=lv))
         account = p.get("email") or ""
         caps = caps_env(cfg, profile, project, a)
+        if engine == "pi" and kindling.is_kindling(node):
+            raise Refused(REFUSED_RC, t("engine.pi.no_kindling", node=node_name))
         argv_claude = claude_args(mode, a.resume, a.model or profile.get("model"),
                                   None if node else a.worktree)
         util.add_meta(self.job_dir, ACCOUNT=account, CLAUDE_VERSION=p.get("claude_version") or "",
@@ -646,6 +788,17 @@ class Launch:
         if kindling.is_kindling(node):
             return self._run_kindling(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude)
         return self._run_remote(profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude, prev)
+
+    def _warn_behind(self, repo_dir, branch):
+        """Only HEAD travels to the node: say so when origin/<branch> has commits HEAD does not."""
+        if not _is_git(repo_dir):
+            return
+        b = branch or _git(repo_dir, "rev-parse", "--abbrev-ref", "HEAD")
+        if not b or b == "HEAD" or not _git(repo_dir, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{b}"):
+            return
+        n = _git(repo_dir, "rev-list", "--count", f"HEAD..refs/remotes/origin/{b}")
+        if n and n.isdigit() and int(n) > 0:
+            print(t("launch.warn.behind", n=n, branch=b), file=sys.stderr)
 
     # -- node choice
     def _choose_node(self, profile, node_opt, requires, prev, repo=None):
@@ -683,7 +836,12 @@ class Launch:
                owner=util.read_meta(self.job_dir).get("OWNER"))
         print(t("launch.start", dir=self.job_dir, node="local", owner=util.read_meta(self.job_dir).get("OWNER"),
                 id=job_id))
-        argv = broker_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] + profile["launcher"] + argv_claude
+        if a.engine == "pi":
+            from .engines import pi as pi_engine
+            argv = pi_engine.runner_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] \
+                + pi_engine.pi_argv(self.pi_model)
+        else:
+            argv = broker_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] + profile["launcher"] + argv_claude
         self.started = True
         rc = subprocess.run(argv, cwd=repo_dir, env=env, stdin=subprocess.DEVNULL).returncode
         util.add_meta(self.job_dir, END=int(time.time()))
@@ -724,6 +882,7 @@ class Launch:
             if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
                 print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
             remote.push_head(repo_dir, node, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
+            self._free_branch(node, repo, branch)
             wt = remote.make_worktree(node, repo, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha)
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
@@ -735,7 +894,7 @@ class Launch:
         caps = dict(caps, DELEGA_BRANCH=branch)
         remote.must(remote.scp_to(node, self._context(profile, project, name, branch, account, caps),
                                   f"{chan}/context.md"), "upload context.md")
-        run_sh = build_run_sh(node, profile, caps, chan, wt, argv_claude)
+        run_sh = build_run_sh(node, profile, caps, chan, wt, argv_claude, a.engine, self.pi_model)
         local_sh = os.path.join(self.job_dir, "run.sh")
         with open(local_sh, "w") as f:
             f.write(run_sh)
@@ -751,6 +910,20 @@ class Launch:
         return wait_and_finish(cfg, self.job_dir)
 
     # -- kindling: one ephemeral microVM per job
+    def _free_branch(self, node, repo, branch):
+        """`--branch` on a branch another worktree of the node still has open: retire that worktree when its
+        job has ended, refuse (rc 5) when the job is alive or unknown."""
+        holder = remote.worktree_holder(node, repo, branch)
+        if not holder:
+            return
+        holder_job = os.path.basename(os.path.dirname(holder.rstrip("/")))
+        for d in jobs.job_dirs(self.cfg):
+            if jobs.job_id(d) == holder_job and util.read_meta(d).get("END"):
+                remote.remove_worktree(node, repo, holder)
+                print(t("launch.worktree.retired", job=holder_job, branch=branch))
+                return
+        raise Refused(5, t("launch.err.branch_in_use", branch=branch, job=holder_job, path=holder))
+
     def _run_kindling(self, profile, project, node, repo_dir, repo, job_id, account, caps, argv_claude):
         cfg, a = self.cfg, self.args
         if a.resume:
@@ -775,7 +948,15 @@ class Launch:
         util.add_meta(self.job_dir, VM=vm, GOLDEN=image)
         node = dict(node, vm=vm)
         t0 = time.time()
-        kindling.create(node, vm, image)
+        # the host freezes the VM past cap + grace + margin even if this machine dies; real data is removed instead
+        try:
+            kindling.create(node, vm, image, ttl=kindling.ttl_min(cfg, caps, profile["name"], project),
+                            on_ttl="remove" if self.dbs else "freeze",
+                            labels={"delega.job": job_id, "delega.owner": util.read_meta(self.job_dir).get("OWNER") or "?"})
+        except remote.RemoteError as e:
+            if kindling.no_room(str(e)):      # the host's memory, not max_jobs: same as a full node
+                raise Full(str(e).strip().splitlines()[0][:300])
+            raise
         self.vm = node
         dbrecs = []
         if self.dbs:
@@ -800,7 +981,11 @@ class Launch:
         if _git(repo_dir, "status", "--porcelain", "--untracked-files=no"):
             print(t("launch.warn.dirty", dir=repo_dir, sha=_git(repo_dir, "rev-parse", "--short", "HEAD")))
         remote.must(remote.ssh(node, f"mkdir -p {shlex.quote(chan)}"), "mkdir channel")
-        kindling.push_head(repo_dir, node, chan, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"))
+        for r in a.with_ref:
+            if not _git(repo_dir, "rev-parse", "--verify", "-q", f"refs/heads/{r}^{{commit}}"):
+                raise Refused(REFUSED_RC, t("kindling.err.with_ref", ref=r))
+        kindling.push_head(repo_dir, node, chan, job_id, cfg.projects.get(cfg.project_for(repo_dir) or "", {}).get("git") or profile.get("git"),
+                           refs=a.with_ref)
         wt = kindling.make_worktree(node, job_id, branch)
         util.add_meta(self.job_dir, CHANNEL=chan, BRANCH=branch, WORKTREE=wt, PYZ_SHA=sha, ACCOUNT=node.get("account", ""),
                       CLAUDE_VERSION=vv or "")

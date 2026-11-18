@@ -12,7 +12,7 @@ try:
 except ImportError:  # run from inside tests/
     from launch_env import LaunchCase
 
-from delega import jobs, util
+from delega import jobs, launch, remote, util
 
 
 def write(path, text):
@@ -279,3 +279,30 @@ class WatchTests(LaunchCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoverWaiterTests(LaunchCase):
+    def setUp(self):
+        super().setUp()
+        self.d = self.new_job(NODE="box", CHANNEL="delega/jobs/J", BRANCH="", REPO="api")
+        self.waiter = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(self.waiter.wait)
+        self.addCleanup(self.waiter.kill)
+        write(os.path.join(self.d, "waiter.pid"), str(self.waiter.pid))
+
+    def test_live_adopt_waiter_blocks_recover(self):
+        from unittest import mock
+        with mock.patch.object(remote, "ssh", side_effect=AssertionError("touched the node")):
+            rc, _, err = captured(jobs.recover, self.cfg(), self.d)
+        self.assertEqual(rc, 2)
+        self.assertIn(str(self.waiter.pid), err)
+        self.assertEqual(open(os.path.join(self.d, "waiter.pid")).read(), str(self.waiter.pid))
+
+    def test_force_takes_over_the_waiter(self):
+        from unittest import mock
+        fake = subprocess.CompletedProcess([], 0, "0\n", "")
+        with mock.patch.object(remote, "ssh", return_value=fake), \
+                mock.patch.object(launch, "wait_and_finish", return_value=0):
+            rc, _, _ = captured(jobs.recover, self.cfg(), self.d, True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(open(os.path.join(self.d, "waiter.pid")).read(), str(os.getpid()))

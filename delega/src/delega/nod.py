@@ -228,7 +228,7 @@ def job_fields(channel):
             "branch": os.environ.get("DELEGA_BRANCH") or meta.get("BRANCH") or None}
 
 
-def channel_emit(channel, type_, data, terms=()):
+def channel_emit(channel, type_, data, terms=(), ts=None):
     """Broker side: append one envelope to <channel>/nod.jsonl; on this machine also forward it."""
     if not enabled():
         return None
@@ -240,7 +240,7 @@ def channel_emit(channel, type_, data, terms=()):
         job = base["job"]
         env = _append_numbered(os.path.join(channel, "nod.jsonl"),
                                lambda seq: envelope(type_, data, job=job, profile=base["profile"], run=run_id(job),
-                                                    seq=seq, machine=base["node"] if not _is_local() else None))
+                                                    seq=seq, ts=ts, machine=base["node"] if not _is_local() else None))
         if _is_local():
             forward(channel)
         return env
@@ -273,7 +273,8 @@ def decision_request(channel, kind, text, answer_wait_s, terms=(), recommendatio
     rec = recommendation or recommendation_in(text)
     if rec:
         data["recommendation"] = rec
-    return channel_emit(channel, "decision.request", data, terms)
+    # same instant for ts and deadline: two clock reads made deadline - ts drift by a ms
+    return channel_emit(channel, "decision.request", data, terms, ts=now_ms)
 
 
 def recommendation_in(text):

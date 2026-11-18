@@ -25,8 +25,11 @@ commands) and is reached through `delega <command>` (`src/delega/__main__.py`).
   cloned from `golden` (default `claude-{repo}`; built with `nodes/kindling/golden.sh`). Its channel,
   pyz and checkout (`vm_repo`, default `wt`) live inside the VM; `remote.ssh/scp_*` reach them through
   `kling exec`/`kling cp` when the node dict carries `vm` (`remote.job_node(cfg, meta)` adds it from
-  meta `VM`). HEAD travels as a bundle on top of `golden_base_ref`, the branch comes back as a bundle,
-  and the VM is removed when the job ends (`keep_vm` to keep it). The token comes from
+  meta `VM`). HEAD travels as a bundle on top of `golden_base_ref`, the branch comes back as a bundle
+  (a file, through `kling cp`: never stdout, which `kling exec` cuts at 8 MiB), and the VM is removed
+  when the job ends (`keep_vm` to keep it). Every job VM is created with `-ttl` = cap-min + grace +
+  `kindling.ttl_margin_min`, `-on-ttl freeze` (`remove` with `--db`: real data is never left frozen)
+  and labels `delega.job=<id>`, `delega.owner=<owner>`, so the host stops it even if this machine dies. The token comes from
   `token_command`, goes through ssh stdin and `kling exec -e` into the worker (broker
   `DELEGA_KEEP_ENV`): never on a disk. No `--resume` (the VM is gone), no `--requires`; picked by
   `--node auto` only when listed in the profile's `nodes` (then first, see **Node selection**).
@@ -71,7 +74,8 @@ commands) and is reached through `delega <command>` (`src/delega/__main__.py`).
   `node.min_disk_gb`, `node.min_mem_mb`, `node.reserve_mb_per_job`,
   `permission_mode.default`, `permission_mode.deny`, `budget.day_usd`,
   `quota.window_5h_pct`, `quota.weekly_pct`, `lint.require`, `lease.renew_s`, `lease.stale_s`,
-  `golden.auto_rebuild` (default false).
+  `golden.auto_rebuild` (default false), `ssh.retries` / `ssh.retry_s` / `ssh.retry_max_s` (waiting for a
+  remote job: 5 retries, 30 s doubling up to 300 s), `kindling.ttl_margin_min` (30).
   Read them only through `cfg.policy(key, profile, project)`.
 
 `config.load()` → `Config` with `.locale`, `.state_dir`, `.owner_name`, `.profile(name)`,
@@ -91,13 +95,14 @@ waiting for a remote job).
 relative to the node's `$HOME`), `BRANCH`, `BASE` (sha the job started from), `OWNER`
 (orchestrator label), `PROFILE`, `ACCOUNT` (verified email), `PROJECT`, `ZONE` (comma-separated
 globs), `CLAUDE_VERSION`, `DELEGA_VERSION`, `PYZ_SHA`, `BUNDLE_SHA`, `CONFIG_SHA`, `SESSION`,
-`END` (epoch; present = closed). Legacy keys (`HOST`, `RJOB`, `RAMA`, `DUENO`, `FIN`) are
+`END` (epoch; present = closed), `DISCONNECTED` (epoch the waiter lost the host, rc 96: the job
+stays open, its VM untouched, until `adopt`/`recover`). Legacy keys (`HOST`, `RJOB`, `RAMA`, `DUENO`, `FIN`) are
 mapped on read.
 
 Other state files: `sessions.jsonl` (`{session_id, node, worktree, branch, profile, job}`; also
 read legacy `sesiones.tsv`: `session_id\thost\twt\tbranch`), `audit.jsonl` (append-only,
 `{ts, event, job, profile, account, node, branch, base, project, owner, cost_usd, ...}` with
-events `launch`, `end`, `resume`, `handoff`, `integrate`, `refused`, `scan`, `db_volume`, `golden_build`,
+events `launch`, `end`, `disconnected`, `resume`, `handoff`, `integrate`, `refused`, `scan`, `db_volume`, `golden_build`,
 `golden_db`, `golden_rm`, `golden_stale`, `sandbox_up|freeze|thaw|rm|save`; kindling launches carry `vm`, `golden`,
 `dbs = [{name, engine, volume, sha, mode, check}]`), `kindling.json` (what delega made on each kindling host, keyed by its ssh alias whichever node — account —
 reached it; records keyed by node name are migrated on read:
@@ -201,15 +206,25 @@ without an audit end, audit ends without a job dir, and jobs whose costs differ.
 - `jobs`: `job_dirs(cfg) -> [path]`, `resolve(cfg, pattern) -> path` (`last` = newest),
   `alive(cfg, job_dir) -> bool` (END absent and: local → lease fresh or pid alive; remote →
   `waiter.pid` alive, else meta newer than 12 h), `live_counts(cfg) -> {node: n}`,
-  `reconcile(cfg) -> [(job_dir, action)]` (close dead local jobs, report orphaned remote ones),
-  `adopt(cfg, job_dir)`, `close_job(job_dir, reason, cfg=None, rc=None)` (END + summary; with cfg, audit `end`),
+  `reconcile(cfg) -> [(job_dir, action)]` (close dead local jobs, report orphaned remote ones; a
+  `DISCONNECTED` job is reported as `disconnected`, never closed),
+  `adopt(cfg, job_dir)` (waits for the rc, also of a `disconnected` job, and brings the branch),
+  `recover(cfg, job_dir, force=False)` (no wait: rc read in the VM — 97 if none and the lease is stale;
+  refuses while the lease is fresh unless force — then the same close as adopt: channel, branch via
+  `kling cp`, scan, END, VM deleted), `gc(cfg, node_names=None, yes=False)` (VMs `delega-*` whose job has
+  END or is not in this state_dir: listed, deleted with yes; other orphans are listed with `recover`; VMs with only the old `delega.owner` label are listed as «old label, delete by hand», never deleted), `close_job(job_dir, reason, cfg=None, rc=None)` (END + summary; with cfg, audit `end`),
   `ensure_summary(job_dir, rc, reason) -> dict`; CLI `ps [--all] [job]`, `say <job> <text>`,
   `watch [--all] [--from-start] [--bus] [job…]`,
-  `adopt <job>`. Default scope = jobs whose `OWNER` equals `DELEGA_OWNER` or the basename of `$PWD`.
+  `adopt <job>`, `recover <job> [--force]`, `gc [--node n]… [--yes]`. Default scope = jobs whose `OWNER` equals `DELEGA_OWNER` or the basename of `$PWD`.
 - `launch`: `main(argv)` = `delega run <repo> <brief> [--node auto|local|<n>] [--profile p]
   [--requires c]… [--resume sid [--force-resume]] [--mode m] [--model m] [--worktree n]
   [--branch b] [--owner o] [--cap-min n] [--cap-usd n] [--cap-turns n] [--zone glob]…
   [--db name|all]… [--db-mode auto|golden|volume] [--heavy] [--rebuild-golden] [--no-lint] [--over-budget] [--allow-version-skew]`.
+  `wait_for_rc(cfg, node, chan, poll_s)`: every poll goes through `ssh_retry` (rc 255/124 = ssh failed:
+  retried per `ssh.*`; any other rc is an answer). Codes: 98 not started, 97 broker lost, 96 no contact
+  with the host after every retry → `DISCONNECTED` in meta, audit `disconnected`, VM kept, message with
+  `delega adopt <id>`. `wait_and_finish(cfg, job_dir, poll_s=None, rc=None)` (rc given = `recover`: no wait).
+  A failed branch fetch prints the first line of `fetch.log`.
   Exports `DELEGA_JOB_ID`, `DELEGA_NODE`, `DELEGA_PROFILE`, `DELEGA_BRANCH` (and the databases' variables). `lint_brief(text, locale) -> [missing]`,
   `zones_from_brief(text) -> [globs]`.
 - `quota`: `limits_from_channels(dirs) -> [records]`, `capacity(cfg, profile) -> dict`; CLI
@@ -226,9 +241,19 @@ without an audit end, audit ends without a job dir, and jobs whose costs differ.
   CLI `scan <repo> <branch> [base]` / `scan --text <file>` (exit 9 on hits; never prints the matched text).
 - `handoff`: CLI `handoff <job> [out.md]`.
 - `queue`: CLI `queue add <repo> <brief> [--prio n] [-- run options]`, `queue ls`, `tick [--adopt]`.
+  `delega run` on a full node (probe `resources`, `max_jobs`, `max_local_jobs`, or `kling run` saying
+  `doesn't fit`) raises `Full`: rc 6, the job folder is removed (audit event `full`) and `add_once`
+  queues the brief unless the same repo, brief and options are already queued (`queue.when_full`:
+  `queue` | `fail`). `tick` launches with `DELEGA_FROM_QUEUE=1`, so a full node fails back (rc 6) and
+  the item stays queued instead of being queued again.
 - `integrate`: CLI `integrate <repo> <branch> [--into main]`: `git merge-tree --write-tree` dry run,
   then the project's `verify` commands in a temporary worktree.
-- `kindling`: `probe(cfg, node, profile, requires)` (same shape as `nodes.probe`), `has_golden(node, repo)`, `create`, `destroy`,
+- `kindling`: `probe(cfg, node, profile, requires)` (same shape as `nodes.probe`; `vms` = VMs with a live job,
+  `orphans` = [(vm, why)]; full → fix `delega gc --node n`), `host_vms(node) -> [(vm, state)]`,
+  `classify(cfg, node, vms) -> (active, orphans)` (active: job here without END, VM running and lease inside it
+  renewed within `lease.stale_s`, or no lease yet within 15 min of launch; why: ended, unknown, frozen, stale,
+  no_lease), `ttl_min(cfg, caps, profile, project)`, `has_golden(node, repo)`,
+  `create(node, vm, image, ttl=None, on_ttl="freeze", labels=None)`, `destroy`,
   `push_head`, `make_worktree`, `fetch_branch`, `start_worker`, `read_token`.
 - `databases`: `specs(cfg, project)`, `select(cfg, project, wanted)`, `env(dbs)`, `kindling_node(cfg, profile,
   dbs, node_opt)`, `plan(cfg, node, golden, dbs, mode) -> (mode, image, why)`, `attach(cfg, node, vm, dbs, mode)
@@ -257,8 +282,12 @@ without an audit end, audit ends without a job dir, and jobs whose costs differ.
 
 `python3 -m unittest discover -s tests` (stdlib unittest). `tests/fakes/claude` emits
 stream-json and is driven by env vars (see the file). `tests/fakes/ssh` and `tests/fakes/scp`
-run commands locally under a temporary `$HOME` so the remote flow can be tested end to end.
+run commands locally under a temporary `$HOME` so the remote flow can be tested end to end; while
+`$FAKE_NODE_HOME/.ssh.fail` holds N > 0 (or `always`) ssh fails with rc 255 (N times). The tests set
+`DELEGA_SSH_RETRY_S`/`_MAX_S` to hundredths of a second.
 `tests/fakes/kling-bin/kling` fakes machines (one cloned from a golden at a time, any number of loaders and
-sandboxes), volumes, snapshots, templates and `cp`/`exec` with path mapping; `fake-dbctl` stands for
+sandboxes), volumes, snapshots, templates and `cp`/`exec` with path mapping (`run` records `-ttl`,
+`-on-ttl`, `-label`; `exec` cuts stdout at 8 MiB like the real one); `stub_broker.py` takes
+`STUB_WAIT_FILE` (keep running, renewing the lease) and `STUB_BIG_MB` (commit a branch bigger than 8 MiB); `fake-dbctl` stands for
 `delega-db` and `split` for GNU split. `tests/nod_sandbox.py` (imported first by every test module) points `NOD_EVENTS_FILE` to
 a temp file and empties `NOD_COLLECTOR_URL`: a test run never writes the real Nod file nor POSTs to :8787.

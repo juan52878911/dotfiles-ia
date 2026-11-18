@@ -3,6 +3,7 @@
 Tests point DELEGA_SSH / DELEGA_SCP at tests/fakes/{ssh,scp}. Credentials are never
 transferred: every upload goes through refuse_credentials().
 """
+import json
 import os
 import re
 import shlex
@@ -164,6 +165,25 @@ def _scp_from_vm(node, src, dst):
     return r
 
 
+def lease_cmd(chan):
+    """Shell that prints the channel's lease.json and then the node's own clock (`date +%s`)."""
+    return f"cat {shlex.quote(chan)}/lease.json && echo && date +%s"
+
+
+def lease_age(r):
+    """(lease, age_s) from the output of lease_cmd, the age measured with the node's clock: a VM
+    restored from a golden can run minutes behind this machine if kling could not resync its clock.
+    (None, None) when there is no lease or it cannot be read."""
+    if r.returncode != 0:
+        return None, None
+    lines = (r.stdout or "").strip().splitlines()
+    try:
+        d = json.loads("\n".join(lines[:-1]))
+        return d, float(lines[-1]) - float(d.get("renewed", 0))
+    except (ValueError, IndexError, TypeError, AttributeError):
+        return None, None
+
+
 def must(r, what):
     if r.returncode != 0:
         raise RemoteError(f"{what}: {(r.stderr or r.stdout or '').strip()[:300] or f'rc={r.returncode}'}")
@@ -266,3 +286,58 @@ def fetch_branch(repo_dir, node, repo, branch):
                         f"+refs/heads/{branch}:refs/heads/{branch}"], capture_output=True, text=True,
                        env=_git_env())
     return r.returncode == 0, (r.stderr or "") + (r.stdout or "")
+
+
+def is_checked_out_error(log):
+    return "checked out" in (log or "")
+
+
+def worktree_holder(node, repo, branch):
+    """Path of the worktree of the node's bare repo that has `branch` checked out, or None."""
+    r = ssh(node, f"git -C {shlex.quote(bare_rel(node, repo))} worktree list --porcelain")
+    if r.returncode != 0:
+        return None
+    path = None
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def remove_worktree(node, repo, path):
+    must(ssh(node, f"git -C {shlex.quote(bare_rel(node, repo))} worktree remove --force {shlex.quote(path)}"),
+         "git worktree remove")
+
+
+def local_worktree_of(repo_dir, branch):
+    """Path of the local worktree that has `branch` checked out, or None."""
+    r = subprocess.run(["git", "-C", repo_dir, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    path = None
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def fetch_into(repo_dir, source, branch, job_id, env=None):
+    """Fetch `branch` from `source` (a remote or a bundle file) when git refused to update it because it is
+    checked out in a worktree: fetch it to refs/delega/<id> and, if that worktree is clean, fast-forward it.
+    Returns (ok, log, where): where = "merged" (branch updated), "ref" (only refs/delega/<id>) or None."""
+    ref = f"refs/delega/{job_id}"
+    r = subprocess.run(["git", "-C", repo_dir, "fetch", "-q", source, f"+refs/heads/{branch}:{ref}"],
+                       capture_output=True, text=True, env=env)
+    log = (r.stderr or "") + (r.stdout or "")
+    if r.returncode != 0:
+        return False, log, None
+    wt = local_worktree_of(repo_dir, branch)
+    if wt and not subprocess.run(["git", "-C", wt, "status", "--porcelain", "--untracked-files=no"],
+                                 capture_output=True, text=True).stdout.strip():
+        m = subprocess.run(["git", "-C", wt, "merge", "-q", "--ff-only", ref], capture_output=True, text=True)
+        if m.returncode == 0:
+            return True, log, "merged"
+        log += (m.stderr or "") + (m.stdout or "")
+    return True, log, "ref"
