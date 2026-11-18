@@ -258,7 +258,7 @@ class NodeDaemon(Base):
         argv = relevo.claude_argv("b", "trycore")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
         allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowedTools")]
-        self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(delega mem *)"])
+        self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(delega relevo-mem *)"])
         self.assertEqual(argv[argv.index("--disallowedTools") + 1:], ["Bash(git *)", "Bash(gh *)", "Edit", "Write"])
         self.assertEqual(argv[:3], ["ws", "exec", "claude"])
         self.assertEqual(relevo.claude_argv("b", "otraorg")[:2], ["claude", "-p"])   # context cannot be pinned

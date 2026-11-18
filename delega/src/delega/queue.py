@@ -682,8 +682,8 @@ FALLOS_WINDOW = 100      # events of the task read to count the cycles without a
 
 def _fallos(client, t):
     """Consecutive cycles without an answer of the task's launcher: the events of THAT task since the last
-    `lanzador_responde`, from a bounded query of the database (no export). Asked once per task and
-    process, then counted in memory (`client._fallos_n`)."""
+    `lanzador_responde`, from a bounded query of the database (no export). Once the cap is reached the
+    process remembers it (`client._fallos_n`) and asks nothing more for that task."""
     n = 0
     for e in client.log(t["id"], FALLOS_WINDOW):
         if e["que"] == FALLO_EVENT:
@@ -699,7 +699,9 @@ def _count_failure(client, fl, t, host, motivo, env=None):
     from . import relevo
     counts = client.__dict__.setdefault("_fallos_n", {})
     try:
-        n = counts[t["id"]] if t["id"] in counts else _fallos(client, t)
+        n = counts.get(t["id"], 0)
+        if n < LANZADOR_MAX_FALLOS:          # below the cap: the database is the truth (a bounded query)
+            n = _fallos(client, t)
         if n < LANZADOR_MAX_FALLOS:
             relevo._event(client, FALLO_EVENT, t["id"], {"lanzador": host, "motivo": motivo, "flujo": fl["id"]})
             n += 1

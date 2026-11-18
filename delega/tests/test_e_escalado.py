@@ -56,48 +56,14 @@ class Escalation(R.Base):
         with open(os.path.join(self.state, "relevo", "t1.md"), encoding="utf-8") as f:
             return f.read()
 
-    def test_e1_remote_base_gets_the_ssh_prefix_and_the_exact_command(self):
-        cfg = config.Config({"profiles": {"trycore": {"owner": "self"}},
-                             "memoria": {"trycore": {"host": "orq@elsewhere", "path": self.db}},
-                             "relevo": {"node": "n"}})
-        line = self.asked(cfg)
-        self.assertIn("Bash(ssh orq@elsewhere .local/bin/delega mem *)", line)
-        self.assertNotIn("Bash(delega mem *)", line)
-        for forbidden in ("Bash(git *)", "Bash(gh *)", "Edit", "Write"):
-            self.assertIn(forbidden, line)
-        argv = relevo.claude_argv("b", None, "Bash(ssh h delega mem *)")
-        allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowedTools")]
-        self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(ssh h delega mem *)"])
-        text = self.brief_text()
-        self.assertIn("ssh orq@elsewhere .local/bin/delega mem", text)
-        self.assertIn(f"--db {self.db} --org trycore --owner dueno-claude", text)
-        self.assertIn("LOG-TAIL-OF-THE-FIX", text)                      # E2: the brief carries the registro
-
-    def test_e1_local_base_gets_the_local_path(self):
-        cfg = config.load()
-        line = self.asked(cfg)
-        self.assertIn("Bash(delega mem *)", line)
+    def test_e1_the_claude_gets_relevo_mem_and_no_ssh(self):
+        line = self.asked(config.load())
+        self.assertIn("Bash(delega relevo-mem *)", line)
         self.assertNotIn("ssh", line.replace("SSH_AUTH_SOCK", ""))
         text = self.brief_text()
-        self.assertIn(f"delega mem", text)
-        self.assertIn(f"--db {self.db} --org trycore --owner dueno-claude", text)
+        self.assertIn("LOG-TAIL-OF-THE-FIX", text)                      # E2: the brief carries the registro
+        self.assertIn("delega relevo-mem", text)
         self.assertNotIn("ssh ", text)
-
-    def test_e1_owner_of_the_claude_passes_the_fence_through_the_ssh_command(self):
-        # the exact command of the brief, run by the fake ssh, writes with the owner of the Claude
-        env = relevo.claude_env("dueno-claude")
-        self.assertEqual(env["DELEGA_MEM_OWNER"], "dueno-claude")
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "orq@elsewhere",
-                            f"delega mem event nota --task t1 --datos '{{}}' --db {self.db} --org trycore "
-                            f"--owner dueno-claude --json"], capture_output=True, text=True,
-                           env=dict(os.environ, PYTHONPATH=SRC))
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
-        c = sqlite3.connect(self.db)
-        try:
-            self.assertEqual(c.execute("SELECT quien FROM eventos WHERE que = 'nota'").fetchone()[0], "dueno-claude")
-        finally:
-            c.close()
-        self.assertNotIn("DELEGA_MEM_OWNER", os.environ)               # `--owner` does not leak out of mem.main
 
 
 class Wave(D.DaemonCase):
@@ -185,7 +151,7 @@ class Wave(D.DaemonCase):
         ev = self.events("necesita_decision")
         self.assertEqual([e["motivo"] for e in ev], ["lanzamiento_rechazado"])
         self.assertTrue(ev[0]["registro"])
-        self.refused_arreglo()
+        self.assertEqual(self.states()["t1"], "bloqueada")                # F15: no more retries
         self.step()
         self.assertEqual(len(self.events("necesita_decision")), 1)        # asked once, ever
 
