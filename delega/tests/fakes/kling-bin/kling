@@ -23,6 +23,7 @@ vols = os.path.join(home, ".kling-volumes")
 vmhome = os.environ["FAKE_KLING_VMHOME"]
 goldens = os.environ.get("FAKE_KLING_GOLDENS", os.path.join(home, ".kling-goldens"))
 MAX_OUTPUT = int(os.environ.get("FAKE_KLING_MAX_OUTPUT", 8 << 20))
+MAX_UPLOAD = int(os.environ.get("FAKE_KLING_MAX_UPLOAD", 64 << 20))   # real kling: 67108864 bytes
 DBCTL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake-dbctl")
 
 
@@ -148,6 +149,11 @@ def cp(src, dst):
     if dn is None:
         sys.stdout.buffer.write(data)
         return 0
+    if dn and len(data) > MAX_UPLOAD:
+        print(f"kling: upload is over the {MAX_UPLOAD} byte limit", file=sys.stderr)
+        return 1
+    if dn:
+        log("up-bytes", str(len(data)), dst)
     out = vmap(dn, dp) if dn else dp
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "wb") as f:

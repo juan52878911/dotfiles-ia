@@ -155,6 +155,7 @@
  "jobs.watch.closed": "trabajo cerrado",
  "jobs.watch.dead": "el broker ya no corre y el trabajo no tiene END; retómalo con --resume {session}",
  "jobs.watch.none": "no hay trabajos de '{owner}' en curso",
+ "kindling.err.with_ref": "--with-ref: no hay una rama local «{ref}» en el repositorio",
  "kindling.golden_rebuild_failed": "falló el rehecho del dorado {golden} (rc={rc}); el trabajo no se lanzó",
  "kindling.golden_rebuilding": "rehaciendo el dorado {golden} antes de lanzar…",
  "kindling.golden_stale": "el dorado {golden} se horneó con otros lockfiles (dorado {have}, HEAD {want}): las dependencias pueden no coincidir. Rehazlo: {fix} (o --rebuild-golden, o la política golden.auto_rebuild = true)",

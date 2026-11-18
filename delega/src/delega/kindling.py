@@ -202,14 +202,22 @@ def destroy(node, vm):
                timeout=120)
 
 
-def push_head(repo_dir, node, chan, job_id, git=None):
-    """Bring this repo's HEAD into the VM checkout as refs/heads/delega-base-<id>. Only what HEAD has
-    on top of the golden's base travels (all of HEAD if it does not descend from it). Returns the ref."""
+CHUNK = 60 << 20     # kling cp refuses uploads over 64 MiB: a bigger bundle travels in pieces of this size
+
+
+def _git(repo_dir, *args):
+    return subprocess.run(["git", "-C", repo_dir, *args], capture_output=True, text=True)
+
+
+def push_head(repo_dir, node, chan, job_id, git=None, refs=()):
+    """Bring this repo's HEAD into the VM checkout as refs/heads/delega-base-<id>, and each of `refs`
+    (local branches) as a branch of the same name. Only what the golden's base lacks travels: nothing
+    if a tip is an ancestor of the base, else the tip --not its merge-base with the base. A bundle over
+    CHUNK is cut in pieces and joined inside the VM. Returns the ref."""
     q, wt = shlex.quote, vm_repo(node)
     ref = f"delega-base-{job_id}"
     base = remote.must(remote.ssh(node, f"git -C {q(wt)} rev-parse {q(base_ref(node))}"),
                        "golden base ref").stdout.strip()
-    head = subprocess.run(["git", "-C", repo_dir, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     setup = ""
     if git and git.get("user_email"):
         setup += f" && git -C {q(wt)} config user.email {q(git['user_email'])}"
@@ -217,22 +225,46 @@ def push_head(repo_dir, node, chan, job_id, git=None):
         setup += f" && git -C {q(wt)} config user.name {q(git['user_name'])}"
     if git and git.get("strip_trailers"):
         setup += " && " + remote.strip_trailers_hook(q(wt + "/.git"))
-    if head == base:
-        remote.must(remote.ssh(node, f"git -C {q(wt)} branch -f {q(ref)} {q(base)}{setup}"), "branch from golden")
-        return ref
-    anc = subprocess.run(["git", "-C", repo_dir, "merge-base", "--is-ancestor", base, "HEAD"],
-                         capture_output=True).returncode == 0
-    tmp = tempfile.mkdtemp(prefix="delega-")
-    bundle = os.path.join(tmp, "in.bundle")
-    try:
-        remote.must(subprocess.run(["git", "-C", repo_dir, "bundle", "create", "-q", bundle,
-                                    f"{base}..HEAD" if anc else "HEAD"], capture_output=True, text=True),
-                    "git bundle")
-        remote.must(remote.scp_to(node, bundle, f"{chan}/in.bundle"), "upload bundle")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    remote.must(remote.ssh(node, f"git -C {q(wt)} fetch -q \"$HOME\"/{q(chan + '/in.bundle')} "
-                                 f"+HEAD:refs/heads/{q(ref)}{setup}"), "git fetch bundle")
+    tips = [("HEAD", ref)] + [(f"refs/heads/{r}", r) for r in refs]
+    local, ship, excl = [], [], []        # local: the VM already has the commit; ship: goes in the bundle
+    for src, dst in tips:
+        sha = remote.must(_git(repo_dir, "rev-parse", "--verify", src + "^{commit}"), f"rev-parse {src}").stdout.strip()
+        if _git(repo_dir, "merge-base", "--is-ancestor", sha, base).returncode == 0 or sha == base:
+            local.append((sha, dst))
+            continue
+        ship.append((src, dst))
+        mb = _git(repo_dir, "merge-base", base, sha)
+        if mb.returncode == 0 and mb.stdout.strip():
+            excl.append(mb.stdout.strip())
+    cmds = [f"git -C {q(wt)} branch -f {q(dst)} {q(sha)}" for sha, dst in local]
+    if ship:
+        tmp = tempfile.mkdtemp(prefix="delega-")
+        bundle = os.path.join(tmp, "in.bundle")
+        try:
+            remote.must(subprocess.run(["git", "-C", repo_dir, "bundle", "create", "-q", bundle,
+                                        *[s for s, _ in ship], *(["--not", *dict.fromkeys(excl)] if excl else [])],
+                                       capture_output=True, text=True), "git bundle")
+            size = os.path.getsize(bundle)
+            if size <= CHUNK:
+                remote.must(remote.scp_to(node, bundle, f"{chan}/in.bundle"), "upload bundle")
+            else:
+                names = []
+                with open(bundle, "rb") as f:
+                    for i in range(0, size, CHUNK):
+                        part = f"{bundle}.part{i // CHUNK:04d}"
+                        with open(part, "wb") as o:
+                            o.write(f.read(CHUNK))
+                        names.append(os.path.basename(part))
+                        remote.must(remote.scp_to(node, part, f"{chan}/{names[-1]}"), "upload bundle")
+                        os.unlink(part)
+                joined = " ".join(q(f"{chan}/{n}") for n in names)
+                remote.must(remote.ssh(node, f"cd \"$HOME\" && cat {joined} > {q(chan + '/in.bundle')} && rm -f {joined}"),
+                            "join bundle")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        specs = " ".join(f"+{q(s)}:refs/heads/{q(d)}" for s, d in ship)
+        cmds.append(f"git -C {q(wt)} fetch -q \"$HOME\"/{q(chan + '/in.bundle')} {specs}")
+    remote.must(remote.ssh(node, " && ".join(cmds) + setup), "git fetch bundle")
     return ref
 
 

@@ -155,6 +155,7 @@
  "jobs.watch.closed": "job closed",
  "jobs.watch.dead": "the broker is gone and the job has no END; continue with --resume {session}",
  "jobs.watch.none": "no running jobs of '{owner}'",
+ "kindling.err.with_ref": "--with-ref: there is no local branch '{ref}' in the repository",
  "kindling.golden_rebuild_failed": "rebuilding golden {golden} failed (rc={rc}); the job was not launched",
  "kindling.golden_rebuilding": "rebuilding golden {golden} before launching…",
  "kindling.golden_stale": "golden {golden} was baked with other lockfiles (golden {have}, HEAD {want}): dependencies may differ. Rebuild: {fix} (or --rebuild-golden, or policy golden.auto_rebuild = true)",
