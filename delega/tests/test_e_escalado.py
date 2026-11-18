@@ -61,7 +61,7 @@ class Escalation(R.Base):
                              "memoria": {"trycore": {"host": "orq@elsewhere", "path": self.db}},
                              "relevo": {"node": "n"}})
         line = self.asked(cfg)
-        self.assertIn("Bash(ssh orq@elsewhere delega mem *)", line)
+        self.assertIn("Bash(ssh orq@elsewhere .local/bin/delega mem *)", line)
         self.assertNotIn("Bash(delega mem *)", line)
         for forbidden in ("Bash(git *)", "Bash(gh *)", "Edit", "Write"):
             self.assertIn(forbidden, line)
@@ -69,7 +69,7 @@ class Escalation(R.Base):
         allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowedTools")]
         self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(ssh h delega mem *)"])
         text = self.brief_text()
-        self.assertIn("ssh orq@elsewhere delega mem", text)
+        self.assertIn("ssh orq@elsewhere .local/bin/delega mem", text)
         self.assertIn(f"--db {self.db} --org trycore --owner dueno-claude", text)
         self.assertIn("LOG-TAIL-OF-THE-FIX", text)                      # E2: the brief carries the registro
 

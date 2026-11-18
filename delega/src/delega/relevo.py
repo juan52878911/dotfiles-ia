@@ -281,7 +281,7 @@ def candidates(exp):
 def mem_access(cfg, org, owner):
     """How the escalated Claude (it runs on THIS host) reaches the org's database: {cmd, tool, owner}.
     `cmd` is the exact command prefix of the brief, `tool` the only `Bash(...)` the Claude may run.
-    A local base: `delega mem … --db <path> --org <org>`; a remote one: `ssh <host> delega mem …` with
+    A local base: `delega mem … --db <path> --org <org>`; a remote one: `ssh <host> .local/bin/delega mem …` with
     the same options (`--owner` carries the identity the writes need to pass the fence)."""
     import shlex
     from . import mem
@@ -289,9 +289,11 @@ def mem_access(cfg, org, owner):
     opts = f"--db {shlex.quote(m['path'] or mem.db_path(None, org=org))} --org {shlex.quote(org)} --owner {shlex.quote(owner)}"
     if m["local"]:
         return {"cmd": "delega mem", "opts": opts, "tool": "Bash(delega mem *)", "owner": owner, "host": ""}
+    # `.local/bin/delega`, relative to the remote HOME (where ssh starts): a non-interactive ssh does not
+    # read the profile, so `delega` alone is not on its PATH; the wrapper `install_on_node` leaves is there
     host = m["host"]
-    return {"cmd": f"ssh {host} delega mem", "opts": opts, "tool": f"Bash(ssh {host} delega mem *)",
-            "owner": owner, "host": host}
+    return {"cmd": f"ssh {host} .local/bin/delega mem", "opts": opts,
+            "tool": f"Bash(ssh {host} .local/bin/delega mem *)", "owner": owner, "host": host}
 
 
 def brief_for(task, why, flow_export, access=None, registro=""):
