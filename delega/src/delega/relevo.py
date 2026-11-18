@@ -18,16 +18,23 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 from . import config, i18n
 
 REQUEST = "orquestador_claude"
 NEEDS_DECISION = "necesita_decision"
+SPAWN_FAILED = "escalado_fallido"
+MAX_SPAWN_TRIES = 3
 MAX_REDS = 2
 MODEL = "sonnet"
 CAP_USD = 3
 EVENT_TAIL = 50
 FORBIDDEN_TOOLS = ("Bash(git push:*)", "Bash(git merge:*)", "Bash(gh pr merge:*)")
+# the escalated Claude only reads and talks to the database: a deny list is bypassed by `git -C x push`,
+# `cd r && git push`, `git update-ref`, `gh api …/merges`; a closed allow list in plan mode is not
+ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Bash(delega mem *)")
+STRIPPED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK")
 # profile keys that make sense on a node (paths and secrets of the Mac are left out)
 PROFILE_KEYS = ("owner", "org", "model", "launcher", "nodes", "identity", "git", "policy", "roles", "repo_match")
 NODE_DROP = ("token_command", "account")
@@ -145,20 +152,25 @@ def _export(client):
     return res
 
 
-def _event_once(client, task, datos):
-    """True when this call wrote the request (False: there was one already)."""
+def _event(client, que, task, datos, once=False):
+    """Write an event of the task. With `once`: True when this call wrote it (False: there was one already)."""
     from . import mem
     if client.m["local"]:
         rc, res = client._call(lambda: client._local_rc(
-            lambda c: mem.add_event(c, REQUEST, datos, task=task, once=True, quien=client.owner)))
+            lambda c: mem.add_event(c, que, datos, task=task, once=once, quien=client.owner)))
         if rc != mem.EXIT_OK:
             raise mem.MemError(f"event: rc={rc}")
         return res
-    rc, payload = client._call(lambda: client._remote("event", REQUEST, "--task", task, "--once", "--datos",
-                                                      json.dumps(datos, ensure_ascii=False)))
+    args = ["event", que, "--task", task] + (["--once"] if once else []) + \
+        ["--datos", json.dumps(datos, ensure_ascii=False)]
+    rc, payload = client._call(lambda: client._remote(*args))
     if rc != mem.EXIT_OK:
         raise mem.MemError(payload.get("error") or f"event: rc={rc}")
     return bool(payload.get("creado"))
+
+
+def _event_once(client, task, datos):
+    return _event(client, REQUEST, task, datos, once=True)
 
 
 def _flow_export(exp, flow):
@@ -171,18 +183,24 @@ def _flow_export(exp, flow):
 
 def candidates(exp):
     """{task id: why} for the tasks that need a decision: red twice (and still red) or flagged by an event."""
-    reds, flagged = {}, {}
+    reds, flagged, failed, asked = {}, {}, {}, set()
     for e in exp["eventos"]:
         d = e.get("datos") or {}
+        if e["que"] == SPAWN_FAILED and d.get("tarea"):
+            failed[d["tarea"]] = failed.get(d["tarea"], (0, ""))[0] + 1, d.get("motivo") or SPAWN_FAILED
+        elif e["que"] == REQUEST and d.get("tarea"):
+            asked.add(d["tarea"])
         if e["que"] == "task.set" and d.get("estado") == "rojo":
             reds[d.get("tarea")] = reds.get(d.get("tarea"), 0) + 1
         elif e["que"] == NEEDS_DECISION and d.get("tarea"):
             flagged[d["tarea"]] = d.get("motivo") or NEEDS_DECISION
     out = {}
     for t in exp["tareas"]:
-        if t["estado"] == "hecha":
+        if t["estado"] == "hecha" or t["id"] in asked:      # one request per task, ever
             continue
-        if t["estado"] == "rojo" and reds.get(t["id"], 0) >= MAX_REDS:
+        if t["id"] in failed and failed[t["id"]][0] < MAX_SPAWN_TRIES:
+            out[t["id"]] = failed[t["id"]][1]      # blocked, but the Claude never started: try again
+        elif t["estado"] == "rojo" and reds.get(t["id"], 0) >= MAX_REDS:
             out[t["id"]] = f"rojo x{reds[t['id']]}"
         elif t["id"] in flagged and t["estado"] != "bloqueada":
             out[t["id"]] = flagged[t["id"]]
@@ -195,41 +213,76 @@ def brief_for(task, why, flow_export):
                   export=json.dumps(flow_export, ensure_ascii=False, indent=1, default=str))
 
 
-def claude_argv(brief):
-    base = ["ws", "exec", "claude"] if shutil.which("ws") else ["claude"]
+def _ws_in_org(org):
+    """True when `ws` exists and its active context is the org of the database (else plain `claude`)."""
+    if not (org and shutil.which("ws")):
+        return False
+    try:
+        r = subprocess.run(["ws", "contexto"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and org.lower() in re.findall(r"[\w.-]+", r.stdout.lower())
+
+
+def claude_argv(brief, org=None):
+    base = ["ws", "exec", "claude"] if _ws_in_org(org) else ["claude"]
     return base + ["-p", brief, "--model", MODEL, "--max-budget-usd", str(CAP_USD),
-                   "--disallowed-tools", *FORBIDDEN_TOOLS]
+                   "--output-format", "json", "--permission-mode", "plan",
+                   "--allowedTools", *ALLOWED_TOOLS, "--disallowed-tools", *FORBIDDEN_TOOLS]
 
 
-def spawn(cfg, task_id, brief):
-    """Start the Claude orchestrator in the background; returns its log path."""
+def claude_env():
+    """The environment of the escalated Claude: no way to push or open a PR."""
+    return {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+
+
+def spawn(cfg, task_id, brief, org=None):
+    """Start the Claude orchestrator in the background; returns its log path.
+
+    The run is a spend entry of its own (`<state>/<ts>-esc-<task>/`): its JSON result lands in
+    `result.json`, so `spend` adds its cost when it finishes; the cap is audited at the start."""
+    from . import audit, util
     d = os.path.join(cfg.state_dir, "relevo")
     os.makedirs(d, exist_ok=True)
     log = os.path.join(d, task_id + ".log")
     with open(os.path.join(d, task_id + ".md"), "w", encoding="utf-8") as f:
         f.write(brief)
-    with open(log, "ab") as out:
-        subprocess.Popen(claude_argv(brief), stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+    prof = next((n for n in cfg.profiles if cfg.profile_org(n) == org), None) if org else None
+    run_dir = os.path.join(cfg.state_dir, time.strftime("%Y%m%d-%H%M%S") + "-esc-" + re.sub(r"[^\w.-]", "_", task_id))
+    os.makedirs(run_dir, exist_ok=True)
+    util.write_json(os.path.join(run_dir, "escalado.json"),
+                    {"OWNER": "relevo", "PROFILE": prof or "", "PROJECT": "", "TASK": task_id, "CAP_USD": CAP_USD})
+    with open(log, "ab") as out, open(os.path.join(run_dir, "result.json"), "wb") as res:
+        subprocess.Popen(claude_argv(brief, org), stdout=res, stderr=out, stdin=subprocess.DEVNULL,
+                         env=claude_env(), start_new_session=True)
+    audit.record(cfg, "escalate", task=task_id, org=org, profile=prof, cap_usd=CAP_USD, dir=run_dir, log=log)
     return log
 
 
 def escalate(cfg, client):
-    """Block the tasks that need a decision and ask one Claude orchestrator per task. Returns the task ids asked."""
+    """Block the tasks that need a decision and ask one Claude orchestrator per task. Returns the task ids asked.
+
+    Order matters: the task is blocked and the Claude started first, the `once` request event is written
+    last, so a failure in between leaves the task retryable (event `escalado_fallido`) instead of dead."""
     from . import mem
     exp = _export(client)
     asked = []
     for tid, why in candidates(exp).items():
         task = next(t for t in exp["tareas"] if t["id"] == tid)
         fx = _flow_export(exp, task["flujo"])
-        if not _event_once(client, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "export": fx}):
+        if task["estado"] != "bloqueada":
+            rc, payload = client.set(tid, "bloqueada", error=why, desde=task["estado"])
+            if rc == mem.EXIT_LEASE:         # another orchestrator moved the task first: it is theirs now
+                continue
+            if rc != mem.EXIT_OK:
+                raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
+        try:
+            log = spawn(cfg, tid, brief_for(task, why, fx), client.org)
+        except Exception as e:
+            print(i18n.t("relevo.error", err=e), file=sys.stderr)
+            _event(client, SPAWN_FAILED, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "error": str(e)})
             continue
-        rc, payload = client.set(tid, "bloqueada", error=why, desde=task["estado"])
-        if rc == mem.EXIT_LEASE:         # another orchestrator moved the task first: it is theirs now
-            continue
-        if rc != mem.EXIT_OK:
-            raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
-        log = spawn(cfg, tid, brief_for(task, why, fx))
+        _event_once(client, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "export": fx})
         print(i18n.t("relevo.asked", task=tid, why=why, log=log))
         asked.append(tid)
     return asked
