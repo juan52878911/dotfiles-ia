@@ -635,8 +635,6 @@ def _reconcile_foreign(cfg, client, fl, t):
         err = str(e)
     if err:
         print(i18n.t("n2.ok_not_fetched", id=t["id"], sha=sha[:12], node=node, err=err), file=sys.stderr)
-        _event_once(client, t, {"flujo": fl["id"], "motivo": "ok_sin_traer", "sha": sha, "node": node,
-                                "job_id": jid})
     return "ok", jid
 
 

@@ -318,6 +318,8 @@ def connect(path, create=False):
         except sqlite3.Error:
             pass
     _pin_epoch(conn)
+    if not create and conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        migrate(conn)            # an older database (before `tareas.lanzador`) is upgraded on first use
     return conn
 
 
