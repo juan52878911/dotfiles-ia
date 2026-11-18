@@ -228,7 +228,8 @@ class Hardening(DaemonCase):
 
             def wait(self, timeout=None):
                 return 0
-        with mock.patch("subprocess.Popen", lambda *a, **k: P()):
+        # Popen falso para todo el proceso: en macOS mem.mounts() llama a `mount`; aquí no hay red que comprobar
+        with mock.patch("subprocess.Popen", lambda *a, **k: P()), mock.patch("delega.mem.mounts", lambda: []):
             self.cycle()
         estado, job_id, rama, nodo = self.row("t1")
         self.assertEqual(estado, "lanzada")
