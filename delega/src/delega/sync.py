@@ -154,11 +154,14 @@ def push_branch(node, repo, branch, checkout):
     import subprocess as sp
     from . import remote
     f = sp.run(["git", "-C", checkout, "fetch", "-q", "origin", branch], capture_output=True, text=True)
-    if f.returncode != 0:      # an old `origin/<branch>` would be force-pushed over what the node has
+    ref = f"refs/remotes/origin/{branch}"
+    have_origin = sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref],
+                         capture_output=True).returncode == 0
+    if f.returncode != 0 and have_origin:
+        # the fetch failed: `origin/<branch>` is an old copy and would be force-pushed over the node's
         return False, i18n.t("sync.fetch_failed", branch=branch, repo=repo, node=node.get("name", ""),
                              err=(f.stderr or f.stdout or "").strip())
-    ref = f"refs/remotes/origin/{branch}"
-    if sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref], capture_output=True).returncode != 0:
+    if not have_origin:                      # a branch that only exists here (not at origin yet)
         ref = f"refs/heads/{branch}"
         if sp.run(["git", "-C", checkout, "rev-parse", "-q", "--verify", ref], capture_output=True).returncode != 0:
             return False, f"no {branch} in {checkout}"
