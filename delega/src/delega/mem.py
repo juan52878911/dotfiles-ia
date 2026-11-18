@@ -947,7 +947,8 @@ def add_event(conn, que, datos=None, task=None, once=False, quien=None):
 
 
 def cmd_event(args, db, as_json):
-    pos, flags, vals = _parse(args, flags=("once",), values=("task", "datos"))
+    pos, flags, vals = _parse(args, flags=("once",), values=("task", "datos", "org"))
+    org = _org(vals, required=True)
     if not pos:
         raise MemError(i18n.t("mem.event_usage"))
     try:
@@ -956,8 +957,9 @@ def cmd_event(args, db, as_json):
             raise ValueError
     except ValueError:
         raise MemError(i18n.t("mem.event_usage"))
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
+        _check_org(conn, org)
         created = add_event(conn, pos[0], datos, task=vals.get("task"), once="once" in flags)
     finally:
         conn.close()
@@ -985,12 +987,14 @@ def backup(conn, dest_file):
 def cmd_backup(args, db, as_json):
     """`delega mem backup --to <host:path | path>`: a consistent copy, sent with scp when it has a host."""
     import tempfile
-    _, _, vals = _parse(args, values=("to",))
+    _, _, vals = _parse(args, values=("to", "org"))
+    org = _org(vals, required=True)
     dest = vals.get("to")
     if not dest:
         raise MemError(i18n.t("mem.backup_usage"))
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
+        _check_org(conn, org)
         if not _is_remote_dest(dest):
             target = os.path.abspath(os.path.expanduser(dest))
             backup(conn, target)
@@ -1018,11 +1022,12 @@ def cmd_promote(args, db, as_json):
     The previous main is kept as `<main>.before-promote`; the leases are cleared so a daemon can take
     over. Without --yes nothing is touched (rc 2)."""
     import shutil
-    _, flags, vals = _parse(args, flags=("yes",), values=("from",))
+    _, flags, vals = _parse(args, flags=("yes",), values=("from", "org"))
+    org_arg = _org(vals, required=True)
     src = vals.get("from")
     if not src:
         raise MemError(i18n.t("mem.promote_usage"))
-    src, main = os.path.abspath(os.path.expanduser(src)), db_path(db)
+    src, main = os.path.abspath(os.path.expanduser(src)), db_path(db, org=org_arg)
     if "yes" not in flags:
         _out({"ok": False, "cmd": "promote", "error": i18n.t("mem.promote_dry", src=src, main=main)},
              [], as_json)
@@ -1037,6 +1042,8 @@ def cmd_promote(args, db, as_json):
         org = get_org(conn)
         if not org:
             raise MemError(i18n.t("mem.promote_corrupt", path=src))
+        if org != org_arg:
+            raise MemError(i18n.t("mem.org_mismatch", org=org_arg, base=org))
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
