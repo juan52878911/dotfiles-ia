@@ -57,12 +57,13 @@ class DaemonCase(unittest.TestCase):
         os.environ.update(DELEGA_STATE_DIR=self.state, DELEGA_CONFIG=self.conf, DELEGA_LOCALE="en")
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self._env)))
         self.assertEqual(mem_cli("init", "--org", "trycore", "--db", self.db)[0], 0)
-        self.assertEqual(mem_cli("add-flow", "--repo", REMOTE, "--id", "f1", "--db", self.db)[0], 0)
+        self.assertEqual(mem_cli("add-flow", "--repo", REMOTE, "--id", "f1", "--org", "trycore",
+                                 "--db", self.db)[0], 0)
         self.cfg = config.load()
 
     def add_task(self, tid, **kw):
-        return mem_cli("add-task", "--flow", "f1", "--brief", "do " + tid, "--id", tid, "--db", self.db,
-                       *sum(([f"--{k}", v] for k, v in kw.items()), []))
+        return mem_cli("add-task", "--flow", "f1", "--brief", "do " + tid, "--id", tid, "--org", "trycore",
+                       "--db", self.db, *sum(([f"--{k}", v] for k, v in kw.items()), []))
 
     def client(self, owner):
         return queue.MemClient(self.cfg, "trycore", owner)
@@ -148,6 +149,49 @@ class LaunchOnlyOnce(DaemonCase):
         self.assertEqual(len(launched), 1)                                # migrated once
 
 
+class CompareAndSet(DaemonCase):
+    """Two daemons see the same pending task: the compare-and-set (`set --desde pendiente`) is
+    what keeps the second one from launching it again."""
+
+    def test_only_one_daemon_takes_a_pending_task(self):
+        self.add_task("t1")
+        a, b = self.client("a"), self.client("b")
+        rc_a, _ = a.set("t1", "lanzada", desde="pendiente")
+        rc_b, payload = b.set("t1", "lanzada", desde="pendiente")
+        self.assertEqual(rc_a, mem.EXIT_OK)
+        self.assertEqual(rc_b, mem.EXIT_LEASE)              # 9: the state changed under its feet
+        self.assertIn("state changed", payload.get("error", ""))
+        self.assertEqual(self.states(), {"t1": "lanzada"})
+
+    def test_two_daemons_that_see_the_task_launch_it_once(self):
+        self.add_task("t1")
+        launched = []
+
+        def fake_launch(cfg, item):
+            launched.append(item["id"])
+            item["log"] = "x.log"
+            return "launched", "1"
+
+        cap = {"has_data": False, "new": 9, "live": 0, "slots": 9}
+        task = {"id": "t1", "ola": 1, "brief": "do t1", "run_args": {}}
+        clients = []
+        for owner in ("a", "b"):
+            c = self.client(owner)
+            c.ready = lambda flow, t=task: [t]            # both daemons see the task as pending
+            clients.append(c)
+        err = io.StringIO()
+        with mock.patch.object(queue, "launch", fake_launch), \
+                mock.patch.object(queue.MemClient, "claim", lambda self, ttl: True), \
+                mock.patch("delega.quota.capacity", lambda cfg, name, **k: cap), \
+                mock.patch.object(queue, "_reconcile", lambda cfg, adopt: None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            for c in clients:
+                queue.daemon_cycle(self.cfg, c, ttl=30)
+        self.assertEqual(launched, ["t1"])                 # only the daemon that took it launched it
+        self.assertEqual(self.states(), {"t1": "lanzada"})
+        self.assertIn("state changed", err.getvalue())     # the second one said why it skipped it
+
+
 class Takeover(DaemonCase):
     def test_other_daemon_takes_the_lease_within_two_intervals_of_expiry(self):
         ttl, interval = 1.5, 0.3
@@ -205,7 +249,9 @@ class Orgs(DaemonCase):
             self.assertFalse(cl.claim(90))
             self.assertEqual(cl.flows(), [{"id": "f", "estado": "activo"}])
         self.assertEqual(calls[0][:3], ["ssh", "-o", "BatchMode=yes"])
-        self.assertIn("DELEGA_MEM_OWNER=me delega mem claim orquestador:personal --ttl 90", calls[0][-1])
+        self.assertIn("DELEGA_MEM_OWNER=me", calls[0][-1])         # the owner always travels
+        self.assertIn("DELEGA_MEM_ORG=personal", calls[0][-1])      # and so does the org
+        self.assertIn("delega mem claim orquestador:personal --ttl 90", calls[0][-1])
         self.assertTrue(calls[0][-1].endswith("--json"))
 
 
