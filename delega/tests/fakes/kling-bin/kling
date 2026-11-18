@@ -8,7 +8,9 @@ root dir, except the home and the mounted volumes ($HOME/.kling-volumes/<name>).
 variables named with -e from the host environment, like the real one, and runs tests/fakes/kling-bin/
 fake-dbctl wherever the command says /usr/local/bin/delega-db. `save` copies a cloned VM back as a golden.
 `run` records -ttl/-on-ttl/-label in the machine file; `exec` cuts stdout at 8 MiB like the real one.
-$FAKE_KLING_NO_ROOM makes `run` refuse for lack of memory. Calls are logged to $HOME/.kling.log.
+`ps` prints the table (ID NAME STATE) or, with -json, the machines with their labels (as the real
+one does). $FAKE_KLING_NO_ROOM makes `run` refuse for lack of memory. Calls are logged to
+$HOME/.kling.log.
 """
 import json
 import os
@@ -47,6 +49,12 @@ def vm_info(n):
 def vm_save(n, info):
     with open(vm_file(n), "w") as f:
         json.dump(info, f)
+
+
+def vm_state(n):
+    """The state of a machine: what the file says, or frozen/running (the real kling knows more)."""
+    info = vm_info(n) or {}
+    return info.get("state") or ("frozen" if info.get("frozen") else "running")
 
 
 def root(n):
@@ -206,11 +214,14 @@ def main(a):
     cmd = a[0]
     if cmd == "ps":
         names = sorted(n for n in os.listdir(reg) if not n.endswith(".root"))
+        if "-json" in a:      # the real kling answers with the machines and their labels
+            print(json.dumps([{"id": n, "name": n, "state": vm_state(n),
+                               "labels": (vm_info(n) or {}).get("labels") or {}} for n in names]))
+            return 0
         if "-q" not in a:
             print("ID NAME STATE")
         for n in names:
-            st = "frozen" if (vm_info(n) or {}).get("frozen") else "running"
-            print(n if "-q" in a else f"x {n} {st}")
+            print(n if "-q" in a else f"x {n} {vm_state(n)}")
         return 0
     if cmd == "run":
         return create(a)

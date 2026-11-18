@@ -539,10 +539,14 @@ def main_recover(argv):
 def gc(cfg, node_names=None, yes=False, out=None):
     """Delete the delega VMs whose job ended or is unknown to this state_dir, on every kindling host
     (once per host). Without yes, only list them. The other orphans (frozen, stale lease) are shown
-    with `delega recover`: they may hold work. Returns the number of VMs deleted (or to delete)."""
+    with `delega recover`: they may hold work. Only our own VMs are deleted: the host can be shared
+    with another orchestrator (or another state_dir), and its VMs are alive: they are listed and left.
+    An ended job proves the VM is ours (its job dir is here); an unknown one only with the owner label.
+    Returns the number of VMs deleted (or to delete)."""
     from . import kindling
     out = out or sys.stdout
     seen, n = set(), 0
+    me = owner_label()
     for name in node_names or [k for k, v in cfg.nodes.items() if v.get("runner") == "kindling"]:
         node = cfg.node(name)
         host = remote.alias(node)
@@ -554,16 +558,28 @@ def gc(cfg, node_names=None, yes=False, out=None):
             print(t("jobs.gc.unreachable", host=host), file=out)
             continue
         _, orphans = kindling.classify(cfg, node, vms)
+        labels = None
         for vm, why in orphans:
-            if why in ("ended", "unknown"):
-                n += 1
-                if yes:
-                    kindling.destroy(node, vm)
-                print(t("jobs.gc.removed" if yes else "jobs.gc.would", vm=vm, host=host, why=t("jobs.gc.why." + why)),
-                      file=out)
-            else:
+            if why not in ("ended", "unknown"):
                 print(t("jobs.gc.keep", vm=vm, host=host, why=t("jobs.gc.why." + why),
                         job=vm[len(kindling.VM_PREFIX):]), file=out)
+                continue
+            if labels is None:
+                labels = kindling.host_labels(node)      # only when there is something to delete
+            owner = kindling.owner_of(labels, vm)
+            if owner and owner != me:
+                # the VM is another orchestrator's (the host is shared): it may have a live job
+                print(t("kindling.gc.other_owner", vm=vm, host=host, owner=owner, me=me), file=out)
+                continue
+            if why == "unknown" and not owner:
+                # no job of ours and no owner label: it may be another state_dir's: do not touch it
+                print(t("kindling.gc.no_owner", vm=vm, host=host), file=out)
+                continue
+            n += 1
+            if yes:
+                kindling.destroy(node, vm)
+            print(t("jobs.gc.removed" if yes else "jobs.gc.would", vm=vm, host=host, why=t("jobs.gc.why." + why)),
+                  file=out)
     if n and not yes:
         print(t("jobs.gc.hint"), file=out)
     elif not n:
@@ -573,9 +589,10 @@ def gc(cfg, node_names=None, yes=False, out=None):
 
 def main_gc(argv):
     ap = argparse.ArgumentParser(prog="delega gc", description="List (and with --yes delete) the delega VMs left "
-                                 "on kindling hosts by jobs that ended or that this machine does not know.")
+                                 "on kindling hosts by jobs that ended or that this machine does not know. "
+                                 "The VMs of another orchestrator are listed and left alone.")
     ap.add_argument("--node", action="append", help="kindling node (repeatable; default: all)")
-    ap.add_argument("--yes", action="store_true", help="delete them (default: only list)")
+    ap.add_argument("--yes", action="store_true", help="delete our own VMs (default: only list)")
     args = ap.parse_args(argv)
     cfg = _config.load()
     try:

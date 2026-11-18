@@ -12,6 +12,7 @@ from launch_env import FAKES, LaunchCase, sh
 from delega import util
 
 TOKEN = "tok-s3cret-123"
+OWNER = "tester"          # the orchestrator label of these tests ($DELEGA_OWNER)
 
 
 class KindlingCase(LaunchCase):
@@ -51,14 +52,21 @@ account = "dev@example.com (token)"
 """
         super().write_config()
 
-    def fake_vm(self, name, job=None, lease_age=None, end=False, final=False):
-        """A VM on the fake host (no golden home) and, with job, its job dir here and lease inside it."""
+    def fake_vm(self, name, job=None, lease_age=None, end=False, final=False, state=None, owner=OWNER):
+        """A VM on the fake host (no golden home) and, with job, its job dir here and lease inside it.
+        With state, the state the host reports (starting, creating…); with owner, the `delega.owner`
+        label it carries (None: no label at all)."""
         import json
         import time
         reg = os.path.join(self.node_home, ".kling-vms")
         os.makedirs(reg, exist_ok=True)
+        info = {}
+        if state:
+            info["state"] = state
+        if owner:
+            info["labels"] = {"delega.owner": owner}
         with open(os.path.join(reg, name), "w") as f:
-            f.write("{}")
+            json.dump(info, f)
         if job:
             chan = f"delega-jobs/{job}"
             self.new_job(id=job, NODE="vm", VM=name, CHANNEL=chan, **({"END": "1"} if end else {}))
@@ -336,6 +344,45 @@ class Kindling(KindlingCase):
             self.assertEqual(jobs.gc(config.load(), yes=True), 2)
         left = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
         self.assertEqual(left, ["delega-20260101-000000-a", "delega-20260101-000000-e"])
+
+    def test_gc_keeps_the_vms_of_another_orchestrator(self):
+        # the host is shared (the personal one and Trycore's on the same kling): the VMs of the other
+        # orchestrator are alive, so gc lists them and leaves them alone
+        import contextlib
+        import io
+
+        from delega import config, jobs
+        self.fake_vm("delega-20260101-000000-c", "20260101-000000-c", lease_age=1, end=True)
+        self.fake_vm("delega-20260101-000000-d", owner=OWNER)          # ours, but its job dir is gone
+        self.fake_vm("delega-20260101-000000-x", owner="trycore")      # another orchestrator's
+        self.fake_vm("delega-20260101-000000-y", owner=None)           # no label: it may be another's
+        reg = os.path.join(self.node_home, ".kling-vms")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(jobs.gc(config.load()), 2)                   # only ours would be deleted
+        self.assertIn("another orchestrator (trycore)", buf.getvalue())
+        self.assertIn("no owner label", buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(jobs.gc(config.load(), yes=True), 2)       # only ours
+        left = sorted(x for x in os.listdir(reg) if not x.endswith(".root"))
+        self.assertEqual(left, ["delega-20260101-000000-x", "delega-20260101-000000-y"])
+        out = buf.getvalue()
+        self.assertIn("another orchestrator (trycore)", out)
+        self.assertIn("no owner label", out)
+        self.assertEqual(out.count("deleted"), 2)      # only ours
+
+    def test_a_vm_being_set_up_counts_as_a_live_job(self):
+        # two launches at once: the first VM is still being created. If it did not count, both would
+        # fit in max_jobs=2 and the host would run out of memory
+        from delega import config, kindling
+        self.fake_vm("delega-20260101-000000-a", "20260101-000000-a", lease_age=1)
+        self.fake_vm("delega-20260101-000000-b", "20260101-000000-b", state="starting")
+        cfg = config.load()
+        res = kindling.probe(cfg, cfg.node("vm"), cfg.profile("work"))
+        self.assertFalse(res["ok"])
+        self.assertIn("max_jobs=2", res["reason"])
+        self.assertIn("2 delega VMs with a live job", res["reason"])
 
     def test_vm_gets_ttl_and_labels(self):
         rc, out, err = self.run_cli([self.repo, self.brief, "--node", "vm", "--cap-min", "10"])
