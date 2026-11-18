@@ -449,5 +449,9 @@
  "launch.err.branch_in_use": "branch {branch} is open in the worktree of job {job} ({path}), which has not ended: wait for it, close it (delega recover) or use another branch",
  "launch.warn.behind": "WARNING: local HEAD is {n} commit(s) behind origin/{branch}; only HEAD travels to the node",
  "launch.worktree.retired": "worktree of ended job {job} retired to reuse {branch}",
- "lint.rounds": "round {n} on branch {branch} in 24 h; the earlier rounds cost {cost} USD: check that a new round is the right move"
+ "lint.rounds": "round {n} on branch {branch} in 24 h; the earlier rounds cost {cost} USD: check that a new round is the right move",
+ "engine.pi.forbidden": "profile '{profile}' forbids the engine(s) {engines}: Pi/MiniMax only runs on personal profiles",
+ "engine.pi.cap_min": "time cap reached ({min} min): Pi was stopped",
+ "engine.pi.cap_turns": "turn cap reached ({turns}): Pi was stopped",
+ "engine.pi.no_kindling": "node '{node}' is kindling: --engine pi needs a plain node or --node local"
 }

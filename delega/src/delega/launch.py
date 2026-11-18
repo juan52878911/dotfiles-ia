@@ -250,7 +250,7 @@ def _home(rel):
     return '"$HOME"/' + shlex.quote(rel)
 
 
-def build_run_sh(node, profile, caps, chan, wt, argv_claude):
+def build_run_sh(node, profile, caps, chan, wt, argv_claude, engine=None, pi_model=None):
     """run.sh for a node: exports caps, locale and the profile's config dir, runs the broker in the worktree
     (directly, or with the worker inside `docker run` when node.runner == "docker")."""
     py = node.get("python", "python3")
@@ -262,6 +262,14 @@ def build_run_sh(node, profile, caps, chan, wt, argv_claude):
         lines.append(f"export CLAUDE_CONFIG_DIR={_home(cd)}")
     lines.append(f"cd {_home(wt)} || {{ echo 99 > {_home(chan)}/rc; exit; }}")
     launcher = nodes.launcher_for(profile, node)
+    if engine == "pi":      # Pi runs on the host, never in the claude docker image
+        from .engines import pi as pi_engine
+        broker = f"PYTHONPATH={_home(pyz)} {shlex.quote(py)} -m delega.engines.pi"
+        worker = " ".join(shlex.quote(x) for x in pi_engine.pi_argv(pi_model))
+        lines.append(f"{broker} run {_home(chan)} {_home(chan + '/brief.md')} -- {worker}"
+                     f" < /dev/null 2>> {_home(chan)}/stderr.log")
+        lines.append(f"rc=$?; test -f {_home(chan)}/rc || echo $rc > {_home(chan)}/rc")
+        return "\n".join(lines) + "\n"
     if node.get("runner", "host") == "docker":
         image = node.get("docker_image")
         if not image:
@@ -504,6 +512,8 @@ def build_parser():
     ap.add_argument("--mode", help="permission mode for the worker (default: policy permission_mode.default; "
                     "modes in permission_mode.deny are refused)")
     ap.add_argument("--model", help="model (default: the role's model, else the profile's)")
+    ap.add_argument("--engine", choices=("claude", "pi"), default="claude",
+                    help="worker engine (default claude); pi = `pi -p --mode json` (MiniMax), personal profiles only")
     ap.add_argument("--role", help="worker (default), reviewer, summarizer…: model and cost cap from [roles.<role>]; "
                     "a role with require_cap_usd is refused without --cap-usd")
     ap.add_argument("--worktree", metavar="NAME", help="local runs only: passed to claude --worktree")
@@ -557,6 +567,7 @@ class Launch:
         self.job_dir = None
         self.started = False
         self.vm = None          # kindling: node dict with the job's microVM, once created
+        self.pi_model = None
         self.dbs = []           # database specs the job gets (kindling only)
         self.budget = (0.0, 0.0)
 
@@ -629,6 +640,13 @@ class Launch:
         profile = cfg.profile(pname)
         project = cfg.project_for(repo_dir)
         pol = lambda k: cfg.policy(k, profile, project)
+        engine = a.engine or "claude"
+        if engine == "pi":
+            from .engines import pi as pi_engine
+            why = pi_engine.refuse_reason(profile, a.model)
+            if why:
+                raise Refused(REFUSED_RC, why)
+            self.pi_model = a.model        # explicit only: role/profile models are Claude's
         role = role_settings(cfg, profile, a.role or "worker")
         if a.role and role is None:
             raise Refused(REFUSED_RC, t("launch.err.role_unknown", role=a.role))
@@ -749,6 +767,8 @@ class Launch:
                 raise Refused(5, t("launch.err.version", node=node_name, remote=p.get("claude_version"), local=lv))
         account = p.get("email") or ""
         caps = caps_env(cfg, profile, project, a)
+        if engine == "pi" and kindling.is_kindling(node):
+            raise Refused(REFUSED_RC, t("engine.pi.no_kindling", node=node_name))
         argv_claude = claude_args(mode, a.resume, a.model or profile.get("model"),
                                   None if node else a.worktree)
         util.add_meta(self.job_dir, ACCOUNT=account, CLAUDE_VERSION=p.get("claude_version") or "",
@@ -812,7 +832,12 @@ class Launch:
                owner=util.read_meta(self.job_dir).get("OWNER"))
         print(t("launch.start", dir=self.job_dir, node="local", owner=util.read_meta(self.job_dir).get("OWNER"),
                 id=job_id))
-        argv = broker_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] + profile["launcher"] + argv_claude
+        if a.engine == "pi":
+            from .engines import pi as pi_engine
+            argv = pi_engine.runner_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] \
+                + pi_engine.pi_argv(self.pi_model)
+        else:
+            argv = broker_argv() + ["run", chan, os.path.join(self.job_dir, "brief.md"), "--"] + profile["launcher"] + argv_claude
         self.started = True
         rc = subprocess.run(argv, cwd=repo_dir, env=env, stdin=subprocess.DEVNULL).returncode
         util.add_meta(self.job_dir, END=int(time.time()))
@@ -865,7 +890,7 @@ class Launch:
         caps = dict(caps, DELEGA_BRANCH=branch)
         remote.must(remote.scp_to(node, self._context(profile, project, name, branch, account, caps),
                                   f"{chan}/context.md"), "upload context.md")
-        run_sh = build_run_sh(node, profile, caps, chan, wt, argv_claude)
+        run_sh = build_run_sh(node, profile, caps, chan, wt, argv_claude, a.engine, self.pi_model)
         local_sh = os.path.join(self.job_dir, "run.sh")
         with open(local_sh, "w") as f:
             f.write(run_sh)
