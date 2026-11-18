@@ -133,7 +133,7 @@ class IntegrateMergeTest(OpsCase):
         self.assertEqual(self.log(), "")                                   # no ssh at all
         self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 3)
 
-    def test_dest_moved_during_verify_aborts_with_8_and_keeps_destination(self):
+    def test_dest_moved_during_verify_aborts_with_11_and_keeps_destination(self):
         self.commit_on(self.repo, "feat", "b.txt", "new\n")
         def slow_verify(cfg, node, repo, sha, commands, timeout):
             self.commit_on(self.repo, "main", "late.txt", "x\n", base="main")   # main advances meanwhile
@@ -141,7 +141,7 @@ class IntegrateMergeTest(OpsCase):
         with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
             rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
         moved = self.git(self.repo, "rev-parse", "main")
-        self.assertEqual(rc, 8, out + err)
+        self.assertEqual(rc, 11, out + err)
         self.assertEqual(len(self.git(self.repo, "rev-list", "--parents", "-n1", "main").split()), 2)  # no merge commit
         self.assertTrue(os.path.exists(os.path.join(self.repo, "late.txt")))
         self.assertEqual(self.git(self.repo, "rev-parse", "main"), moved)
@@ -156,8 +156,20 @@ class IntegrateMergeTest(OpsCase):
             return [(c, 0, 0.0) for c in commands]
         with mock.patch.object(integrate, "run_verify_remote", side_effect=slow_verify):
             rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "box")
-        self.assertEqual(rc, 8, out + err)
+        self.assertEqual(rc, 11, out + err)
         self.assertEqual(self.git(self.repo, "log", "-1", "--format=%s", "main"), "late")
+
+    def test_node_of_another_profile_is_refused_before_any_push(self):
+        from delega import remote
+        self.write_config(TOML.replace("{bundle}", "/nonexistent")
+                          + '[nodes.other]\nssh = "other"\nprofiles = ["private"]\n'
+                          + '[profiles.private]\nowner = "self"\nnodes = ["other"]\n')
+        self.commit_on(self.repo, "feat", "b.txt", "new\n")
+        with mock.patch.object(remote, "ssh", side_effect=AssertionError("must not reach the node")):
+            rc, out, err = self.run_cli(integrate.main, self.repo, "feat", "--merge", "--node", "other")
+        self.assertEqual(rc, 2, out + err)
+        self.assertEqual(self.audit_last()["result"], "node_profile_refused")
+        self.assertFalse(os.path.exists(os.path.join(self.node_home, "delega", "repo.git")))
 
     def test_remote_ref_cleaned_when_worktree_add_fails(self):
         from delega import remote

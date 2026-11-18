@@ -33,8 +33,9 @@ class CleanTest(OpsCase):
         os.environ["DELEGA_SSH"] = os.path.join(FAKES, "ssh")
         os.environ["FAKE_NODE_HOME"] = self.node_home
 
-    def remote_job(self, job_id, *, ended=True, fetched=True, lease_age=None, final=False):
+    def remote_job(self, job_id, *, ended=True, fetched=True, lease_age=None, final=False, extra=None):
         meta = {"NODE": "box", "CHANNEL": f"delega/jobs/{job_id}", "BRANCH": f"delega/{job_id}"}
+        meta.update(extra or {})
         if ended:
             meta["END"] = str(int(time.time()) - 10 * 86400)
         job = self.make_job(f"{job_id}-repo", meta)
@@ -104,6 +105,36 @@ class CleanTest(OpsCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn("20260101-000000-1111", out)
         self.assertTrue(os.path.isdir(recent))
+
+    def test_fetched_sha_in_meta_is_required_when_the_key_exists(self):
+        _, empty = self.remote_job("20260101-000000-1111", lease_age=3600, final=True, extra={"FETCHED": ""})
+        _, sha = self.remote_job("20260102-000000-2222", lease_age=3600, final=True, extra={"FETCHED": "abc1234def"})
+        _, old = self.remote_job("20260103-000000-3333", lease_age=3600, final=True)   # no FETCHED: old rule
+        rc, out, err = self.run_cli(clean.main, "--node", "box", "--older-than", "1d", "--yes")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.isdir(empty))
+        self.assertFalse(os.path.exists(sha))
+        self.assertFalse(os.path.exists(old))
+
+    def test_job_without_lease_is_removed_but_unreadable_dir_is_not(self):
+        _, nolease = self.remote_job("20260101-000000-1111")
+        _, denied = self.remote_job("20260102-000000-2222", lease_age=3600, final=True)
+        if os.geteuid() == 0:
+            self.skipTest("root ignores permissions")
+        os.chmod(denied, 0)
+        self.addCleanup(os.chmod, denied, 0o755)
+        rc, out, err = self.run_cli(clean.main, "--node", "box", "--older-than", "1d", "--yes")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(nolease))
+        self.assertTrue(os.path.isdir(denied))
+
+    def test_permission_denied_on_lease_file_is_not_no_lease(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores permissions")
+        _, denied = self.remote_job("20260101-000000-1111", lease_age=3600, final=True)
+        os.chmod(os.path.join(denied, "lease.json"), 0)
+        rc, out, err = self.run_cli(clean.main, "--node", "box", "--older-than", "1d", "--yes")
+        self.assertTrue(os.path.isdir(denied))
 
 
 if __name__ == "__main__":
