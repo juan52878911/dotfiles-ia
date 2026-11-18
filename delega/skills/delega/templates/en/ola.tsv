@@ -1,0 +1,6 @@
+# id	brief	zona	deps	run_args
+# Columns separated by TAB. Zone: comma-separated globs, disjoint between rows of the same wave.
+# In the brief, \n is a line break. run_args: JSON object with `delega run` options.
+# Load: delega wave plan <flow> wave.tsv   ·   Advance: delega wave step <flow> --par 2
+# api-1	Añade el endpoint /ping con su test.\nCriterio: la suite verde.	src/api/**,tests/api/**		{"profile":"personal"}
+# ui-1	Pinta el estado en la cabecera.	src/ui/**,tests/ui/**	api-1	{"node":"kindling-personal"}
