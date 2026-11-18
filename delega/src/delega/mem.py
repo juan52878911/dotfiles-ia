@@ -24,7 +24,7 @@ The interface (stable: the daemon with leases and the handover are built on top 
                            [--deps <a,b>] [--run-args <json>] [--id <id>]
     delega mem next       <flujo>
     delega mem set        <tarea> --estado <estado> --org <org> [--desde <estado>] [--forzar]
-                           [--job-id <id>] [--nodo <n>] [--rama <r>] [--intentos <n>]
+                           [--job-id <id>] [--nodo <n>] [--rama <r>] [--intentos <n>] [--lanzador <dueño>]
     delega mem claim      <rol> --owner <id> --org <org> --ttl <segundos>
     delega mem heartbeat  <rol> --owner <id> --org <org> [--ttl <segundos>]
     delega mem release    <rol> --owner <id> --org <org>
@@ -61,7 +61,7 @@ Schema (`PRAGMA user_version`; the migration is idempotent, so `init` can be rep
     org      id, org, creada                       the organization of this database (one row)
     flujos   id, org, repo, rama_destino, estado, plan, creado, actualizado
     tareas   id, flujo, ola, brief, zona, deps, run_args, estado, intentos, job_id, nodo,
-             rama, creado, actualizado             estado ∈ pendiente|lanzada|ok|rojo|arreglo|
+             rama, lanzador (owner of the daemon that launched it), creado, actualizado             estado ∈ pendiente|lanzada|ok|rojo|arreglo|
              bloqueada|hecha; deps and run_args are JSON
     leases   rol, dueno (stable owner id), vence_en, latido, epoca
     meta     clave, valor                           the orchestration epoch is meta.epoca
@@ -80,7 +80,7 @@ import time
 
 from . import i18n
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_DB_DIR = "~/.local/state/delega"
 DEFAULT_DB_TEMPLATE = DEFAULT_DB_DIR + "/memoria-{org}.db"
 BUSY_TIMEOUT_MS = 5000
@@ -131,6 +131,7 @@ SCHEMA = [
         job_id      TEXT,
         nodo        TEXT,
         rama        TEXT,
+        lanzador    TEXT,
         creado      REAL NOT NULL,
         actualizado REAL NOT NULL
     )""",
@@ -340,6 +341,9 @@ def migrate(conn):
         columns = {r[1] for r in conn.execute("PRAGMA table_info(leases)").fetchall()}
         if "epoca" not in columns:
             conn.execute("ALTER TABLE leases ADD COLUMN epoca INTEGER NOT NULL DEFAULT 1")
+        tcols = {r[1] for r in conn.execute("PRAGMA table_info(tareas)").fetchall()}
+        if "lanzador" not in tcols:
+            conn.execute("ALTER TABLE tareas ADD COLUMN lanzador TEXT")
         conn.execute("INSERT OR IGNORE INTO meta (clave, valor) VALUES ('epoca', '1')")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.execute("COMMIT")
@@ -548,7 +552,7 @@ def next_tasks(conn, flow):
 
 
 def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=None, error=None,
-             desde=None, force=False, org=None):
+             desde=None, force=False, org=None, lanzador=None):
     """Move a task to another state (and note where it runs).
 
     The current row is read inside the write transaction. `desde` is an optional
@@ -582,16 +586,18 @@ def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=Non
         new_job_id = job_id if job_id is not None else row["job_id"]
         new_nodo = nodo if nodo is not None else row["nodo"]
         new_rama = rama if rama is not None else row["rama"]
+        new_lanzador = lanzador if lanzador is not None else row["lanzador"]
         now = time.time()
         c.execute("UPDATE tareas SET estado = ?, intentos = ?, job_id = ?, nodo = ?, rama = ?,"
-                  " actualizado = ? WHERE id = ?",
-                  (estado, int(new_attempts), new_job_id, new_nodo, new_rama, now, task))
+                  " lanzador = ?, actualizado = ? WHERE id = ?",
+                  (estado, int(new_attempts), new_job_id, new_nodo, new_rama, new_lanzador, now, task))
         _event(c, "task.set", {"tarea": task, "flujo": row["flujo"], "estado": estado,
                                "estado_anterior": current, "intentos": int(new_attempts),
                                "job_id": new_job_id, "nodo": new_nodo,
-                               "rama": new_rama, "error": error})
+                               "rama": new_rama, "lanzador": new_lanzador, "error": error})
         return {"id": task, "flujo": row["flujo"], "estado": estado, "intentos": int(new_attempts),
-                "job_id": new_job_id, "nodo": new_nodo, "rama": new_rama, "actualizado": now}
+                "job_id": new_job_id, "nodo": new_nodo, "rama": new_rama, "lanzador": new_lanzador,
+                "actualizado": now}
 
     return write(conn, op)
 
@@ -928,7 +934,7 @@ def cmd_next(args, db, as_json):
 def cmd_set(args, db, as_json):
     pos, flags, vals = _parse(args, flags=("forzar",),
                                values=("estado", "state", "desde", "job-id", "nodo", "node", "rama",
-                                       "branch", "intentos", "error", "id", "org"))
+                                       "branch", "intentos", "error", "id", "org", "lanzador"))
     org = _org(vals, required=True)
     task = vals.get("id") or (pos.pop(0) if pos else None)
     if not task:
@@ -941,7 +947,8 @@ def cmd_set(args, db, as_json):
     try:
         res = set_task(conn, task, estado, job_id=vals.get("job-id"), nodo=vals.get("nodo") or vals.get("node"),
                        rama=vals.get("rama") or vals.get("branch"), intentos=intentos, error=vals.get("error"),
-                       desde=vals.get("desde"), force="forzar" in flags, org=org)
+                       desde=vals.get("desde"), force="forzar" in flags, org=org,
+                       lanzador=vals.get("lanzador"))
     finally:
         conn.close()
     payload = {"ok": True, "cmd": "set", "tarea": res}

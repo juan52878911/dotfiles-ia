@@ -471,5 +471,9 @@
  "mem.fenced": "the owner {owner} is fenced since epoch {epoca} (memory at epoch {actual}): a promotion fenced it; readmit it with `mem unfence {owner} --yes`",
  "mem.unfence_usage": "usage: mem unfence <owner> --yes --org <org>",
  "mem.unfence_dry": "nothing done: unfence would readmit the owner {owner}; repeat with --yes",
- "mem.unfenced": "owner {owner} readmitted (fence removed: {removed})"
+ "mem.unfenced": "owner {owner} readmitted (fence removed: {removed})",
+ "jobstate.usage": "usage: delega job-state --task <id> --job-id <id> [--rama <rama>] [--json]",
+ "jobstate.line": "task {id}: {estado} (job {job})",
+ "n2.lanzador_unreachable": "launcher {host} did not answer for task {id} ({n}/{max})",
+ "n2.ok_not_fetched": "task {id} is ok at {sha} on node {node}, but the branch could not be fetched here: {err}"
 }

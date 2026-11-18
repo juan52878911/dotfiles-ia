@@ -24,6 +24,7 @@ COMMANDS = {
     "queue":     ("queue",     "queue a brief with a priority / list the queue"),
     "mem":       ("mem",       "central orchestration memory in SQLite: flows, tasks, leases, log"),
     "wave":      ("wave",      "a wave of tasks in the memory: plan, step (idempotent), status"),
+    "job-state": ("jobstate",  "read-only state of a task's job (asked by another daemon over ssh)"),
     "tick":      ("queue",     "reconcile leases and launch queued jobs when there is room"),
     "integrate": ("integrate", "dry-run merge of a job branch and run the project's verify commands"),
     "sync":      ("sync",      "push the profile's rules bundle (CLAUDE.md, hooks, agents) to nodes"),

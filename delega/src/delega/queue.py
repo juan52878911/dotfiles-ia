@@ -387,7 +387,8 @@ class MemClient:
         rc, payload = self._call(lambda: self._remote("next", flow))
         return payload.get("tareas", [])
 
-    def set(self, task, estado, error=None, desde=None, force=False, job_id=None, rama=None, nodo=None):
+    def set(self, task, estado, error=None, desde=None, force=False, job_id=None, rama=None, nodo=None,
+            lanzador=None):
         """(rc, payload) of `set`: rc 9 when the compare-and-set found another state (somebody
         else moved the task first), rc 10 when the database stayed locked."""
         from . import mem
@@ -396,7 +397,8 @@ class MemClient:
                 try:
                     payload = self._local(lambda c: mem.set_task(c, task, estado, error=error,
                                                                 desde=desde, force=force, org=self.org,
-                                                                job_id=job_id, rama=rama, nodo=nodo))
+                                                                job_id=job_id, rama=rama, nodo=nodo,
+                                                                lanzador=lanzador))
                 except mem.MemConflict as e:
                     return mem.EXIT_LEASE, {"error": str(e)}
                 except sqlite3.OperationalError as e:
@@ -408,7 +410,8 @@ class MemClient:
         extra = ["--error", error] if error else []
         if desde:
             extra += ["--desde", desde]
-        for flag, val in (("--job-id", job_id), ("--rama", rama), ("--nodo", nodo)):
+        for flag, val in (("--job-id", job_id), ("--rama", rama), ("--nodo", nodo),
+                           ("--lanzador", lanzador)):
             if val:
                 extra += [flag, val]
         if force:
@@ -554,22 +557,119 @@ def _wave_step(cfg, client, fl):
             os.environ["DELEGA_MEM_OWNER"] = prev
 
 
+LANZADOR_MAX_FALLOS = 10     # consecutive cycles without an answer from the launcher (~5 min)
+_LANZADOR_FALLOS = {}        # (org, task) -> consecutive cycles without an answer
+
+
+def _ask_lanzador(host, t):
+    """The state of a task's job as the host that launched it sees it: the dict of
+    `delega job-state --json`, or None when it did not answer (ssh rc 255, timeout, garbage)."""
+    import shlex
+    cmd = ('PATH="$HOME/.local/bin:$PATH" delega job-state --task %s --rama %s --job-id %s --flujo %s --json'
+           % tuple(shlex.quote(str(x or "")) for x in (t["id"], t.get("rama"), t.get("job_id"), t.get("flujo"))))
+    try:
+        r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, cmd], capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("estado") in ("running", "ok", "fail", "queued"):
+            return d
+        return None
+    return None
+
+
+def _event_once(client, t, datos):
+    from . import mem
+    try:
+        if client.m["local"]:
+            client._call(lambda: client._local_rc(lambda c: mem.add_event(
+                c, "necesita_decision", datos, task=t["id"], once=True, quien=client.owner)))
+        else:
+            client._remote("event", "necesita_decision", "--task", t["id"], "--once",
+                           "--datos", json.dumps(datos))
+    except Exception as e:
+        print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
+
+
+def _reconcile_foreign(cfg, client, fl, t):
+    """A task launched by another owner whose job directory is not here: ask the launcher.
+    Returns (state, job_id) to settle, or None to leave the task in `lanzada` for the next cycle."""
+    key = (client.org, t["id"])
+    host = t["lanzador"]
+    ans = _ask_lanzador(host, dict(t, flujo=fl["id"]))
+    if ans is None:
+        n = _LANZADOR_FALLOS[key] = _LANZADOR_FALLOS.get(key, 0) + 1
+        print(i18n.t("n2.lanzador_unreachable", host=host, id=t["id"], n=n, max=LANZADOR_MAX_FALLOS),
+              file=sys.stderr)
+        if n == LANZADOR_MAX_FALLOS:
+            _event_once(client, t, {"flujo": fl["id"], "motivo": "lanzador_caido", "lanzador": host,
+                                    "job_id": t.get("job_id")})
+        return None
+    _LANZADOR_FALLOS.pop(key, None)
+    state, jid = ans["estado"], ans.get("job_id") or t.get("job_id")
+    if state != "ok":
+        return state, jid
+    sha, node = ans.get("sha"), ans.get("node")
+    if not sha:
+        return "fail", jid
+    err = None
+    try:
+        from . import remote
+        env = _flow_env(cfg, client, fl)
+        if wave_have(env.repo_dir, sha):
+            pass
+        elif not node:
+            err = "unknown node"
+        else:
+            ok, log = remote.fetch_branch(env.repo_dir, cfg.node(node), fl["repo"], t.get("rama"))
+            if not ok or not wave_have(env.repo_dir, sha):
+                err = (log or "fetch failed").strip()[-200:]
+    except Exception as e:
+        err = str(e)
+    if err:
+        print(i18n.t("n2.ok_not_fetched", id=t["id"], sha=sha[:12], node=node, err=err), file=sys.stderr)
+        _event_once(client, t, {"flujo": fl["id"], "motivo": "ok_sin_traer", "sha": sha, "node": node,
+                                "job_id": jid})
+    return "ok", jid
+
+
+def wave_have(repo_dir, sha):
+    from . import wave
+    rc, _ = wave._git(repo_dir, "rev-parse", "--verify", "-q", f"{sha}^{{commit}}")
+    return rc == 0
+
+
 def _reconcile_tasks(cfg, client, fl, tasks):
     """lanzada -> ok/rojo from the state of the task's job (compare-and-set on `lanzada`)."""
     from . import mem
     env = None
     for t in tasks:
+        foreign = False
         if t["estado"] != "lanzada" or not t.get("job_id"):
             continue
         try:
             env = env or _flow_env(cfg, client, fl)
-            state, jid, _sha = env.job_state(t)
+            if t.get("lanzador") and t["lanzador"] != client.owner and env._job_dir(t) is None:
+                res = _reconcile_foreign(cfg, client, fl, t)
+                if res is None:
+                    continue
+                state, jid = res
+                foreign = True
+            else:
+                state, jid, _sha = env.job_state(t)
         except Exception as e:
             print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
             continue
         if state in ("running", "queued"):
             continue
-        if state == "fail" and not jid.startswith("pend:") and env._job_dir(t) is None:
+        if state == "fail" and not foreign and not jid.startswith("pend:") and env._job_dir(t) is None:
             # a real job id whose directory is gone (cleaned, or another state_dir): not a failure
             # of the job; leave the task as it is and ask for a decision, once
             datos = {"flujo": fl["id"], "motivo": "job_sin_directorio", "job_id": jid}
@@ -646,7 +746,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
         """Take the task with a compare-and-set (`set --desde pendiente`): the daemon that moves
         it out of `pendiente` is the one that launches it; the others get rc 9 and skip it."""
         rc, payload = client.set(it["id"], "lanzada", desde="pendiente", rama=it.get("rama"),
-                                 nodo=it.get("nodo"))
+                                 nodo=it.get("nodo"), lanzador=client.owner)
         if rc == mem.EXIT_OK:
             return True
         print(i18n.t("tick.bad_item", id=it["id"], err=mem_reason(rc, payload, it["id"])), file=sys.stderr)
@@ -661,7 +761,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
         if state != "launched":               # 'lanzada' -> 'rojo': the worker never started
             client.set(it["id"], "rojo", error=detail)
         else:
-            client.set(it["id"], "lanzada", desde="lanzada", job_id=it.get("job_id"))
+            client.set(it["id"], "lanzada", desde="lanzada", job_id=it.get("job_id"), lanzador=client.owner)
 
     started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl),
                            reserve=reserve, unreserve=unreserve)
