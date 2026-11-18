@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-from . import audit, config, i18n, util
+from . import audit, config, i18n, relevo, util
 
 LAUNCH_GRACE_S = 3        # a launch that dies within this time (refused: budget, identity…) is "failed"
 
@@ -511,7 +511,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
             continue
         for t in client.ready(fl["id"]):
             ra = t.get("run_args") or {}
-            repo = _checkout(client.m, fl["repo"], ra.get("_checkout"))
+            repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"], ra.get("_checkout"))
             if not repo:
                 print(i18n.t("tick.no_checkout", id=t["id"], repo=fl["repo"]), file=sys.stderr)
                 continue
@@ -543,6 +543,7 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
     started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl),
                            reserve=reserve, unreserve=unreserve)
     print(i18n.t("tick.summary", n=started, left=len(items) - started))
+    relevo.after_cycle(cfg, client)
     return True
 
 
