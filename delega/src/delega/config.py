@@ -130,6 +130,9 @@ class Config:
             for key in ("failover", "rotate"):
                 if p.get(key):
                     raise ConfigError(f"profile '{name}': '{key}' is not supported: jobs never move between accounts")
+            bp = p.get("branch_prefix")
+            if bp is not None and (not isinstance(bp, str) or not re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/", bp)):
+                raise ConfigError(f"profile '{name}': branch_prefix must be like \"chore/\" (ends with '/')")
             for n in p.get("nodes", []):
                 if n not in self.nodes:
                     raise ConfigError(f"profile '{name}' lists unknown node '{n}'")
@@ -177,6 +180,7 @@ class Config:
         p.setdefault("nodes", [])
         p.setdefault("compute", [])
         p.setdefault("forbidden_engines", [])
+        p.setdefault("branch_prefix", "delega/")
         return p
 
     def project_for(self, repo_dir):

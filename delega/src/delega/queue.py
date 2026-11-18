@@ -388,7 +388,7 @@ class MemClient:
         return payload.get("tareas", [])
 
     def set(self, task, estado, error=None, desde=None, force=False, job_id=None, rama=None, nodo=None,
-            lanzador=None):
+            lanzador=None, intentos=None):
         """(rc, payload) of `set`: rc 9 when the compare-and-set found another state (somebody
         else moved the task first), rc 10 when the database stayed locked."""
         from . import mem
@@ -398,7 +398,7 @@ class MemClient:
                     payload = self._local(lambda c: mem.set_task(c, task, estado, error=error,
                                                                 desde=desde, force=force, org=self.org,
                                                                 job_id=job_id, rama=rama, nodo=nodo,
-                                                                lanzador=lanzador))
+                                                                lanzador=lanzador, intentos=intentos))
                 except mem.MemConflict as e:
                     return mem.EXIT_LEASE, {"error": str(e)}
                 except sqlite3.OperationalError as e:
@@ -414,6 +414,10 @@ class MemClient:
                            ("--lanzador", lanzador)):
             if val:
                 extra += [flag, val]
+        if job_id == "":                       # an empty job id clears it (a task given back)
+            extra += ["--job-id", ""]
+        if intentos is not None:
+            extra += ["--intentos", str(intentos)]
         if force:
             extra += ["--forzar"]
         return self._call(lambda: self._remote("set", task, "--estado", estado, *extra))
@@ -531,25 +535,34 @@ def _flow_env(cfg, client, fl):
     return wave.Env(repo, org=client.org)
 
 
+def _has_deps(tasks):
+    return any(t.get("deps") for t in tasks)
+
+
 def _wave_step(cfg, client, fl):
-    """A flow with waves is driven by wave.step (it launches one wave at a time, with --par)."""
+    """A flow with waves (or with deps between tasks) is driven by wave.step, one wave at a time,
+    with --par. Whatever host holds the lease drives it: with a remote base `wave.step` talks to
+    it through the same ssh `MemClient` (every write with --owner/--org and the epoch fence)."""
     from . import mem, wave
     flow = fl["id"]
-    if not client.m["local"]:
-        print(i18n.t("tick.wave_remote", flow=flow), file=sys.stderr)
-        return
     prev = os.environ.get("DELEGA_MEM_OWNER")
     os.environ["DELEGA_MEM_OWNER"] = client.owner
+    conn = None
     try:
-        conn = client._conn()
         try:
             env = _flow_env(cfg, client, fl)
-            wave.check_profiles(conn, flow, client.org, env.repo_dir)
-            wave.step(conn, flow, env, org=client.org, say=lambda m: print(m))
+            if client.m["local"]:
+                conn = client._conn()
+                base = conn
+            else:
+                base = client
+            wave.check_profiles(base, flow, client.org, env.repo_dir)
+            wave.step(base, flow, env, org=client.org, say=lambda m: print(m))
         except mem.MemError as e:
             print(i18n.t("tick.bad_item", id=flow, err=e), file=sys.stderr)
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
     finally:
         if prev is None:
             os.environ.pop("DELEGA_MEM_OWNER", None)
@@ -710,8 +723,10 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
     for fl in client.flows():
         if fl.get("estado") != "activo":
             continue
-        # waves: more than one (`ola` defaults to 1, so ola > 0 would take every flow)
-        if any((t.get("ola") or 1) > 1 for t in by_flow.get(fl["id"], [])):
+        # waves: more than one (`ola` defaults to 1, so ola > 0 would take every flow); a flow whose
+        # tasks have deps is one too: only wave.step takes the `ok` ones to `hecha` for the dependents
+        ftasks = by_flow.get(fl["id"], [])
+        if any((t.get("ola") or 1) > 1 for t in ftasks) or _has_deps(ftasks):
             _wave_step(cfg, client, fl)
             continue
         _reconcile_tasks(cfg, client, fl, by_flow.get(fl["id"], []))
@@ -732,7 +747,8 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
             brief = os.path.join(qdir, base + ".md")
             with open(brief, "w", encoding="utf-8") as f:
                 f.write(t["brief"])
-            rama = str(ra.get("branch") or f"delega/q-{base}")[:100]
+            prefix = cfg.profile(pname).get("branch_prefix") or "delega/"
+            rama = str(ra.get("branch") or f"{prefix}q-{base}")[:100]
             ra = dict(ra, profile=pname, branch=rama)
             it = {"id": t["id"], "repo": repo, "brief": brief, "args": dict_to_args(ra),
                   "log_path": os.path.join(qdir, base + ".log"), "rama": rama,

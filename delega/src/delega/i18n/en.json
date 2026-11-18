@@ -400,7 +400,6 @@
  "tick.migrated": "queue item {id} migrated to the database as {task}",
  "tick.migrate_skip": "queue item {id} not migrated: {err}",
  "tick.no_checkout": "task {id} waits: no local checkout of {repo} (set repos in [memoria.<org>])",
- "tick.wave_remote": "flow {flow} has waves and its database is remote: drive it with `delega wave step` on the host",
  "tick.task_reconciled": "task {id} reconciled: {estado}",
  "tick.wrong_org": "profile {profile} does not belong to the org {org} of this database",
  "tick.daemon_start": "daemon: org {org}, owner {owner}, every {interval} s",

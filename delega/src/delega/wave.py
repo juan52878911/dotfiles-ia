@@ -211,7 +211,7 @@ def check_profiles(conn, flow, org, repo_dir=None):
             default = config.load().profile_for(repo_dir)
         except Exception:
             default = None
-    for t in _tasks(conn, flow):
+    for t in as_store(conn, org).tasks(flow):
         po = mem._profile_org((t["run_args"] or {}).get("profile") or default)
         if po and po != org:
             raise mem.MemError(i18n.t("wave.profile_org", id=t["id"], org=po, base=org))
@@ -230,6 +230,15 @@ class Env:
             from . import config
             self._cfg = config.load()
         return self._cfg
+
+    def branch_prefix(self, task):
+        """`branch_prefix` of the profile the task runs with (default `delega/`)."""
+        try:
+            cfg = self.cfg()
+            name = (task.get("run_args") or {}).get("profile") or cfg.profile_for(self.repo_dir)
+            return cfg.profile(name).get("branch_prefix") or "delega/"
+        except Exception:
+            return "delega/"
 
     def _wave_dir(self):
         d = os.path.join(self.cfg().state_dir, "wave", self.org or "_")
@@ -399,20 +408,119 @@ def _sha_of(conn, flow, task):
     return None
 
 
+# ── stores: the base as step sees it (local SQLite, or `delega mem` over ssh) ────────────────
+class LocalStore:
+    """The base is a SQLite file on this host."""
+
+    def __init__(self, conn, org=None):
+        self.conn, self.org = conn, org
+
+    def flow(self, flow):
+        row = self.conn.execute("SELECT * FROM flujos WHERE id = ?", (flow,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def tasks(self, flow):
+        return _tasks(self.conn, flow)
+
+    def next(self, flow):
+        return mem.next_tasks(self.conn, flow)[0]
+
+    def set(self, task, estado, desde, force=False, **kw):
+        """Compare-and-set of a task state. False when another orchestrator moved it first."""
+        try:
+            _retry(lambda: mem.set_task(self.conn, task, estado, desde=desde, force=force, org=self.org, **kw))
+            return True
+        except mem.MemConflict:
+            return False
+
+    def event(self, que, datos):
+        _retry(lambda: mem.add_event(self.conn, que, datos, quien=mem.owner_id()))
+
+    def sha_of(self, flow, task):
+        for e in reversed(mem.log_events(self.conn, limit=0, flow=flow)):
+            if e["que"] == "wave.sha" and e["datos"].get("tarea") == task:
+                return e["datos"].get("sha")
+        return None
+
+
+class ClientStore:
+    """The base is on another host: every call is a `delega mem … --json` over ssh through the
+    queue's `MemClient`, which carries `--owner`/`--org` (and the epoch fence of mem) on each write."""
+
+    def __init__(self, client):
+        self.client, self.org = client, client.org
+
+    def flow(self, flow):
+        for f in self.client.flows():
+            if f["id"] == flow:
+                return f
+        return None
+
+    def tasks(self, flow):
+        rc, res = self.client._call(lambda: self.client._remote("export"))
+        if rc != mem.EXIT_OK:
+            raise mem.MemError(f"export: rc={rc}")
+        return [t for t in res.get("tareas", []) if t["flujo"] == flow]
+
+    def next(self, flow):
+        return self.client.ready(flow)
+
+    def set(self, task, estado, desde, force=False, **kw):
+        rc, payload = self.client.set(task, estado, desde=desde, force=force, **kw)
+        if rc == mem.EXIT_OK:
+            return True
+        if rc == mem.EXIT_LEASE:
+            return False
+        raise mem.MemError(payload.get("error") or f"set {task}: rc={rc}")
+
+    def event(self, que, datos):
+        rc, payload = self.client._call(lambda: self.client._remote(
+            "event", que, "--datos", json.dumps(datos, ensure_ascii=False)))
+        if rc != mem.EXIT_OK:
+            raise mem.MemError(payload.get("error") or f"event: rc={rc}")
+
+    def sha_of(self, flow, task):
+        rc, payload = self.client._call(lambda: self.client._remote("log", "--flow", flow, "--limit", "0"))
+        for e in reversed(payload.get("eventos", [])):
+            if e["que"] == "wave.sha" and e["datos"].get("tarea") == task:
+                return e["datos"].get("sha")
+        return None
+
+
+def as_store(base, org=None):
+    """`base` is a sqlite connection, a MemClient, or already a store."""
+    if hasattr(base, "execute"):
+        return LocalStore(base, org)
+    if hasattr(base, "_remote"):
+        return ClientStore(base)
+    return base
+
+
+def _needed_by_others(tasks, wave):
+    """ids of the tasks of the wave that another task not yet `hecha` depends on."""
+    need = set()
+    for t in tasks:
+        if t["estado"] != "hecha":
+            need.update(t.get("deps") or [])
+    return need
+
+
 def _conflict_files(out):
     return [ln.strip() for ln in out.splitlines() if ln.startswith("  ")]
 
 
 def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=None):
+    """One step of a flow. `conn` is a sqlite connection (local base) or a MemClient (remote base)."""
     if not org:
         raise mem.MemError(i18n.t("wave.no_org"))
-    flow_row = conn.execute("SELECT * FROM flujos WHERE id = ?", (flow,)).fetchone()
+    st = as_store(conn, org)
+    flow_row = st.flow(flow)
     if flow_row is None:
         raise mem.MemError(i18n.t("mem.unknown_flow", flow=flow))
     into = into or flow_row["rama_destino"] or "main"
 
     # 1. reconcile
-    for t in _tasks(conn, flow):
+    for t in st.tasks(flow):
         if t["estado"] not in ("lanzada", "arreglo"):
             continue
         res = env.job_state(t)
@@ -420,62 +528,62 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
         sha = res[2] if len(res) > 2 else None
         if state == "running":
             if jid != t["job_id"]:
-                _set(conn, org, t["id"], t["estado"], t["estado"], job_id=jid)
+                st.set(t["id"], t["estado"], t["estado"], job_id=jid)
             continue
         if state == "queued":
             # the node was full: `delega run` did not start (rc 6). Give the attempt back.
             back = "pendiente" if t["estado"] == "lanzada" else (
-                "ok" if _sha_of(conn, flow, t["id"]) else "rojo")
-            if _set(conn, org, t["id"], back, t["estado"], force=True, job_id="",
+                "ok" if st.sha_of(flow, t["id"]) else "rojo")
+            if st.set(t["id"], back, t["estado"], force=True, job_id="",
                     intentos=max(t["intentos"] - 1, 0)):
                 say(i18n.t("wave.requeued", id=t["id"]))
             continue
         if state == "ok":
             if sha:
-                _event(conn, "wave.sha", {"flujo": flow, "tarea": t["id"], "sha": sha})
+                st.event("wave.sha", {"flujo": flow, "tarea": t["id"], "sha": sha})
             if t["estado"] == "arreglo":     # the fix job came back: arreglo -> lanzada -> ok
-                if not _set(conn, org, t["id"], "lanzada", "arreglo", job_id=jid, intentos=t["intentos"]):
+                if not st.set(t["id"], "lanzada", "arreglo", job_id=jid, intentos=t["intentos"]):
                     continue
-            if not _set(conn, org, t["id"], "ok", "lanzada", job_id=jid):
+            if not st.set(t["id"], "ok", "lanzada", job_id=jid):
                 continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="ok"))
         elif t["estado"] == "arreglo":
-            if not _set(conn, org, t["id"], "bloqueada", "arreglo", job_id=jid, error="fix job failed"):
+            if not st.set(t["id"], "bloqueada", "arreglo", job_id=jid, error="fix job failed"):
                 continue
-            _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "arreglo_fallido"})
+            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "arreglo_fallido"})
             say(i18n.t("wave.fix_failed", id=t["id"]))
         else:
-            if not _set(conn, org, t["id"], "rojo", "lanzada", job_id=jid):
+            if not st.set(t["id"], "rojo", "lanzada", job_id=jid):
                 continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="rojo"))
 
     # 1b. a failed job: one retry as a fix, then a decision
-    inflight = sum(1 for t in _tasks(conn, flow) if t["estado"] in ("lanzada", "arreglo"))
-    for t in _tasks(conn, flow):
+    inflight = sum(1 for t in st.tasks(flow) if t["estado"] in ("lanzada", "arreglo"))
+    for t in st.tasks(flow):
         if t["estado"] != "rojo":
             continue
         if t["intentos"] >= 2:
-            if _set(conn, org, t["id"], "bloqueada", "rojo", error="failed twice"):
-                _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_repetido"})
+            if st.set(t["id"], "bloqueada", "rojo", error="failed twice"):
+                st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_repetido"})
                 say(i18n.t("wave.blocked", id=t["id"]))
             continue
         if inflight >= par:
             continue
-        if not _set(conn, org, t["id"], "arreglo", "rojo", intentos=t["intentos"] + 1):
+        if not st.set(t["id"], "arreglo", "rojo", intentos=t["intentos"] + 1):
             continue
         brief = t["brief"] + "\n\n" + i18n.t("wave.retry_header")
         tail = env.log_tail(t) if hasattr(env, "log_tail") else ""
         if tail:
             brief += "\n\n" + i18n.t("wave.retry_log") + "\n" + tail
-        flags = run_flags(t["run_args"], t["zona"])
+        flags = run_flags({k: v for k, v in t["run_args"].items() if k != "branch"}, t["zona"])
         if node and "node" not in t["run_args"]:
             flags += ["--node", node]
         jid = env.launch(t, brief, t["rama"], flags)
-        _set(conn, org, t["id"], "arreglo", "arreglo", job_id=jid)
+        st.set(t["id"], "arreglo", "arreglo", job_id=jid)
         inflight += 1
         say(i18n.t("wave.retry_launched", id=t["id"]))
 
-    tasks = _tasks(conn, flow)
+    tasks = st.tasks(flow)
     open_waves = sorted({t["ola"] for t in tasks if t["estado"] != "hecha"})
     if not open_waves:
         say(i18n.t("wave.all_done", flow=flow))
@@ -485,52 +593,61 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
 
     # 2. launch the ready ones
     inflight = sum(1 for t in tasks if t["estado"] in ("lanzada", "arreglo"))
-    ready, _ = mem.next_tasks(conn, flow)
+    ready, _ = mem.nextst.tasks(flow)
     for t in ready:
         if t["ola"] != wave:
             continue
         if inflight >= par:
             break
-        branch = f"delega/wave-{flow}-{t['id']}"[:100]
         ra = t["run_args"]
-        flags = run_flags(ra, t["zona"])
+        prefix = env.branch_prefix(t) if hasattr(env, "branch_prefix") else "delega/"
+        branch = str(ra.get("branch") or f"{prefix}wave-{flow}-{t['id']}")[:100]
+        flags = run_flags({k: v for k, v in ra.items() if k != "branch"}, t["zona"])
         if node and "node" not in ra:
             flags += ["--node", node]
         # claim the task first (pendiente -> lanzada), launch only if this orchestrator won it
-        if not _set(conn, org, t["id"], "lanzada", "pendiente", nodo=ra.get("node") or node or "auto", rama=branch):
+        if not st.set(t["id"], "lanzada", "pendiente", nodo=ra.get("node") or node or "auto", rama=branch):
             continue
         jid = env.launch(t, t["brief"], branch, flags)
-        _set(conn, org, t["id"], "lanzada", "lanzada", job_id=jid)
+        st.set(t["id"], "lanzada", "lanzada", job_id=jid)
         inflight += 1
         say(i18n.t("wave.launched", id=t["id"], branch=branch))
 
     # 3. integrate when the whole wave is ok
-    mine = [t for t in _tasks(conn, flow) if t["ola"] == wave]
+    tasks_now = st.tasks(flow)
+    mine = [t for t in tasks_now if t["ola"] == wave]
     pending = [t for t in mine if t["estado"] != "hecha"]
-    if not pending or any(t["estado"] != "ok" for t in pending):
+    if not pending:
         return 0
+    if any(t["estado"] != "ok" for t in pending):
+        # the wave is not whole yet; but an ok task that the rest depends on is integrated now,
+        # or its dependents would never become ready (a flow with deps and a single wave)
+        need = _needed_by_others(tasks_now, wave)
+        pending = [t for t in pending if t["estado"] == "ok" and t["id"] in need]
+        if not pending:
+            return 0
     for t in pending:
         rc, out = env.integrate(t["rama"], into, node or (t["nodo"] if t["nodo"] != "auto" else None),
-                                sha=_sha_of(conn, flow, t["id"]))
+                                sha=st.sha_of(flow, t["id"]))
         if rc == 0:
-            _set(conn, org, t["id"], "hecha", "ok")
+            st.set(t["id"], "hecha", "ok")
             say(i18n.t("wave.merged", id=t["id"], into=into))
         elif rc == 7 and t["intentos"] < 2:
             brief = (t["brief"] + "\n\n" + i18n.t("wave.fix_header") + "\n\n" + out[-LOG_TAIL:])
-            flags = run_flags(t["run_args"], t["zona"])
+            flags = run_flags({k: v for k, v in t["run_args"].items() if k != "branch"}, t["zona"])
             if node and "node" not in t["run_args"]:
                 flags += ["--node", node]
             # integration found it red after the job said ok: ok -> arreglo is not a transition of mem,
             # so it is forced, but only from `ok` (CAS). Claim first, launch only if this step won.
-            if not _set(conn, org, t["id"], "arreglo", "ok", force=True, intentos=t["intentos"] + 1):
+            if not st.set(t["id"], "arreglo", "ok", force=True, intentos=t["intentos"] + 1):
                 return 0
             jid = env.launch(t, brief, t["rama"], flags)
-            _set(conn, org, t["id"], "arreglo", "arreglo", job_id=jid)
+            st.set(t["id"], "arreglo", "arreglo", job_id=jid)
             say(i18n.t("wave.fix_launched", id=t["id"]))
             return 0
         elif rc == 7:
-            _set(conn, org, t["id"], "bloqueada", "ok", force=True, error="red after fix")
-            _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_tras_arreglo",
+            st.set(t["id"], "bloqueada", "ok", force=True, error="red after fix")
+            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_tras_arreglo",
                                                "registro": out[-LOG_TAIL:]})
             say(i18n.t("wave.blocked", id=t["id"]))
             return 0
@@ -539,8 +656,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
             return 0
         elif rc == 8:
             files = _conflict_files(out)
-            _set(conn, org, t["id"], "bloqueada", "ok", force=True, error="conflict")
-            _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "conflicto",
+            st.set(t["id"], "bloqueada", "ok", force=True, error="conflict")
+            st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "conflicto",
                                                "ficheros": files})
             say(i18n.t("wave.conflict", id=t["id"], n=len(files)))
             return 0

@@ -46,6 +46,8 @@ identity.expect_email_domain = "example.com"
 repo_match = { git_remote = "github.com[:/]example-org/" }
 git = { user_name = "Alex Doe", user_email = "alex@example.com" }
 model = "sonnet"
+# branch_prefix = "chore/"   # optional: prefix of the queue/wave task branches (default "delega/");
+#                            # for a repo whose hooks only accept feature/, fix/ or chore/
 forbidden_terms_file = "~/.config/delega/work/forbidden.txt"   # client names, never in commits
 env_file = "~/.config/delega/work/api.env"                     # lint: a live run must cite it or use --requires
 node_bundle = "~/.config/delega/work/bundle"                   # CLAUDE.md, hooks/, agents/ for nodes
