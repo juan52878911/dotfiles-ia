@@ -317,7 +317,8 @@ class MemClient:
     def _ssh(self, *args):
         """(rc, payload) of `delega mem <args> --json` on the host; rc 255 = ssh itself failed."""
         import shlex
-        cmd = (f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} DELEGA_MEM_ORG={shlex.quote(self.org)} delega mem ") + " ".join(shlex.quote(a) for a in args)
+        cmd = ('PATH="$HOME/.local/bin:$PATH" '          # non-interactive ssh does not read the profile
+               f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} DELEGA_MEM_ORG={shlex.quote(self.org)} delega mem ") + " ".join(shlex.quote(a) for a in args)
         if self.m["path"]:
             cmd += f" --db {shlex.quote(self.m['path'])}"
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", self.m["host"], cmd + " --json"],

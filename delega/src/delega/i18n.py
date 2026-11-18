@@ -13,8 +13,18 @@ def _load(locale):
             with open(os.path.join(_DIR, f"{locale}.json"), encoding="utf-8") as f:
                 _cache[locale] = json.load(f)
         except (OSError, ValueError):
-            _cache[locale] = {}
+            _cache[locale] = _load_packaged(locale)
     return _cache[locale]
+
+
+def _load_packaged(locale):
+    """The catalog read through the package loader: inside delega.pyz `open()` cannot see it."""
+    import pkgutil
+    try:
+        data = pkgutil.get_data(__package__ or "delega", f"i18n/{locale}.json")
+        return json.loads(data.decode("utf-8")) if data else {}
+    except (OSError, ValueError, ImportError):
+        return {}
 
 
 def locale():
