@@ -35,27 +35,28 @@ class RelevoMem(R.Base):
         self.pwn = os.path.join(self.tmp.name, "pwn")
 
     def rm(self, *args, owner="dueno"):
-        env = dict(os.environ, PYTHONPATH=SRC, DELEGA_RELEVO_OWNER=owner, DELEGA_RELEVO_ORG="trycore")
+        env = dict(os.environ, PYTHONPATH=SRC, DELEGA_RELEVO_OWNER=owner, DELEGA_RELEVO_ORG="trycore",
+                   DELEGA_RELEVO_TASK="t1")
         r = subprocess.run([sys.executable, "-m", "delega", "relevo-mem", *args], capture_output=True, text=True,
                            env=env)
         return r.returncode, r.stdout, r.stderr
 
     def test_it_works_through_the_ssh_and_writes_with_the_daemon_owner(self):
-        rc, out, err = self.rm("event", "nota", "--task", "t1", "--datos", "{}")
+        rc, out, err = self.rm("event", "relevo.nota", "--task", "t1", "--datos", "{}")
         self.assertEqual(rc, 0, err + out)
         rc, out, err = self.rm("log", "--task", "t1")
         self.assertEqual(rc, 0, err)
-        self.assertEqual([(e["que"], e["quien"]) for e in json.loads(out)["eventos"] if e["que"] == "nota"],
-                         [("nota", "dueno")])
+        self.assertEqual([(e["que"], e["quien"]) for e in json.loads(out)["eventos"] if e["que"] == "relevo.nota"],
+                         [("relevo.nota", "dueno")])
         self.assertEqual(self.rm("export")[0], 0)
         self.assertEqual(self.rm("next", "f1")[0], 0)
-        self.assertEqual(self.rm("set", "t1", "--estado", "bloqueada", "--forzar")[0], 0)
+        self.assertEqual(self.rm("set", "t1", "--estado", "bloqueada")[0], 0)
 
     def test_shell_text_of_the_claude_is_never_executed(self):
         self.assertFalse(os.path.exists(self.pwn))
         self.rm("export", f"; touch {self.pwn}")
-        self.rm("set", "t1", "--estado", "bloqueada", "--forzar", "--error", f"$(touch {self.pwn})")
-        self.rm("event", f"x; touch {self.pwn}", "--task", "t1", "--datos", f"`touch {self.pwn}`")
+        self.rm("set", "t1", "--estado", "bloqueada", "--error", f"$(touch {self.pwn})")
+        self.rm("event", f"relevo.x; touch {self.pwn}", "--task", "t1", "--datos", f"`touch {self.pwn}`")
         self.rm("log", "--flow", f"f1 && touch {self.pwn}")
         self.assertFalse(os.path.exists(self.pwn))
 
@@ -66,16 +67,33 @@ class RelevoMem(R.Base):
                      ("set", "t1", "--estado", "ok", "--owner", "otro")):
             self.assertEqual(self.rm(*args)[0], 2, args)
 
+    def test_set_and_event_only_touch_the_escalated_task_and_safe_values(self):     # R10
+        R.mem_cli("add-task", "--flow", "f1", "--brief", "b2", "--id", "t2", "--db", self.db)
+        for args in (("set", "t2", "--estado", "bloqueada"),                  # another task
+                     ("set", "t1", "--estado", "hecha"), ("set", "t1", "--estado", "ok"),
+                     ("set", "t1", "--estado", "bloqueada", "--forzar"),
+                     ("set", "t1", "--estado", "bloqueada", "--job-id", "j"), ("set", "t1", "--estado", "bloqueada", "--rama", "x"),
+                     ("set", "t1", "--estado", "bloqueada", "--lanzador", "h"), ("set", "t1", "--estado", "bloqueada", "--intentos", "0"),
+                     ("event", "wave.sha", "--task", "t1"), ("event", "lanzador_responde", "--task", "t1"),
+                     ("event", "relevo.x", "--task", "t2"), ("event", "relevo.x")):
+            self.assertEqual(self.rm(*args)[0], 2, args)
+        env = dict(os.environ, PYTHONPATH=SRC, DELEGA_RELEVO_OWNER="dueno", DELEGA_RELEVO_ORG="trycore")
+        env.pop("DELEGA_RELEVO_TASK", None)
+        r = subprocess.run([sys.executable, "-m", "delega", "relevo-mem", "set", "t1", "--estado", "bloqueada"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 2)                                     # no escalated task: no writes
+        self.assertEqual(relevo.claude_env("dueno", "trycore", "t1")["DELEGA_RELEVO_TASK"], "t1")
+
     def test_a_fenced_owner_cannot_write_rc_9(self):
         self.assertEqual(R.mem_cli("claim", "orquestador", "--owner", "dueno", "--org", "trycore", "--db", self.db)[0], 0)
         copy = os.path.join(self.tmp.name, "copy.db")
         self.assertEqual(R.mem_cli("backup", "--to", copy, "--org", "trycore", "--db", self.db)[0], 0)
-        self.assertEqual(self.rm("set", "t1", "--estado", "bloqueada", "--forzar")[0], 0)      # before: writes
+        self.assertEqual(self.rm("event", "relevo.antes", "--task", "t1")[0], 0)      # before: writes
         rc = R.mem_cli("promote", "--from", copy, "--org", "trycore", "--db", self.db, "--yes")[0]
         self.assertEqual(rc, 0)
-        self.assertEqual(self.rm("set", "t1", "--estado", "pendiente", "--forzar")[0], 9)
-        self.assertEqual(self.rm("event", "x")[0], 9)
-        self.assertEqual(self.rm("set", "t1", "--estado", "pendiente", "--forzar", owner="otro")[0], 0)
+        self.assertEqual(self.rm("set", "t1", "--estado", "bloqueada")[0], 9)
+        self.assertEqual(self.rm("event", "relevo.x", "--task", "t1")[0], 9)
+        self.assertEqual(self.rm("event", "relevo.y", "--task", "t1", owner="otro")[0], 0)
 
     def test_the_claude_argv_has_no_ssh_and_only_relevo_mem(self):
         cfg = config.load()
@@ -192,6 +210,18 @@ class Wave(D.DaemonCase):
                              "run_args": {"profile": "trycore"}})
         self.assertIn("[redacted]", tail)
         self.assertNotIn("acmecorp", tail.lower())
+
+
+class RelevoMemLocal(RelevoMem):
+    """The same rules on the in-process path (the base is on THIS host): no ssh at all."""
+    CONF = R.NODE
+
+    def test_local_writes_and_reads(self):
+        self.assertEqual(self.rm("set", "t1", "--estado", "bloqueada")[0], 0)
+        self.assertEqual(self.rm("set", "t1", "--estado", "pendiente", "--desde", "bloqueada")[0], 0)
+        rc, out, _ = self.rm("log", "--task", "t1")
+        self.assertEqual(rc, 0)
+        self.assertTrue(any(e["quien"] == "dueno" for e in json.loads(out)["eventos"]))
 
 
 if __name__ == "__main__":

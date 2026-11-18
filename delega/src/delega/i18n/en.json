@@ -444,7 +444,7 @@
  "relevo_mem.order": "Order `{order}` is not allowed (allowed: {allowed})",
  "relevo_mem.option": "Option `{opt}` is not allowed: the database, org and owner are fixed by the daemon",
  "relevo_mem.no_env": "DELEGA_RELEVO_OWNER / DELEGA_RELEVO_ORG missing: this order only runs for the escalated Claude",
- "relevo.brief": "You are the stand-in orchestrator of an org while its usual orchestrator is not available.\nTask `{task}` of flow `{flow}` needs a decision: {why}. State: {estado}, attempts: {intentos}.\n\nBrief of the task:\n{brief}\n\nRules: decide and leave the next step in the memory with `{cmd}` (the only door to the org's database; it admits log, export, next, set and event, and refuses `--db`, `--org`, `--owner` and `--out`: it fixes them itself), e.g. `{cmd} set {task} --estado pendiente --desde bloqueada` (`set` to pendiente to retry with a corrected brief, or leave it bloqueada and explain why). NEVER merge to main, never push, never touch another task. You have a cap of $3.\n\nWhat is known of the cause (log tail / last facts):\n{registro}\n\nExport of the flow:\n{export}\n",
+ "relevo.brief": "You are the stand-in orchestrator of an org while its usual orchestrator is not available.\nTask `{task}` of flow `{flow}` needs a decision: {why}. State: {estado}, attempts: {intentos}.\n\nBrief of the task:\n{brief}\n\nRules: decide and leave the next step in the memory with `{cmd}` (the only door to the org's database; it admits log, export, next, set and event, and refuses `--db`, `--org`, `--owner` and `--out`: it fixes them itself), e.g. `{cmd} set {task} --estado pendiente --desde bloqueada` (`set` to pendiente to retry with a corrected brief, or leave it bloqueada and explain why). NEVER merge to main, never push, never touch another task. You have a cap of $3. To explain your decision leave an event `{cmd} event relevo.decision --task {task} --datos '{{\"motivo\": \"…\"}}'` (only names starting with `relevo.` and only on this task; `set` only admits `pendiente` or `bloqueada`).\n\nWhat is known of the cause (log tail / last facts):\n{registro}\n\nExport of the flow:\n{export}\n",
  "sync.orch_dry": "{node}: would also leave delega.pyz and the derived orchestrator config",
  "sync.orch_done": "{node}: orchestrator installed (delega.pyz, ~/.local/bin/delega, ~/.config/delega/config.toml)",
  "sync.orch_failed": "{node}: orchestrator install FAILED: {err}",
@@ -489,5 +489,9 @@
  "wave.integrate_push_failed": "task {id}: merged into {into}, but it could not be pushed to the node's bare repo: {err}",
  "sync.fetch_failed": "branch {branch} of {repo}: `git fetch origin` failed, not pushing it to {node}: {err}",
  "sync.branch_diverged": "{node}: {branch} in {repo}.git has diverged from this checkout: not pushed (decide which one wins)",
- "wave.no_verify": "{id}: the project has no `verify` commands, not merged; blocked (needs a decision: add verify or merge with --allow-unverified)"
+ "wave.no_verify": "{id}: the project has no `verify` commands, not merged; blocked (needs a decision: add verify or merge with --allow-unverified)",
+ "relevo_mem.no_task": "`set` and `event` need the escalated task (DELEGA_RELEVO_TASK): refused",
+ "relevo_mem.other_task": "only the escalated task {task} can be touched",
+ "relevo_mem.state": "`set --estado` admits only: {states} (integration marks work done, not the Claude)",
+ "relevo_mem.event": "`event` admits one name starting with `{prefix}`"
 }

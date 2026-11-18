@@ -444,7 +444,7 @@
  "relevo_mem.order": "La orden `{order}` no se admite (admitidas: {allowed})",
  "relevo_mem.option": "La opción `{opt}` no se admite: la base, la org y el dueño los fija el daemon",
  "relevo_mem.no_env": "Faltan DELEGA_RELEVO_OWNER / DELEGA_RELEVO_ORG: esta orden solo corre para el Claude escalado",
- "relevo.brief": "Eres el orquestador suplente de una org mientras su orquestador habitual no está disponible.\nLa tarea `{task}` del flujo `{flow}` necesita una decisión: {why}. Estado: {estado}, intentos: {intentos}.\n\nBrief de la tarea:\n{brief}\n\nReglas: decide y deja el siguiente paso en la memoria con `{cmd}` (la única puerta a la base de la org; admite log, export, next, set y event, y rechaza `--db`, `--org`, `--owner` y `--out`: los fija ella), p. ej. `{cmd} set {task} --estado pendiente --desde bloqueada` (`set` a pendiente para reintentar con un brief corregido, o déjala bloqueada y explica por qué). NUNCA hagas merge a main, ni push, ni toques otra tarea. Tienes un tope de 3 $.\n\nLo que se sabe de la causa (cola del registro / últimos datos):\n{registro}\n\nExport del flujo:\n{export}\n",
+ "relevo.brief": "Eres el orquestador suplente de una org mientras su orquestador habitual no está disponible.\nLa tarea `{task}` del flujo `{flow}` necesita una decisión: {why}. Estado: {estado}, intentos: {intentos}.\n\nBrief de la tarea:\n{brief}\n\nReglas: decide y deja el siguiente paso en la memoria con `{cmd}` (la única puerta a la base de la org; admite log, export, next, set y event, y rechaza `--db`, `--org`, `--owner` y `--out`: los fija ella), p. ej. `{cmd} set {task} --estado pendiente --desde bloqueada` (`set` a pendiente para reintentar con un brief corregido, o déjala bloqueada y explica por qué). NUNCA hagas merge a main, ni push, ni toques otra tarea. Tienes un tope de 3 $. Para explicar tu decisión deja un evento `{cmd} event relevo.decision --task {task} --datos '{{\"motivo\": \"…\"}}'` (solo nombres que empiecen por `relevo.` y solo sobre esta tarea; `set` solo admite `pendiente` o `bloqueada`).\n\nLo que se sabe de la causa (cola del registro / últimos datos):\n{registro}\n\nExport del flujo:\n{export}\n",
  "sync.orch_dry": "{node}: dejaría además delega.pyz y la config de orquestador derivada",
  "sync.orch_done": "{node}: orquestador instalado (delega.pyz, ~/.local/bin/delega, ~/.config/delega/config.toml)",
  "sync.orch_failed": "{node}: la instalación del orquestador FALLÓ: {err}",
@@ -489,5 +489,9 @@
  "wave.integrate_push_failed": "tarea {id}: integrada en {into}, pero no se pudo empujar al bare del nodo: {err}",
  "sync.fetch_failed": "rama {branch} de {repo}: `git fetch origin` falló, no se empuja a {node}: {err}",
  "sync.branch_diverged": "{node}: {branch} en {repo}.git diverge de este checkout: no se empuja (decide cuál gana)",
- "wave.no_verify": "{id}: el proyecto no tiene comandos `verify`, no se fusiona; bloqueada (necesita decisión: añade verify o fusiona con --allow-unverified)"
+ "wave.no_verify": "{id}: el proyecto no tiene comandos `verify`, no se fusiona; bloqueada (necesita decisión: añade verify o fusiona con --allow-unverified)",
+ "relevo_mem.no_task": "`set` y `event` necesitan la tarea escalada (DELEGA_RELEVO_TASK): rechazado",
+ "relevo_mem.other_task": "solo se puede tocar la tarea escalada {task}",
+ "relevo_mem.state": "`set --estado` solo admite: {states} (lo hecho lo marca la integración, no el Claude)",
+ "relevo_mem.event": "`event` admite un nombre que empiece por `{prefix}`"
 }

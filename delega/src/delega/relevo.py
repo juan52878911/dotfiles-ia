@@ -338,7 +338,7 @@ def claude_argv(brief, org=None, tool=None):
                    "--allowedTools", *_allowed(tool), "--disallowedTools", *FORBIDDEN_TOOLS]
 
 
-def claude_env(owner=None, org=None):
+def claude_env(owner=None, org=None, task=None):
     """The environment of the escalated Claude: no way to push or open a PR. It carries the daemon's
     owner (the lease holder) and the org for `relevo-mem`, which is who writes in its name."""
     env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV and k != "DELEGA_MEM_OWNER"}
@@ -346,6 +346,10 @@ def claude_env(owner=None, org=None):
         env["DELEGA_RELEVO_OWNER"] = owner
     if org:
         env["DELEGA_RELEVO_ORG"] = org
+    if task:
+        env["DELEGA_RELEVO_TASK"] = task
+    else:
+        env.pop("DELEGA_RELEVO_TASK", None)
     return env
 
 
@@ -381,7 +385,7 @@ def spawn(cfg, task_id, brief, org=None, profile=None, access=None):
                     {"OWNER": "relevo", "PROFILE": prof or "", "PROJECT": "", "TASK": task_id, "CAP_USD": CAP_USD})
     with open(log, "ab") as out, open(os.path.join(run_dir, "result.json"), "wb") as res:
         subprocess.Popen(claude_argv(brief, org, (access or {}).get("tool")), stdout=res, stderr=out,
-                         stdin=subprocess.DEVNULL, env=claude_env((access or {}).get("owner"), org), start_new_session=True)
+                         stdin=subprocess.DEVNULL, env=claude_env((access or {}).get("owner"), org, task_id), start_new_session=True)
     audit.record(cfg, "escalate", task=task_id, org=org, profile=prof, cap_usd=CAP_USD, dir=run_dir, log=log)
     return log
 
