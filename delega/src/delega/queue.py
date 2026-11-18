@@ -259,7 +259,7 @@ class MemClient:
     # local ----------------------------------------------------------------------------------
     def _conn(self):
         from . import mem
-        return mem.connect(mem.db_path(self.m["path"] or None))
+        return mem.connect(mem.db_path(self.m["path"] or None, org=self.org))
 
     def _local(self, fn):
         conn = self._conn()
@@ -272,7 +272,7 @@ class MemClient:
     def _ssh(self, *args):
         """(rc, payload) of `delega mem <args> --json` on the host; rc 255 = ssh itself failed."""
         import shlex
-        cmd = f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} delega mem " + " ".join(shlex.quote(a) for a in args)
+        cmd = (f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} DELEGA_MEM_ORG={shlex.quote(self.org)} delega mem ") + " ".join(shlex.quote(a) for a in args)
         if self.m["path"]:
             cmd += f" --db {shlex.quote(self.m['path'])}"
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", self.m["host"], cmd + " --json"],

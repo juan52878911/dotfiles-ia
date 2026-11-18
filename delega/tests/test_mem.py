@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))   # run without PYTHONPATH
 
@@ -28,6 +29,22 @@ def _run(args, q=None):
     return rc, out.getvalue(), err.getvalue()
 
 
+@contextlib.contextmanager
+def _without_env(*names):
+    """Temporarily remove environment variables and restore them afterwards."""
+    saved = {name: os.environ.get(name) for name in names}
+    for name in names:
+        os.environ.pop(name, None)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _claim_child(db, rol, ttl, barrier, q):
     """Child: wait for the other child (so both claim at the same time) and claim the lease."""
     if barrier is not None:
@@ -35,11 +52,23 @@ def _claim_child(db, rol, ttl, barrier, q):
             barrier.wait(timeout=30)
         except threading.BrokenBarrierError:
             pass
-    _run(["claim", rol, "--ttl", str(ttl), "--db", db, "--json"], q)
+    owner = f"spawn:{os.getpid()}"
+    _run(["claim", rol, "--ttl", str(ttl), "--owner", owner, "--org", "trycore",
+          "--db", db, "--json"], q)
+
+
+def _lease_child(db, command, rol, ttl, owner, org, q):
+    """Run one lease order in its own process with a stable, explicit owner."""
+    args = [command, rol]
+    if command in ("claim", "heartbeat"):
+        args += ["--ttl", str(ttl)]
+    args += ["--owner", owner, "--org", org, "--db", db, "--json"]
+    _run(args, q)
 
 
 def _add_task_child(db, flow, brief, q):
-    _run(["add-task", "--flow", flow, "--brief", brief, "--db", db, "--json"], q)
+    _run(["add-task", "--flow", flow, "--brief", brief, "--org", "trycore",
+          "--db", db, "--json"], q)
 
 
 def _export_child(db, q):
@@ -60,7 +89,8 @@ class MemTest(unittest.TestCase):
         return json.loads(out)
 
     def flow(self, flow_id="f1", repo="git@github.com:acme/app.git", **kw):
-        args = ["add-flow", "--repo", repo, "--id", flow_id, "--db", self.db, "--json"]
+        org = kw.pop("org", "trycore")
+        args = ["add-flow", "--repo", repo, "--id", flow_id, "--org", org, "--db", self.db, "--json"]
         for k, v in kw.items():
             args += ["--" + k.replace("_", "-"), str(v)]
         rc, out, err = _run(args)
@@ -68,7 +98,8 @@ class MemTest(unittest.TestCase):
         return json.loads(out)["flujo"]
 
     def task(self, flow="f1", brief="do it", task_id=None, **kw):
-        args = ["add-task", "--flow", flow, "--brief", brief, "--db", self.db, "--json"]
+        org = kw.pop("org", "trycore")
+        args = ["add-task", "--flow", flow, "--brief", brief, "--org", org, "--db", self.db, "--json"]
         if task_id:
             args += ["--id", task_id]
         for k, v in kw.items():
@@ -152,8 +183,9 @@ class MemTest(unittest.TestCase):
         self.init()
         conn = mem.connect(self.db)
         try:
-            first = mem.claim_lease(conn, "orq", 0, owner="host:1")      # expires at once
+            first = mem.claim_lease(conn, "orq", 60, owner="host:1")
             self.assertEqual(first["estado"], "tomada")
+            conn.execute("UPDATE leases SET vence_en = 0 WHERE rol = 'orq'")
             second = mem.claim_lease(conn, "orq", 60, owner="host:2")
             self.assertEqual(second["estado"], "tomada")
             self.assertEqual(second["dueno"], "host:2")
@@ -162,8 +194,14 @@ class MemTest(unittest.TestCase):
 
     def test_an_expired_lease_is_taken_by_another_process(self):
         self.init()
-        rc, _, err = _run(["claim", "orq", "--ttl", "0", "--db", self.db])
+        rc, _, err = _run(["claim", "orq", "--ttl", "60", "--owner", "host:1",
+                           "--org", "trycore", "--db", self.db])
         self.assertEqual(rc, 0, err)
+        conn = mem.connect(self.db)
+        try:
+            conn.execute("UPDATE leases SET vence_en = 0 WHERE rol = 'orq'")
+        finally:
+            conn.close()
         rc, out, err = self.kid(_claim_child, self.db, "orq", 60, None)
         self.assertEqual(rc, 0, err)                                    # the child took the expired lease
         self.assertEqual(json.loads(out)["estado"], "tomada")
@@ -171,16 +209,40 @@ class MemTest(unittest.TestCase):
 
     def test_release_and_heartbeat(self):
         self.init()
-        rc, out, err = _run(["claim", "orq", "--ttl", "60", "--db", self.db, "--json"])
+        common = ["--owner", "orch:1", "--org", "trycore", "--db", self.db, "--json"]
+        rc, out, err = _run(["claim", "orq", "--ttl", "60"] + common)
         self.assertEqual(rc, 0, err)
-        rc, out, err = _run(["heartbeat", "orq", "--ttl", "90", "--db", self.db, "--json"])
+        rc, out, err = _run(["heartbeat", "orq", "--ttl", "90"] + common)
         self.assertEqual(rc, 0, err)
         self.assertEqual(json.loads(out)["estado"], "renovada")
-        rc, out, err = _run(["release", "orq", "--db", self.db, "--json"])
+        rc, out, err = _run(["release", "orq"] + common)
         self.assertEqual(rc, 0, err)
         self.assertEqual(json.loads(out)["estado"], "liberada")
-        rc, _, err = _run(["heartbeat", "orq", "--db", self.db])          # there is no lease any more
+        rc, _, err = _run(["heartbeat", "orq"] + common)                # there is no lease any more
         self.assertEqual(rc, 2)
+
+    def test_lease_owner_is_stable_across_three_processes(self):
+        """Claim, heartbeat and release are separate SSH processes but one logical owner."""
+        self.init()
+        owner = "ssh-worker:42"
+        for command in ("claim", "heartbeat", "release"):
+            rc, out, err = self.kid(_lease_child, self.db, command, "orq", 60, owner, "trycore")
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(json.loads(out).get("dueno", owner), owner)
+        conn = mem.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM leases").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+        with _without_env("DELEGA_MEM_OWNER"):
+            rc, _, err = _run(["claim", "orq", "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 2)
+        self.assertIn("--owner", err)
+
+        with mock.patch.dict(os.environ, {"DELEGA_MEM_OWNER": owner}):
+            rc, _, err = _run(["claim", "orq-env", "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 0, err)
 
     # ── the tasks: one process writes, another reads ────────────────────────
     def test_a_task_added_by_a_process_is_read_by_another(self):
@@ -208,8 +270,10 @@ class MemTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual([t["id"] for t in json.loads(out)["tareas"]], ["t1"])
         self.assertEqual([t["id"] for t in json.loads(out)["bloqueadas"]], ["t2"])
-        rc, out, err = _run(["set", "t1", "--estado", "hecha", "--db", self.db, "--json"])
-        self.assertEqual(rc, 0, err)
+        for old, new in (("pendiente", "lanzada"), ("lanzada", "ok"), ("ok", "hecha")):
+            rc, out, err = _run(["set", "t1", "--estado", new, "--desde", old,
+                                 "--org", "trycore", "--db", self.db, "--json"])
+            self.assertEqual(rc, 0, err)
         rc, out, err = _run(["next", "f1", "--db", self.db, "--json"])
         self.assertEqual([t["id"] for t in json.loads(out)["tareas"]], ["t2"])
 
@@ -218,15 +282,47 @@ class MemTest(unittest.TestCase):
         self.flow("f1")
         self.task(flow="f1", brief="primero", task_id="t1")
         rc, out, err = _run(["set", "t1", "--estado", "lanzada", "--job-id", "j1", "--nodo", "box",
-                             "--rama", "delega/x", "--db", self.db, "--json"])
+                             "--rama", "delega/x", "--org", "trycore", "--db", self.db, "--json"])
         self.assertEqual(rc, 0, err)
         t = json.loads(out)["tarea"]
         self.assertEqual((t["estado"], t["intentos"], t["job_id"], t["nodo"], t["rama"]),
                          ("lanzada", 1, "j1", "box", "delega/x"))
-        rc, _, err = _run(["set", "t1", "--estado", "inventado", "--db", self.db])
+        rc, _, err = _run(["set", "t1", "--estado", "inventado", "--org", "trycore", "--db", self.db])
         self.assertEqual(rc, 2)
-        rc, _, err = _run(["set", "no-existe", "--estado", "hecha", "--db", self.db])
+        rc, _, err = _run(["set", "no-existe", "--estado", "hecha", "--org", "trycore", "--db", self.db])
         self.assertEqual(rc, 2)
+
+    def test_set_uses_compare_and_set_and_valid_transitions(self):
+        self.init()
+        self.flow("f1")
+        self.task(flow="f1", brief="primero", task_id="t1")
+
+        rc, out, err = _run(["set", "t1", "--estado", "lanzada", "--desde", "pendiente",
+                             "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["tarea"]["intentos"], 1)
+
+        rc, out, err = _run(["set", "t1", "--estado", "rojo", "--desde", "pendiente",
+                             "--org", "trycore", "--db", self.db, "--json"])
+        self.assertEqual(rc, 9)
+        self.assertIn("state changed", err)
+        conn = mem.connect(self.db)
+        try:
+            row = conn.execute("SELECT estado, intentos FROM tareas WHERE id = 't1'").fetchone()
+            self.assertEqual((row["estado"], row["intentos"]), ("lanzada", 1))
+        finally:
+            conn.close()
+
+        for old, new in (("lanzada", "ok"), ("ok", "hecha")):
+            rc, _, err = _run(["set", "t1", "--estado", new, "--desde", old,
+                               "--org", "trycore", "--db", self.db, "--json"])
+            self.assertEqual(rc, 0, err)
+        rc, _, err = _run(["set", "t1", "--estado", "pendiente", "--desde", "hecha",
+                           "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 2)
+        rc, _, err = _run(["set", "t1", "--estado", "pendiente", "--desde", "hecha", "--forzar",
+                           "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 0, err)
 
     def test_a_task_of_another_flow_is_not_ready(self):
         self.init()
@@ -239,12 +335,12 @@ class MemTest(unittest.TestCase):
     def test_a_local_path_is_refused_as_a_repo(self):
         self.init()
         for repo in ("/Users/juan/proyecto", "./repo", "../repo", "~/repo", "file:///tmp/x", os.getcwd()):
-            rc, out, err = _run(["add-flow", "--repo", repo, "--db", self.db, "--json"])
+            rc, out, err = _run(["add-flow", "--repo", repo, "--org", "trycore", "--db", self.db, "--json"])
             self.assertEqual(rc, 2, repo)
             self.assertFalse(json.loads(out)["ok"])
             self.assertIn("local path", err)
         for repo in ("git@github.com:acme/app.git", "https://github.com/acme/app.git", "acme/app"):
-            rc, out, err = _run(["add-flow", "--repo", repo, "--db", self.db, "--json"])
+            rc, out, err = _run(["add-flow", "--repo", repo, "--org", "trycore", "--db", self.db, "--json"])
             self.assertEqual(rc, 0, err)
 
     def test_another_org_is_refused(self):
@@ -262,9 +358,46 @@ class MemTest(unittest.TestCase):
             conn.close()
 
     def test_an_org_is_needed_to_init(self):
-        rc, _, err = _run(["init", "--db", self.db])
+        with _without_env("DELEGA_MEM_ORG"):
+            rc, _, err = _run(["init", "--db", self.db])
         self.assertEqual(rc, 2)
         self.assertIn("--org", err)
+
+    def test_writes_require_an_org_and_use_an_org_scoped_default_database(self):
+        self.init()
+        writes = (
+            ["init"],
+            ["add-flow", "--repo", "acme/app"],
+            ["add-task", "--flow", "f1", "--brief", "x"],
+            ["set", "t1", "--estado", "lanzada"],
+            ["claim", "orq"],
+            ["heartbeat", "orq"],
+            ["release", "orq"],
+        )
+        with _without_env("DELEGA_MEM_ORG"):
+            for args in writes:
+                rc, _, err = _run(args + ["--db", self.db])
+                self.assertEqual(rc, 2, args)
+                self.assertIn("--org", err, args)
+
+        with mock.patch.dict(os.environ, {"DELEGA_MEM_ORG": "trycore"}):
+            rc, _, err = _run(["add-flow", "--repo", "acme/app", "--id", "f-env",
+                               "--db", self.db, "--json"])
+        self.assertEqual(rc, 0, err)
+        rc, _, err = _run(["add-flow", "--repo", "acme/app", "--org", "personal",
+                           "--db", self.db])
+        self.assertEqual(rc, 2)
+        self.assertIn("personal", err)
+
+        with (
+            _without_env("DELEGA_MEM_DB", "DELEGA_MEM_ORG"),
+            mock.patch.dict(os.environ, {"HOME": self.tmp.name}),
+        ):
+            rc, out, err = _run(["init", "--org", "acme", "--json"])
+        self.assertEqual(rc, 0, err)
+        expected = os.path.join(self.tmp.name, ".local", "state", "delega", "memoria-acme.db")
+        self.assertEqual(json.loads(out)["db"], expected)
+        self.assertTrue(os.path.exists(expected))
 
     # ── the database itself ─────────────────────────────────────────────────
     def test_the_migration_is_idempotent(self):
@@ -308,6 +441,40 @@ class MemTest(unittest.TestCase):
         self.assertEqual([t["id"] for t in data["tareas"]], ["t1"])
         self.assertEqual(data["tareas"][0]["deps"], [])
         self.assertTrue(data["leases"] == [])
+
+    def test_a_locked_database_returns_the_retryable_exit_code(self):
+        self.init()
+        locked = sqlite3.OperationalError("database is locked")
+        with mock.patch.object(mem.sqlite3, "connect", side_effect=locked):
+            rc, out, err = _run(["next", "f1", "--db", self.db, "--json"])
+        self.assertEqual(rc, 10)
+        self.assertFalse(json.loads(out)["ok"])
+        self.assertIn("locked", err)
+
+    def test_lease_ttl_must_be_finite_positive_and_at_most_one_hour(self):
+        self.init()
+        for ttl in ("inf", "nan", "-1", "0", "3601"):
+            rc, _, err = _run(["claim", "orq", "--ttl", ttl, "--owner", "orch:1",
+                               "--org", "trycore", "--db", self.db])
+            self.assertEqual(rc, 2, ttl)
+            self.assertIn("--ttl", err)
+        rc, _, err = _run(["claim", "orq", "--ttl", "3600", "--owner", "orch:1",
+                           "--org", "trycore", "--db", self.db])
+        self.assertEqual(rc, 0, err)
+
+    def test_an_existing_relative_repository_is_refused(self):
+        self.init()
+        os.makedirs(os.path.join(self.tmp.name, "repos", "app"))
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp.name)
+            rc, out, err = _run(["add-flow", "--repo", "repos/app", "--org", "trycore",
+                                 "--db", self.db, "--json"])
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 2)
+        self.assertFalse(json.loads(out)["ok"])
+        self.assertIn("local path", err)
 
     def test_the_memory_refuses_to_open_on_a_network_filesystem(self):
         self.assertEqual(mem.network_fs("/srv/mem/x.db", [("/", "nfs"), ("/srv", "nfs4")]), "nfs4")
