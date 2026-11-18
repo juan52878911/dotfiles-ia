@@ -1,4 +1,5 @@
 """sync: push the profile's rules bundle to its nodes so remote workers behave like local ones.
+`--with-orchestrator` also leaves delega.pyz and a derived orchestrator config (relevo.py) on the node.
 
 The bundle dir (profile `node_bundle`) may hold CLAUDE.md, hooks/, agents/, skills/, rules/, commands/,
 output-styles/, settings.json (all go to the node's ~/.claude, or config_dirs[profile]) and home/ (unpacked
@@ -128,13 +129,15 @@ def sync_node(cfg, prof, node, tar_path):
 
 
 def main(argv):
-    profile, names, dry, tar_out, a = None, [], False, None, list(argv)
+    profile, names, dry, tar_out, orch, a = None, [], False, None, False, list(argv)
     while a:
         x = a.pop(0)
         if x == "--profile" and a:
             profile = a.pop(0)
         elif x == "--tar" and a:
             tar_out = os.path.abspath(a.pop(0))
+        elif x == "--with-orchestrator":
+            orch = True
         elif x == "--dry-run":
             dry = True
         elif x in ("-h", "--help"):
@@ -176,11 +179,23 @@ def main(argv):
                 print(i18n.t("sync.dry", node=node["name"], n=len(staged)))
                 for s in staged:
                     print("  " + s)
+                if orch:
+                    from . import relevo
+                    try:
+                        relevo.derive_config(cfg, prof["name"], node["name"])
+                        print(i18n.t("sync.orch_dry", node=node["name"]))
+                    except config.ConfigError as e:
+                        print(i18n.t("sync.orch_failed", node=node["name"], err=e), file=sys.stderr)
+                        rc = 1
                 continue
             try:
                 ok, err = sync_node(cfg, prof, node, tar_path)
             except (OSError, subprocess.SubprocessError, AttributeError, NotImplementedError) as e:
                 ok, err = False, str(e)
             print(i18n.t("sync.done" if ok else "sync.failed", node=node["name"], n=len(staged), err=err))
+            if ok and orch:
+                from . import relevo
+                ok, err = relevo.install_on_node(cfg, prof, node)
+                print(i18n.t("sync.orch_done" if ok else "sync.orch_failed", node=node["name"], err=err))
             rc = rc or (0 if ok else 1)
     return rc

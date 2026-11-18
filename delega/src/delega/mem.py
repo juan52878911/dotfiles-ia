@@ -828,9 +828,146 @@ def cmd_install_daemon(args, db, as_json):
     return queue.cmd_install_daemon(args, db, as_json)
 
 
+# ── event, backup and promote (the relevo: another team can take the memory over) ───────────────
+def add_event(conn, que, datos=None, task=None, once=False, quien=None):
+    """Append an event (with `tarea` when given). With `once`, only if the task has none of that kind yet:
+    the check and the insert are one transaction. Returns True when it wrote the event."""
+    datos = dict(datos or {})
+    if task:
+        datos["tarea"] = task
+
+    def op(c):
+        if once and task:
+            for r in c.execute("SELECT datos FROM eventos WHERE que = ?", (que,)).fetchall():
+                if json.loads(r["datos"] or "{}").get("tarea") == task:
+                    return False
+        _event(c, que, datos, quien=quien)
+        return True
+    return write(conn, op)
+
+
+def cmd_event(args, db, as_json):
+    pos, flags, vals = _parse(args, flags=("once",), values=("task", "datos"))
+    if not pos:
+        raise MemError(i18n.t("mem.event_usage"))
+    try:
+        datos = json.loads(vals.get("datos") or "{}")
+        if not isinstance(datos, dict):
+            raise ValueError
+    except ValueError:
+        raise MemError(i18n.t("mem.event_usage"))
+    conn = connect(db_path(db))
+    try:
+        created = add_event(conn, pos[0], datos, task=vals.get("task"), once="once" in flags)
+    finally:
+        conn.close()
+    _out({"ok": True, "cmd": "event", "creado": created}, [i18n.t("mem.event_done", que=pos[0], creado=created)],
+         as_json)
+    return EXIT_OK
+
+
+def _is_remote_dest(dest):
+    return bool(re.match(r"^[^/\s:]+:", dest))
+
+
+def backup(conn, dest_file):
+    """Consistent copy of the open database into `dest_file` (sqlite's online backup = `.backup`)."""
+    os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
+    if os.path.exists(dest_file):
+        os.remove(dest_file)
+    out = sqlite3.connect(dest_file)
+    try:
+        conn.backup(out)
+    finally:
+        out.close()
+
+
+def cmd_backup(args, db, as_json):
+    """`delega mem backup --to <host:path | path>`: a consistent copy, sent with scp when it has a host."""
+    import tempfile
+    _, _, vals = _parse(args, values=("to",))
+    dest = vals.get("to")
+    if not dest:
+        raise MemError(i18n.t("mem.backup_usage"))
+    conn = connect(db_path(db))
+    try:
+        if not _is_remote_dest(dest):
+            target = os.path.abspath(os.path.expanduser(dest))
+            backup(conn, target)
+        else:
+            with tempfile.TemporaryDirectory(prefix="delega-mem-") as tmp:
+                snap = os.path.join(tmp, "memoria.db")
+                backup(conn, snap)
+                host, path = dest.split(":", 1)
+                r = subprocess.run(["ssh", "-o", "BatchMode=yes", host, "mkdir", "-p",
+                                    os.path.dirname(path) or "."], capture_output=True, text=True, timeout=60)
+                if r.returncode == 0:
+                    r = subprocess.run(["scp", "-o", "BatchMode=yes", "-q", snap, dest],
+                                       capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    raise MemError(i18n.t("mem.backup_failed", to=dest, err=(r.stderr or r.stdout).strip()))
+            target = dest
+    finally:
+        conn.close()
+    _out({"ok": True, "cmd": "backup", "destino": target}, [i18n.t("mem.backup_done", to=target)], as_json)
+    return EXIT_OK
+
+
+def cmd_promote(args, db, as_json):
+    """`delega mem promote --from <copy> --yes [--db <main>]`: the copy becomes the main database.
+    The previous main is kept as `<main>.before-promote`; the leases are cleared so a daemon can take
+    over. Without --yes nothing is touched (rc 2)."""
+    import shutil
+    _, flags, vals = _parse(args, flags=("yes",), values=("from",))
+    src = vals.get("from")
+    if not src:
+        raise MemError(i18n.t("mem.promote_usage"))
+    src, main = os.path.abspath(os.path.expanduser(src)), db_path(db)
+    if "yes" not in flags:
+        _out({"ok": False, "cmd": "promote", "error": i18n.t("mem.promote_dry", src=src, main=main)},
+             [], as_json)
+        print(i18n.t("mem.promote_dry", src=src, main=main), file=sys.stderr)
+        return EXIT_USAGE
+    if src == main:
+        raise MemError(i18n.t("mem.promote_same", path=main))
+    conn = connect(src)                                  # refuses a missing file or a network filesystem
+    try:
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise MemError(i18n.t("mem.promote_corrupt", path=src))
+        org = get_org(conn)
+        if not org:
+            raise MemError(i18n.t("mem.promote_corrupt", path=src))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+    if network_fs(os.path.dirname(main) or "."):
+        raise MemError(i18n.t("mem.netfs", path=main, fs=network_fs(os.path.dirname(main) or ".")))
+    os.makedirs(os.path.dirname(main) or ".", exist_ok=True)
+    kept = None
+    if os.path.exists(main):
+        kept = main + ".before-promote"
+        shutil.copy2(main, kept)
+    tmp = main + ".promoting"
+    shutil.copy2(src, tmp)
+    for ext in ("-wal", "-shm"):                         # a stale journal of the old main must not apply to the copy
+        if os.path.exists(main + ext):
+            os.remove(main + ext)
+    os.replace(tmp, main)
+    conn = connect(main)
+    try:
+        write(conn, lambda c: (c.execute("DELETE FROM leases"),
+                               _event(c, "mem.promote", {"desde": src, "anterior": kept})))
+    finally:
+        conn.close()
+    _out({"ok": True, "cmd": "promote", "org": org, "principal": main, "anterior": kept},
+         [i18n.t("mem.promoted", org=org, main=main)], as_json)
+    return EXIT_OK
+
+
 ORDERS = {
     "install-daemon": cmd_install_daemon, "flows": cmd_flows,
     "init": cmd_init, "add-flow": cmd_add_flow, "add-task": cmd_add_task, "next": cmd_next, "set": cmd_set,
+    "backup": cmd_backup, "promote": cmd_promote, "event": cmd_event,
     "claim": cmd_claim, "heartbeat": cmd_heartbeat, "release": cmd_release, "log": cmd_log, "export": cmd_export,
 }
 

@@ -208,6 +208,26 @@ the Claude transcripts (`--preset claude-sessions`), use it instead of reading l
   rewriting briefs.
 - If they will be away, ask for a hard deadline and what you may decide alone; the rest waits.
 
+## Relevo: another team keeps orchestrating if the Mac falls
+
+- **Mac**: config with every profile, the daemon (`delega tick --daemon`) and the lease holder by default.
+- **Memory server** (CT 110 `orq@192.168.2.27` for personal): the org's SQLite, used with `ssh host delega mem … --json`.
+- **Relevo node** (trycorepc / dev-trycore for Trycore, the CT for personal): `delega.pyz`, the wrapper
+  `~/.local/bin/delega`, a config **derived** from the Mac's (one profile, its nodes, `[memoria.<org>]`, policy;
+  no keychain `token_command`, nothing of other profiles) and its own daemon.
+- Install: `delega sync --profile <p> --with-orchestrator <node>` (`--dry-run` checks the derivation), then on
+  the node `delega mem install-daemon --org <org> --owner <node> --yes` and enable the unit. Both daemons
+  contest the lease `orquestador:<org>`: only one acts; the other takes over when it expires.
+- On a node the daemon launches from the bare `~/<workdir>/<repo>.git` (`git clone --bare` if missing); the
+  brief comes from the database, not from a Mac file.
+- Second `rojo` of a task (or a `necesita_decision` event): the owner daemon marks it `bloqueada`, writes ONE
+  `orquestador_claude` event with the flow export and starts `ws exec claude -p` (or `claude -p`), Sonnet, $3,
+  no merge to main, no push. Read its answer with `delega mem log` and the log in `<state>/relevo/<task>.log`.
+- Backup: `delega mem backup --to host:path` (consistent copy + scp), e.g. from cron on the memory server.
+- Promote the copy when the server is lost: on the new host `delega mem promote --from <copy> --yes`
+  (without `--yes` nothing happens, rc 2; the old file is kept as `.before-promote`, leases are cleared),
+  then point `[memoria.<org>]` at the new host in the Mac config and re-run the `sync --with-orchestrator`.
+
 ## Fixed rules
 
 - **One account per person.** delega runs only profiles with `owner = "self"`. Never share, pool or
