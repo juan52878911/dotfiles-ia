@@ -439,5 +439,12 @@
  "mem.promote_dry": "no se hizo nada: promote sustituiría {main} por la copia {src}; repite con --yes",
  "mem.promote_same": "la copia y la base principal son el mismo fichero ({path})",
  "mem.promote_corrupt": "{path} no es una base de memoria válida (integridad u org ausente)",
- "mem.promoted": "copia promovida: la memoria de {org} es ahora {main} (leases borradas)"
+ "mem.promoted": "copia promovida: la memoria de {org} es ahora {main} (leases borradas)",
+ "jobs.recover.waiter": "el trabajo {job} aún tiene un waiter vivo (pid {pid}): `delega adopt` lo espera, o --force para tomarlo",
+ "launch.branch.in_ref": "AVISO: la rama {branch} está abierta en un worktree de aquí y no se pudo avanzar (sucio o divergente): el trabajo está en {ref}",
+ "launch.branch.merged": "la rama {branch} estaba abierta en un worktree de aquí: avanzada con ff-only",
+ "launch.err.branch_in_use": "la rama {branch} está abierta en el worktree del trabajo {job} ({path}), que no ha terminado: espera, ciérralo (delega recover) o usa otra rama",
+ "launch.warn.behind": "AVISO: HEAD local va {n} commit(s) por detrás de origin/{branch}; al nodo solo viaja HEAD",
+ "launch.worktree.retired": "worktree del trabajo terminado {job} retirado para reutilizar {branch}",
+ "lint.rounds": "vuelta {n} sobre la rama {branch} en 24 h; las anteriores costaron {cost} USD: comprueba que otra vuelta es lo correcto"
 }

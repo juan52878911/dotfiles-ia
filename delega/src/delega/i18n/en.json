@@ -439,5 +439,12 @@
  "mem.promote_dry": "nothing done: promote would replace {main} with the copy {src}; repeat with --yes",
  "mem.promote_same": "the copy and the main database are the same file ({path})",
  "mem.promote_corrupt": "{path} is not a valid memory database (integrity or org missing)",
- "mem.promoted": "copy promoted: the memory of {org} is now {main} (leases cleared)"
+ "mem.promoted": "copy promoted: the memory of {org} is now {main} (leases cleared)",
+ "jobs.recover.waiter": "job {job} still has a live waiter (pid {pid}): `delega adopt` waits for it, or --force to take over",
+ "launch.branch.in_ref": "WARNING: branch {branch} is open in a worktree here and could not be fast-forwarded (dirty or diverged): the work is in {ref}",
+ "launch.branch.merged": "branch {branch} was open in a worktree here: fast-forwarded it",
+ "launch.err.branch_in_use": "branch {branch} is open in the worktree of job {job} ({path}), which has not ended: wait for it, close it (delega recover) or use another branch",
+ "launch.warn.behind": "WARNING: local HEAD is {n} commit(s) behind origin/{branch}; only HEAD travels to the node",
+ "launch.worktree.retired": "worktree of ended job {job} retired to reuse {branch}",
+ "lint.rounds": "round {n} on branch {branch} in 24 h; the earlier rounds cost {cost} USD: check that a new round is the right move"
 }
