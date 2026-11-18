@@ -19,6 +19,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from delega import mem  # noqa: E402
 
 
+def setUpModule():
+    # los mensajes que comprueban estas pruebas están en inglés; en los nodos DELEGA_LOCALE=es
+    patcher = mock.patch.dict(os.environ, {"DELEGA_LOCALE": "en"})
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 def _run(args, q=None):
     """Run the CLI in this process; returns (rc, stdout, stderr)."""
     out, err = io.StringIO(), io.StringIO()

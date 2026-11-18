@@ -199,7 +199,8 @@ class NodeDaemon(Base):
     def test_ws_exec_when_it_exists_else_plain_claude(self):
         self.assertEqual(relevo.claude_argv("b")[:4], ["ws", "exec", "claude", "-p"])    # fake ws on PATH
         os.remove(os.path.join(self.bin, "ws"))
-        self.assertEqual(relevo.claude_argv("b")[:2], ["claude", "-p"])
+        with mock.patch("shutil.which", lambda name, *a, **k: None if name == "ws" else "/usr/bin/" + name):
+            self.assertEqual(relevo.claude_argv("b")[:2], ["claude", "-p"])   # el ws real del equipo no cuenta
 
     def test_needs_decision_event_and_no_second_request(self):
         self.add_task("t1")
