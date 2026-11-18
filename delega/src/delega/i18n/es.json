@@ -467,6 +467,7 @@
  "engine.pi.cap_turns": "tope de turnos alcanzado ({turns}): se paró Pi",
  "engine.pi.no_kindling": "el nodo '{node}' es kindling: --engine pi necesita un nodo normal o --node local",
  "kindling.gc.legacy_label": "{host}: {vm} se conserva: etiqueta antigua (delega.owner={owner}, sin delega.orch); bórrala a mano con `kling rm {vm}` en {host} si es tuya",
+ "mem.stale_epoch": "la conexión se abrió en la época {epoca} pero la memoria está en la época {actual}: una promoción sustituyó la base; reabre la conexión",
  "mem.fenced": "el dueño {owner} está vetado desde la época {epoca} (memoria en la época {actual}): lo vetó una promoción; readmítelo con `mem unfence {owner} --yes`",
  "mem.unfence_usage": "uso: mem unfence <dueño> --yes --org <org>",
  "mem.unfence_dry": "no se hizo nada: unfence readmitiría al dueño {owner}; repite con --yes",

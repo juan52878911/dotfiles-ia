@@ -281,6 +281,21 @@ def network_fs(path, table=None):
 
 
 # ── database ────────────────────────────────────────────────────────────────
+class _Conn(sqlite3.Connection):
+    """Connection that remembers the epoch it read when it was opened (see `write`)."""
+    epoca = None
+
+
+def _pin_epoch(conn, force=False):
+    if not isinstance(conn, _Conn) or (conn.epoca is not None and not force):
+        return
+    try:
+        row = conn.execute("SELECT valor FROM meta WHERE clave = 'epoca'").fetchone()
+        conn.epoca = int(float(row[0])) if row else None
+    except (sqlite3.Error, TypeError, ValueError):
+        conn.epoca = None
+
+
 def connect(path, create=False):
     """Open the memory database (WAL, busy_timeout, autocommit: transactions are explicit)."""
     p = db_path(path)
@@ -291,7 +306,7 @@ def connect(path, create=False):
         raise MemError(i18n.t("mem.netfs", path=p, fs=fs))
     if create:
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-    conn = sqlite3.connect(p, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None)
+    conn = sqlite3.connect(p, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None, factory=_Conn)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -301,6 +316,7 @@ def connect(path, create=False):
             conn.execute("PRAGMA journal_mode = WAL").fetchone()
         except sqlite3.Error:
             pass
+    _pin_epoch(conn)
     return conn
 
 
@@ -315,6 +331,7 @@ def migrate(conn):
     if ver > SCHEMA_VERSION:
         raise MemError(i18n.t("mem.db_newer", ver=ver, want=SCHEMA_VERSION))
     if ver == SCHEMA_VERSION:
+        _pin_epoch(conn)
         return ver
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -332,6 +349,7 @@ def migrate(conn):
         except sqlite3.Error:
             pass
         raise
+    _pin_epoch(conn, force=True)
     return SCHEMA_VERSION
 
 
@@ -339,6 +357,11 @@ def write(conn, fn):
     """Run `fn(conn)` inside a write transaction (BEGIN IMMEDIATE serializes the writers)."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        pinned = getattr(conn, "epoca", None)
+        if pinned is not None:
+            current = epoch(conn)
+            if current != pinned:
+                raise MemConflict(i18n.t("mem.stale_epoch", epoca=pinned, actual=current))
         out = fn(conn)
         conn.execute("COMMIT")
         return out
@@ -1235,8 +1258,7 @@ def cmd_promote(args, db, as_json):
                 if lock is not None:
                     lock.close()
                     lock = None
-                if _db_is_busy(e):
-                    raise
+                raise
         current_epoch, current_tasks, current_leases = _promoted_snapshot(main, lock)
         current_tasks = [x for x in current_tasks if x[2] > copied_at]   # only work after the copy
 

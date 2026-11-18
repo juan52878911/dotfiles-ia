@@ -568,6 +568,20 @@ def _reconcile_tasks(cfg, client, fl, tasks):
             continue
         if state in ("running", "queued"):
             continue
+        if state == "fail" and not jid.startswith("pend:") and env._job_dir(t) is None:
+            # a real job id whose directory is gone (cleaned, or another state_dir): not a failure
+            # of the job; leave the task as it is and ask for a decision, once
+            datos = {"flujo": fl["id"], "motivo": "job_sin_directorio", "job_id": jid}
+            try:
+                if client.m["local"]:
+                    client._call(lambda: client._local_rc(lambda c: mem.add_event(
+                        c, "necesita_decision", datos, task=t["id"], once=True, quien=client.owner)))
+                else:
+                    client._remote("event", "necesita_decision", "--task", t["id"], "--once",
+                                   "--datos", json.dumps(datos))
+            except Exception as e:
+                print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
+            continue
         target = "ok" if state == "ok" else "rojo"
         rc, _ = client.set(t["id"], target, desde="lanzada", job_id=jid,
                            error=None if target == "ok" else "job failed")

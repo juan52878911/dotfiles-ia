@@ -564,6 +564,80 @@ class MemTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(seen, ["locked"])
 
+    def test_a_writer_without_lease_is_refused_between_the_commit_and_the_copy(self):
+        copy, _ = self._promote_setup()
+        self.task(flow="f1", brief="x", task_id="t1")
+        writer = mem.connect(self.db)               # opened before the promotion, owner without lease
+        self.addCleanup(writer.close)
+        results = []
+        real = sqlite3.connect
+
+        def spy(path, *a, **kw):
+            if path == self.db and "isolation_level" not in kw:    # the final copy into main
+                try:
+                    mem.set_task(writer, "t1", "lanzada", org="trycore")
+                    results.append("wrote")
+                except mem.MemConflict:
+                    results.append("refused")
+            return real(path, *a, **kw)
+        with mock.patch.dict(os.environ, {"DELEGA_MEM_OWNER": "host:4242"}), \
+                mock.patch.object(mem.sqlite3, "connect", spy):
+            rc, _, err = self._promote(copy)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(results, ["refused"])
+        self.assertEqual(self._count("SELECT COUNT(*) FROM tareas WHERE estado = 'lanzada'"), 0)
+
+    def test_a_connection_of_an_old_epoch_cannot_write_anything(self):
+        copy, _ = self._promote_setup()
+        old = mem.connect(self.db)
+        self.addCleanup(old.close)
+        self.assertEqual(self._promote(copy)[0], 0)
+        with self.assertRaises(mem.MemConflict):
+            mem.add_task(old, "f1", "late", org="trycore")
+        with self.assertRaises(mem.MemConflict):
+            mem.add_event(old, "x", quien="host:1")
+        fresh = mem.connect(self.db)
+        self.addCleanup(fresh.close)
+        mem.add_event(fresh, "x", quien="host:1")           # a new connection reads the new epoch
+
+    def test_wave_events_go_through_the_fence(self):
+        from delega import wave
+        self.init()
+        old = mem.connect(self.db)
+        self.addCleanup(old.close)
+        mem.add_event(old, "x", quien="host:1")
+        mem._set_meta(mem.connect(self.db), "epoca", 5)
+        with self.assertRaises(mem.MemConflict):
+            wave._event(old, "wave.sha", {"flujo": "f1"})
+
+    def test_promote_does_not_go_on_without_the_lock_when_begin_fails(self):
+        copy, _ = self._promote_setup()
+        real = sqlite3.connect
+
+        class Boom:
+            def __init__(self, c):
+                self.c = c
+            def execute(self, sql, *a):
+                if sql == "BEGIN IMMEDIATE":
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self.c.execute(sql, *a)
+            def __getattr__(self, n):
+                return getattr(self.c, n)
+
+            def __setattr__(self, n, v):
+                if n == "c":
+                    object.__setattr__(self, n, v)
+                else:
+                    setattr(self.c, n, v)
+
+        def spy(path, *a, **kw):
+            c = real(path, *a, **kw)
+            return Boom(c) if path == self.db and kw.get("isolation_level", 1) is None else c
+        with mock.patch.object(mem.sqlite3, "connect", spy):
+            rc, _, _ = self._promote(copy)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(self._count("SELECT valor FROM meta WHERE clave = 'epoca'"), "1")
+
     def test_failback_readmits_the_owner_with_unfence_or_promote_owner(self):
         copy, claim = self._promote_setup()
         self.assertEqual(self._promote(copy)[0], 0)
