@@ -74,8 +74,10 @@ def script(path, body):
 
 
 def mem_cli(*args):
+    """The strict `delega mem`: org and owner of the test are always given (environment)."""
     out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+    env = {"DELEGA_MEM_ORG": "trycore", "DELEGA_MEM_OWNER": "test-owner"}
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch.dict(os.environ, env):
         rc = mem.main(list(args)) or 0
     return rc, out.getvalue(), err.getvalue()
 
@@ -155,8 +157,10 @@ class NodeDaemon(Base):
         self.assertIsNone(relevo.origin(config.Config({"profiles": {"p": {"owner": "self"}}}), REMOTE))
 
     def red(self, tid):
+        if self.task_state(tid) == "rojo":      # a second red: rojo -> arreglo -> lanzada -> rojo
+            self.assertEqual(mem_cli("set", tid, "--estado", "arreglo", "--desde", "rojo", "--db", self.db)[0], 0)
         self.assertEqual(mem_cli("set", tid, "--estado", "lanzada", "--db", self.db)[0], 0)
-        self.assertEqual(mem_cli("set", tid, "--estado", "rojo", "--db", self.db)[0], 0)
+        self.assertEqual(mem_cli("set", tid, "--estado", "rojo", "--desde", "lanzada", "--db", self.db)[0], 0)
 
     def requests(self):
         c = sqlite3.connect(self.db)
@@ -207,7 +211,7 @@ class NodeDaemon(Base):
         client = queue.MemClient(self.cfg, "trycore", "node")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(relevo.escalate(self.cfg, client), ["t1"])
-            mem_cli("set", "t1", "--estado", "pendiente", "--db", self.db)   # even if someone resets it
+            mem_cli("set", "t1", "--estado", "pendiente", "--forzar", "--db", self.db)   # even if someone resets it
             self.assertEqual(relevo.escalate(self.cfg, client), [])
         self.assertEqual(len(self.requests()), 1)
         self.assertEqual(len([c for c in self.log(1) if c.startswith(ASK)]), 1)

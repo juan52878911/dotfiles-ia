@@ -25,6 +25,7 @@ The side effects (launch a job, look at a job, integrate) live in `Env`, so the 
 import fnmatch
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ from . import i18n, mem
 
 LOG_TAIL = 6000
 DEFAULT_PAR = 2
+BUSY_RETRIES = 3          # rc 10 of `delega mem`: a locked database is retried
+BUSY_WAIT_S = 0.2
 WILD = "*?["
 
 
@@ -116,7 +119,7 @@ def validate_rows(rows, existing_ids):
                                           za=a["zona"] or "**", zb=b["zona"] or "**"))
 
 
-def plan(conn, flow, path, wave=None):
+def plan(conn, flow, path, wave=None, org=None):
     flow_row = conn.execute("SELECT id FROM flujos WHERE id = ?", (flow,)).fetchone()
     if flow_row is None:
         raise mem.MemError(i18n.t("mem.unknown_flow", flow=flow))
@@ -127,7 +130,7 @@ def plan(conn, flow, path, wave=None):
         wave = max([r["ola"] for r in existing] + [0]) + 1
     for r in rows:
         mem.add_task(conn, flow, r["brief"], wave=wave, zone=r["zona"] or None, deps=r["deps"],
-                     run_args=r["run_args"], task_id=r["id"])
+                     run_args=r["run_args"], task_id=r["id"], org=org)
     return wave, rows
 
 
@@ -230,15 +233,38 @@ def _tasks(conn, flow):
             conn.execute("SELECT * FROM tareas WHERE flujo = ? ORDER BY ola, id", (flow,)).fetchall()]
 
 
+def _retry(fn):
+    """Run fn(), retrying a busy/locked database (what rc 10 is for `delega mem`)."""
+    for attempt in range(BUSY_RETRIES):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if not mem._db_is_busy(e) or attempt == BUSY_RETRIES - 1:
+                raise
+            time.sleep(BUSY_WAIT_S * (attempt + 1))
+
+
 def _event(conn, que, datos):
-    mem.write(conn, lambda c: mem._event(c, que, datos))
+    _retry(lambda: mem.write(conn, lambda c: mem._event(c, que, datos)))
+
+
+def _set(conn, org, task, estado, desde, force=False, **kw):
+    """Compare-and-set of a task state (`desde` is the state this step read). False when
+    another orchestrator moved the task first (rc 9): the caller leaves it to them."""
+    try:
+        _retry(lambda: mem.set_task(conn, task, estado, desde=desde, force=force, org=org, **kw))
+        return True
+    except mem.MemConflict:
+        return False
 
 
 def _conflict_files(out):
     return [ln.strip() for ln in out.splitlines() if ln.startswith("  ")]
 
 
-def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print):
+def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=None):
+    if not org:
+        raise mem.MemError(i18n.t("wave.no_org"))
     flow_row = conn.execute("SELECT * FROM flujos WHERE id = ?", (flow,)).fetchone()
     if flow_row is None:
         raise mem.MemError(i18n.t("mem.unknown_flow", flow=flow))
@@ -251,17 +277,23 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print):
         state, jid = env.job_state(t)
         if state == "running":
             if jid != t["job_id"]:
-                mem.set_task(conn, t["id"], t["estado"], job_id=jid)
+                _set(conn, org, t["id"], t["estado"], t["estado"], job_id=jid)
             continue
         if state == "ok":
-            mem.set_task(conn, t["id"], "ok", job_id=jid)
+            if t["estado"] == "arreglo":     # the fix job came back: arreglo -> lanzada -> ok
+                if not _set(conn, org, t["id"], "lanzada", "arreglo", job_id=jid, intentos=t["intentos"]):
+                    continue
+            if not _set(conn, org, t["id"], "ok", "lanzada", job_id=jid):
+                continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="ok"))
         elif t["estado"] == "arreglo":
-            mem.set_task(conn, t["id"], "bloqueada", job_id=jid, error="fix job failed")
+            if not _set(conn, org, t["id"], "bloqueada", "arreglo", job_id=jid, error="fix job failed"):
+                continue
             _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "arreglo_fallido"})
             say(i18n.t("wave.fix_failed", id=t["id"]))
         else:
-            mem.set_task(conn, t["id"], "rojo", job_id=jid)
+            if not _set(conn, org, t["id"], "rojo", "lanzada", job_id=jid):
+                continue
             say(i18n.t("wave.reconciled", id=t["id"], estado="rojo"))
 
     tasks = _tasks(conn, flow)
@@ -285,8 +317,11 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print):
         flags = run_flags(ra, t["zona"])
         if node and "node" not in ra:
             flags += ["--node", node]
+        # claim the task first (pendiente -> lanzada), launch only if this orchestrator won it
+        if not _set(conn, org, t["id"], "lanzada", "pendiente", nodo=ra.get("node") or node or "auto", rama=branch):
+            continue
         jid = env.launch(t, t["brief"], branch, flags)
-        mem.set_task(conn, t["id"], "lanzada", job_id=jid, nodo=ra.get("node") or node or "auto", rama=branch)
+        _set(conn, org, t["id"], "lanzada", "lanzada", job_id=jid)
         inflight += 1
         say(i18n.t("wave.launched", id=t["id"], branch=branch))
 
@@ -298,7 +333,7 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print):
     for t in pending:
         rc, out = env.integrate(t["rama"], into, node or (t["nodo"] if t["nodo"] != "auto" else None))
         if rc == 0:
-            mem.set_task(conn, t["id"], "hecha")
+            _set(conn, org, t["id"], "hecha", "ok")
             say(i18n.t("wave.merged", id=t["id"], into=into))
         elif rc == 7 and t["intentos"] < 2:
             brief = (t["brief"] + "\n\n" + i18n.t("wave.fix_header") + "\n\n" + out[-LOG_TAIL:])
@@ -306,18 +341,19 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print):
             if node and "node" not in t["run_args"]:
                 flags += ["--node", node]
             jid = env.launch(t, brief, t["rama"], flags)
-            mem.set_task(conn, t["id"], "arreglo", job_id=jid, intentos=t["intentos"] + 1)
+            # integration found it red after the job said ok: a manual correction (forzar)
+            _set(conn, org, t["id"], "arreglo", "ok", force=True, job_id=jid, intentos=t["intentos"] + 1)
             say(i18n.t("wave.fix_launched", id=t["id"]))
             return 0
         elif rc == 7:
-            mem.set_task(conn, t["id"], "bloqueada", error="red after fix")
+            _set(conn, org, t["id"], "bloqueada", "ok", force=True, error="red after fix")
             _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "rojo_tras_arreglo",
                                                "registro": out[-LOG_TAIL:]})
             say(i18n.t("wave.blocked", id=t["id"]))
             return 0
         elif rc == 8:
             files = _conflict_files(out)
-            mem.set_task(conn, t["id"], "bloqueada", error="conflict")
+            _set(conn, org, t["id"], "bloqueada", "ok", force=True, error="conflict")
             _event(conn, "necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "conflicto",
                                                "ficheros": files})
             say(i18n.t("wave.conflict", id=t["id"], n=len(files)))
@@ -372,20 +408,23 @@ def main(argv, env=None):
         print(i18n.t("wave.usage"), file=sys.stderr)
         return 2
     try:
-        pos, vals, fl = _opts(rest, ("db", "wave", "par", "into", "node", "repo-dir"), ("json",))
+        pos, vals, fl = _opts(rest, ("db", "org", "wave", "par", "into", "node", "repo-dir"), ("json",))
+        org = (vals.get("org") or os.environ.get("DELEGA_MEM_ORG") or "").strip()
+        if cmd in ("plan", "step") and not org:
+            raise mem.MemError(i18n.t("wave.no_org"))
         need = 2 if cmd == "plan" else 1
         if len(pos) != need:
             raise mem.MemError(i18n.t("wave.usage"))
-        conn = mem.connect(mem.db_path(vals.get("db")))
+        conn = mem.connect(mem.db_path(vals.get("db"), org=org or None))
         try:
             flow = pos[0]
             if cmd == "plan":
-                wave, rows = plan(conn, flow, pos[1], int(vals["wave"]) if vals.get("wave") else None)
+                wave, rows = plan(conn, flow, pos[1], int(vals["wave"]) if vals.get("wave") else None, org=org)
                 print(i18n.t("wave.planned", flow=flow, wave=wave, n=len(rows)))
             elif cmd == "step":
                 par = mem._number(vals.get("par", DEFAULT_PAR), "--par", int)
                 return step(conn, flow, env or Env(vals.get("repo-dir") or os.getcwd()), par=par,
-                            into=vals.get("into"), node=vals.get("node"))
+                            into=vals.get("into"), node=vals.get("node"), org=org)
             else:
                 tasks, lines = status_table(conn, flow)
                 if "json" in fl:

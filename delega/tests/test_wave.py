@@ -52,13 +52,13 @@ class WaveTest(unittest.TestCase):
         p = os.path.join(self.tmp.name, "ola.tsv")
         with open(p, "w") as f:
             f.write(tsv(rows))
-        return wave.plan(self.conn, "f", p, **kw)
+        return wave.plan(self.conn, "f", p, org="personal", **kw)
 
     def states(self):
         return {r["id"]: r["estado"] for r in self.conn.execute("SELECT id, estado FROM tareas")}
 
     def step(self, **kw):
-        return wave.step(self.conn, "f", self.env, say=lambda *_: None, **kw)
+        return wave.step(self.conn, "f", self.env, say=lambda *_: None, org="personal", **kw)
 
     def events(self, que):
         return [e for e in mem.log_events(self.conn, limit=0, flow="f") if e["que"] == que]
@@ -127,7 +127,7 @@ class WaveTest(unittest.TestCase):
         out = io.StringIO()
         p = os.path.join(self.tmp.name, "ola.tsv")
         with contextlib.redirect_stderr(out):
-            rc = wave.main(["plan", "f", p, "--db", self.db])
+            rc = wave.main(["plan", "f", p, "--db", self.db, "--org", "personal"])
         self.assertEqual(rc, 2)
 
     def test_cli_overlap_rc2_writes_nothing(self):
@@ -135,7 +135,7 @@ class WaveTest(unittest.TestCase):
         with open(p, "w") as f:
             f.write(tsv([("a", "x", "src/**", "", ""), ("b", "y", "src/b.py", "", "")]))
         with contextlib.redirect_stderr(io.StringIO()):
-            rc = wave.main(["plan", "f", p, "--db", self.db])
+            rc = wave.main(["plan", "f", p, "--db", self.db, "--org", "personal"])
         self.assertEqual(rc, 2)
         self.assertEqual(self.states(), {})
 
@@ -169,7 +169,7 @@ class WaveTest(unittest.TestCase):
         self.assertIn("0/3", lines[0])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(wave.main(["status", "f", "--db", self.db]), 0)
+            self.assertEqual(wave.main(["status", "f", "--db", self.db, "--org", "personal"]), 0)
         self.assertIn("pendiente", out.getvalue())
 
 

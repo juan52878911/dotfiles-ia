@@ -137,17 +137,28 @@ def origin(cfg, remote):
 def _export(client):
     from . import mem
     if client.m["local"]:
-        return client._local(mem.export)
-    return client._remote("export")[1]
+        rc, res = client._call(lambda: client._local_rc(mem.export))
+    else:
+        rc, res = client._call(lambda: client._remote("export"))
+    if rc != mem.EXIT_OK:
+        raise mem.MemError(f"export: rc={rc}")
+    return res
 
 
 def _event_once(client, task, datos):
     """True when this call wrote the request (False: there was one already)."""
     from . import mem
     if client.m["local"]:
-        return client._local(lambda c: mem.add_event(c, REQUEST, datos, task=task, once=True, quien=client.owner))
-    return bool(client._remote("event", REQUEST, "--task", task, "--once", "--datos",
-                               json.dumps(datos, ensure_ascii=False))[1].get("creado"))
+        rc, res = client._call(lambda: client._local_rc(
+            lambda c: mem.add_event(c, REQUEST, datos, task=task, once=True, quien=client.owner)))
+        if rc != mem.EXIT_OK:
+            raise mem.MemError(f"event: rc={rc}")
+        return res
+    rc, payload = client._call(lambda: client._remote("event", REQUEST, "--task", task, "--once", "--datos",
+                                                      json.dumps(datos, ensure_ascii=False)))
+    if rc != mem.EXIT_OK:
+        raise mem.MemError(payload.get("error") or f"event: rc={rc}")
+    return bool(payload.get("creado"))
 
 
 def _flow_export(exp, flow):
@@ -205,6 +216,7 @@ def spawn(cfg, task_id, brief):
 
 def escalate(cfg, client):
     """Block the tasks that need a decision and ask one Claude orchestrator per task. Returns the task ids asked."""
+    from . import mem
     exp = _export(client)
     asked = []
     for tid, why in candidates(exp).items():
@@ -212,7 +224,11 @@ def escalate(cfg, client):
         fx = _flow_export(exp, task["flujo"])
         if not _event_once(client, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "export": fx}):
             continue
-        client.set(tid, "bloqueada", error=why)
+        rc, payload = client.set(tid, "bloqueada", error=why, desde=task["estado"])
+        if rc == mem.EXIT_LEASE:         # another orchestrator moved the task first: it is theirs now
+            continue
+        if rc != mem.EXIT_OK:
+            raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
         log = spawn(cfg, tid, brief_for(task, why, fx))
         print(i18n.t("relevo.asked", task=tid, why=why, log=log))
         asked.append(tid)
