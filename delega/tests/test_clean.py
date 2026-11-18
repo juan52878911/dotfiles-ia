@@ -116,6 +116,15 @@ class CleanTest(OpsCase):
         self.assertFalse(os.path.exists(sha))
         self.assertFalse(os.path.exists(old))
 
+    def test_fetched_sha_wins_over_a_noisy_fetch_log(self):            # finding 9/11: ssh warnings in fetch.log
+        _, noisy = self.remote_job("20260101-000000-1111", lease_age=3600, final=True, fetched=False,
+                                   extra={"FETCHED": "abc1234def"})
+        _, failed = self.remote_job("20260102-000000-2222", lease_age=3600, final=True, fetched=False)
+        rc, out, err = self.run_cli(clean.main, "--node", "box", "--older-than", "1d", "--yes")
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(noisy))
+        self.assertTrue(os.path.isdir(failed))
+
     def test_job_without_lease_is_removed_but_unreadable_dir_is_not(self):
         _, nolease = self.remote_job("20260101-000000-1111")
         _, denied = self.remote_job("20260102-000000-2222", lease_age=3600, final=True)

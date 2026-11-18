@@ -199,7 +199,7 @@ class NodeDaemon(Base):
         self.assertEqual([t["id"] for t in reqs[0]["export"]["tareas"]], ["t1"])
         calls = [c for c in self.log(1) if c.startswith(ASK)]
         self.assertEqual(len(calls), 1)
-        for want in ("-p", "--model sonnet", "--max-budget-usd 3", "git push", "git merge", "only in the database: t1"):
+        for want in ("-p", "--model sonnet", "--max-budget-usd 3", "Bash(git *)", "Bash(gh *)", "only in the database: t1"):
             self.assertIn(want, calls[0])
         
     def test_ws_exec_when_it_exists_else_plain_claude(self):
@@ -217,9 +217,10 @@ class NodeDaemon(Base):
 
     def test_escalation_is_read_only_and_without_push_credentials(self):
         argv = relevo.claude_argv("b", "trycore")
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
-        allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowed-tools")]
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+        allowed = argv[argv.index("--allowedTools") + 1:argv.index("--disallowedTools")]
         self.assertEqual(allowed, ["Read", "Grep", "Glob", "Bash(delega mem *)"])
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1:], ["Bash(git *)", "Bash(gh *)", "Edit", "Write"])
         self.assertEqual(argv[:3], ["ws", "exec", "claude"])
         self.assertEqual(relevo.claude_argv("b", "otraorg")[:2], ["claude", "-p"])   # context cannot be pinned
         with mock.patch.dict(os.environ, {"GH_TOKEN": "x", "GITHUB_TOKEN": "y", "SSH_AUTH_SOCK": "/s"}):

@@ -48,6 +48,12 @@ class DaemonCase(unittest.TestCase):
         self.db, self.repo, self.state = (os.path.join(r, x) for x in ("m.db", "repo", "state"))
         os.makedirs(self.repo)
         os.makedirs(self.state)
+        # a real checkout whose origin is the repo of the flow (the daemon checks it, like `delega wave`)
+        for cmd in (["init", "-q", "-b", "main"], ["remote", "add", "origin", REMOTE],
+                    ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c0"]):
+            subprocess.run(["git", "-C", self.repo, *cmd], check=True)
+        self.sha = subprocess.run(["git", "-C", self.repo, "rev-parse", "HEAD"], capture_output=True,
+                                  text=True, check=True).stdout.strip()
         self.conf = os.path.join(r, "config.toml")
         with open(self.conf, "w") as f:
             f.write(TOML.format(db=self.db, repo=self.repo))
@@ -134,8 +140,6 @@ class LaunchOnlyOnce(DaemonCase):
         self.assertEqual(sum(results.values()), 1)
 
     def test_reads_tasks_from_the_database_and_migrates_queue_jsonl(self):
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
-        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", REMOTE], check=True)
         brief = os.path.join(self.tmp.name, "b.md")
         with open(brief, "w") as f:
             f.write("legacy brief")
@@ -237,14 +241,28 @@ class Hardening(DaemonCase):
         self.assertEqual(rama, "delega/q-f1-t1")
         self.assertEqual(nodo, "auto")
 
-    def test_lanzada_is_reconciled_to_ok_or_rojo(self):
-        from delega import wave
-        for t in ("t1", "t2", "t3"):
+    def fake_job(self, jid, branch, rc=0, sha=None, end=True, fetch_log=""):
+        """A real job directory (meta + summary.json + fetch.log), as `delega run` leaves it."""
+        d = os.path.join(self.state, jid + "-fake")
+        os.makedirs(d)
+        meta = f"BRANCH={branch}\n" + ("END=1\n" if end else "") + (f"FETCHED={sha}\n" if sha else "")
+        with open(os.path.join(d, "meta"), "w") as f:
+            f.write(meta)
+        with open(os.path.join(d, "summary.json"), "w") as f:
+            json.dump({"rc": rc}, f)
+        with open(os.path.join(d, "fetch.log"), "w") as f:
+            f.write(fetch_log)
+        return d
+
+    def test_lanzada_is_reconciled_to_ok_or_rojo(self):        # finding 1: the real job_state (3 values)
+        for t, jid in (("t1", "20260101-000001-aaaa"), ("t2", "20260101-000002-bbbb"),
+                       ("t3", "20260101-000003-cccc")):
             self.add_task(t)
-            self.assertEqual(self.client("a").set(t, "lanzada", job_id="j-" + t)[0], 0)
-        states = {"j-t1": "ok", "j-t2": "fail", "j-t3": "running"}
-        with mock.patch.object(wave.Env, "job_state", lambda self, t: (states[t["job_id"]], t["job_id"])):
-            self.cycle()
+            self.assertEqual(self.client("a").set(t, "lanzada", job_id=jid)[0], 0)
+        self.fake_job("20260101-000001-aaaa", "b1", rc=0, sha=self.sha, fetch_log="Warning: Permanently added")
+        self.fake_job("20260101-000002-bbbb", "b2", rc=1)
+        self.fake_job("20260101-000003-cccc", "b3", end=False)
+        self.cycle()
         self.assertEqual(self.states(), {"t1": "ok", "t2": "rojo", "t3": "lanzada"})
 
     def test_flow_with_waves_goes_to_wave_step_and_not_to_the_plain_launch(self):
@@ -252,11 +270,145 @@ class Hardening(DaemonCase):
         self.add_task("t1")
         self.add_task("t2", wave="2")
         calls, launched = [], []
-        with mock.patch.object(wave, "step", lambda conn, flow, env, **kw: calls.append((flow, kw.get("org")))):
+        with mock.patch.object(wave, "step", lambda conn, flow, env, **kw: calls.append(
+                (flow, kw.get("org"), env.repo_dir, env.org))):
             self.cycle(launch=lambda cfg, it: launched.append(it["id"]) or ("launched", "1"))
-        self.assertEqual(calls, [("f1", "trycore")])
+        self.assertEqual(calls, [("f1", "trycore", os.path.abspath(self.repo), "trycore")])   # finding 2
         self.assertEqual(launched, [])
         self.assertEqual(self.states(), {"t1": "pendiente", "t2": "pendiente"})
+
+    def test_wave_flow_full_cycle_with_the_real_wave_and_queue(self):       # findings 1, 2, 9, 10
+        """pendiente -> lanzada -> ok -> integrada -> hecha, with `delega run` and `integrate` faked
+        at the process boundary only: wave.step, Env.job_state, _fetched_sha and the daemon are real."""
+        from delega import wave
+        self.add_task("t1")
+        integrations, runs = [], []
+
+        class P:
+            pid = 999999
+
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):               # `delega run`: leaves a finished job dir behind
+            if "--branch" not in cmd:            # (subprocess is global: git and the rest stay real)
+                return real_popen(cmd, **kw)
+            branch = cmd[cmd.index("--branch") + 1]
+            runs.append((branch, kw["cwd"]))
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self.fake_job(f"{stamp}-w{len(runs)}", branch, rc=0, sha=self.sha, fetch_log="Warning: Permanently added")
+            return P()
+
+        def fake_integrate(env, branch, into, node, sha=None):
+            integrations.append((env.repo_dir, branch, into, sha))
+            return 0, "ok"
+
+        def drive(n=3):
+            with mock.patch.object(wave.subprocess, "Popen", fake_popen), \
+                    mock.patch.object(wave.Env, "integrate", fake_integrate):
+                for _ in range(n):
+                    self.cycle()
+        # a second wave makes it a flow with waves; t2 must wait for t1
+        self.add_task("t2", wave="2")
+        drive(1)
+        self.assertEqual(self.states(), {"t1": "lanzada", "t2": "pendiente"})
+        self.assertEqual(runs, [("delega/wave-f1-t1", os.path.abspath(self.repo))])
+        self.assertTrue(os.path.isfile(os.path.join(self.state, "wave", "trycore", "f1-t1.md")))
+        drive(1)                                  # reconcile (ok) + integrate the whole wave 1
+        self.assertEqual(self.states()["t1"], "hecha")
+        self.assertEqual(integrations[0], (os.path.abspath(self.repo), "delega/wave-f1-t1", "main", self.sha))
+        drive(3)
+        self.assertEqual(self.states(), {"t1": "hecha", "t2": "hecha"})
+        self.assertFalse(os.path.exists(os.path.join(self.state, "wave", "_")))
+
+    def test_real_env_fetched_sha_trusts_meta_over_a_noisy_fetch_log(self):    # finding 9
+        from delega import wave
+        env = wave.Env(self.repo, org="trycore")
+        noisy = self.fake_job("20260101-000001-aaaa", "b1", sha=self.sha, fetch_log="Warning: Permanently added")
+        old_ok = self.fake_job("20260101-000002-bbbb", "main")                       # old job: empty log, no key
+        old_bad = self.fake_job("20260101-000003-cccc", "main", fetch_log="fatal: x")
+        self.assertEqual(env._fetched_sha(noisy, "20260101-000001-aaaa", "b1"), self.sha)
+        self.assertEqual(env._fetched_sha(old_ok, "20260101-000002-bbbb", "main"), self.sha)
+        self.assertIsNone(env._fetched_sha(old_bad, "20260101-000003-cccc", "main"))
+
+    def test_retry_from_rojo_carries_the_tail_of_the_failed_log(self):          # finding 12
+        from delega import wave
+        self.add_task("t1")
+        self.add_task("t2", wave="2")
+        self.assertEqual(self.client("a").set("t1", "lanzada", job_id="20260101-000001-aaaa", rama="b1")[0], 0)
+        d = self.fake_job("20260101-000001-aaaa", "b1", rc=1)
+        with open(os.path.join(d, "progress.log"), "w") as f:
+            f.write("\n".join(f"line {i}" for i in range(200)))
+        launches = []
+
+        def fake_launch(env, task, brief, branch, flags):
+            launches.append(brief)
+            return "pend:1:x"
+        with mock.patch.object(wave.Env, "launch", fake_launch):
+            self.cycle()
+            self.cycle()
+        self.assertEqual(len(launches), 1)
+        self.assertIn("line 199", launches[0])
+        self.assertIn("line 120", launches[0])
+        self.assertNotIn("line 100\n", launches[0])
+
+    def test_task_without_profile_is_checked_against_the_org_of_the_default_profile(self):   # finding 15
+        from delega import wave
+        with open(self.conf, "a") as f:
+            f.write('[profiles.personal.repo_match]\ngit_remote = "example.com:acme/api"\n')
+        self.cfg = config.load()
+        self.add_task("t1")
+        conn = mem.connect(self.db)
+        try:
+            wave.check_profiles(conn, "f1", "trycore")                               # no repo dir: nothing to resolve
+            with self.assertRaises(mem.MemError):
+                wave.check_profiles(conn, "f1", "trycore", self.repo)
+        finally:
+            conn.close()
+
+    def test_escalation_goes_through_relevo_escalate_with_org_and_task_profile(self):    # finding 7, 13
+        from delega import relevo
+        self.add_task("t1")
+        self.client("a").set("t1", "lanzada")
+        conn = mem.connect(self.db)
+        mem.add_event(conn, relevo.NEEDS_DECISION, {"tarea": "t1", "motivo": "x"}, task="t1")
+        conn.close()
+        popen = []
+
+        class P:
+            pass
+        with mock.patch.object(relevo.subprocess, "Popen", lambda cmd, **k: popen.append(cmd) or P()):
+            self.cycle()
+            self.cycle()
+        self.assertEqual(len(popen), 1)                                              # once, never twice
+        esc = [d for d in os.listdir(self.state) if d.endswith("-esc-t1")]
+        self.assertEqual(len(esc), 1)
+        info = json.load(open(os.path.join(self.state, esc[0], "escalado.json")))
+        self.assertEqual(info["PROFILE"], "trycore")
+        self.assertEqual(self.states()["t1"], "bloqueada")
+
+    def test_escalation_profile_prefers_the_task_then_repo_match(self):        # finding 13
+        from delega import relevo
+        with open(self.conf, "a") as f:
+            f.write('[profiles.trycore.repo_match]\ngit_remote = "other/x"\n')
+            f.write('[profiles.second]\nowner = "self"\norg = "trycore"\n[profiles.second.repo_match]\n'
+                    'git_remote = "acme/api"\n')
+        cfg = config.load()
+        self.assertEqual(relevo.escalation_profile(cfg, "trycore", None, REMOTE), "second")
+        self.assertEqual(relevo.escalation_profile(cfg, "trycore", {"run_args": {"profile": "trycore"}}, REMOTE),
+                         "trycore")
+        self.assertEqual(relevo.escalation_profile(cfg, "trycore", None, "git@h:zz/yy"), "trycore")
+
+    def test_wave_flow_with_the_wrong_checkout_is_refused(self):     # finding 2: same check as `delega wave`
+        from delega import wave
+        subprocess.run(["git", "-C", self.repo, "remote", "set-url", "origin", "git@example.com:other/thing"],
+                       check=True)
+        self.add_task("t1")
+        self.add_task("t2", wave="2")
+        calls = []
+        with mock.patch.object(wave, "step", lambda *a, **k: calls.append(1)):
+            err = self.cycle()
+        self.assertEqual(calls, [])
+        self.assertIn("other/thing", err)
 
     def test_brief_and_log_live_under_the_org_and_the_flow(self):
         self.add_task("t1")
@@ -273,8 +425,6 @@ class Hardening(DaemonCase):
         self.assertFalse(os.path.exists(os.path.join(self.state, "queue", "t1.md")))
 
     def test_migrated_items_are_not_launched_by_a_normal_tick(self):
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
-        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", REMOTE], check=True)
         brief = os.path.join(self.tmp.name, "b.md")
         with open(brief, "w") as f:
             f.write("legacy")
@@ -289,8 +439,6 @@ class Hardening(DaemonCase):
         self.assertEqual(launched, [])
 
     def test_task_without_profile_of_another_org_is_refused(self):
-        subprocess.run(["git", "init", "-q", self.repo], check=True)
-        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", REMOTE], check=True)
         with open(self.conf, "a") as f:
             f.write('[profiles.personal.repo_match]\ngit_remote = "acme/api"\n')
         self.cfg = config.load()
@@ -311,7 +459,7 @@ class Hardening(DaemonCase):
             mem.add_event(conn, relevo.NEEDS_DECISION, {"tarea": t, "motivo": "x"}, task=t)
         conn.close()
         spawned = []
-        with mock.patch.object(relevo, "spawn", lambda cfg, tid, brief: spawned.append(tid) or "log"):
+        with mock.patch.object(relevo, "spawn", lambda cfg, tid, brief, *a, **k: spawned.append(tid) or "log"):
             self.cycle()
             self.assertEqual(len(spawned), 1)
             self.cycle()

@@ -399,6 +399,7 @@ class RemoteRunTests(LaunchCase):
             self.assertTrue(os.path.exists(os.path.join(d, f)), f)
         self.assertEqual(sh("git", "-C", self.repo, "log", "--format=%s", "-1", meta["BRANCH"]), "stub work")
         self.assertIn(f"branch {meta['BRANCH']} fetched", out)
+        self.assertEqual(util.read_meta(d)["FETCHED"], sh("git", "-C", self.repo, "rev-parse", meta["BRANCH"]))  # finding 9
         self.assertIn("no forbidden terms", out)
         self.assertIn("RC=0", out)
         self.assertIn("final report", out)

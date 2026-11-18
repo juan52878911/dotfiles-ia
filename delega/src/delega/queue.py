@@ -516,9 +516,21 @@ def _safe(text):
     return re.sub(r"[^\w.-]", "_", str(text))
 
 
-def _wave_step(cfg, client, flow):
+def _flow_env(cfg, client, fl):
+    """The `wave.Env` of a flow: its repo checkout (the node's bare repo on a node, the local checkout
+    of `[memoria.<org>].repos` on the Mac), never the cwd of the daemon; the origin must be the flow's repo."""
+    from . import mem, wave
+    repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"])
+    if not repo:
+        raise mem.MemError(i18n.t("tick.no_checkout", id=fl["id"], repo=fl["repo"]))
+    wave.check_origin(repo, fl["repo"])
+    return wave.Env(repo, org=client.org)
+
+
+def _wave_step(cfg, client, fl):
     """A flow with waves is driven by wave.step (it launches one wave at a time, with --par)."""
-    from . import wave
+    from . import mem, wave
+    flow = fl["id"]
     if not client.m["local"]:
         print(i18n.t("tick.wave_remote", flow=flow), file=sys.stderr)
         return
@@ -527,7 +539,11 @@ def _wave_step(cfg, client, flow):
     try:
         conn = client._conn()
         try:
-            wave.step(conn, flow, wave.Env(os.getcwd()), org=client.org, say=lambda m: print(m))
+            env = _flow_env(cfg, client, fl)
+            wave.check_profiles(conn, flow, client.org, env.repo_dir)
+            wave.step(conn, flow, env, org=client.org, say=lambda m: print(m))
+        except mem.MemError as e:
+            print(i18n.t("tick.bad_item", id=flow, err=e), file=sys.stderr)
         finally:
             conn.close()
     finally:
@@ -537,20 +553,20 @@ def _wave_step(cfg, client, flow):
             os.environ["DELEGA_MEM_OWNER"] = prev
 
 
-def _reconcile_tasks(cfg, client, tasks):
+def _reconcile_tasks(cfg, client, fl, tasks):
     """lanzada -> ok/rojo from the state of the task's job (compare-and-set on `lanzada`)."""
-    from . import wave
+    from . import mem
     env = None
     for t in tasks:
         if t["estado"] != "lanzada" or not t.get("job_id"):
             continue
-        env = env or wave.Env(os.getcwd())
         try:
-            state, jid = env.job_state(t)
+            env = env or _flow_env(cfg, client, fl)
+            state, jid, _sha = env.job_state(t)
         except Exception as e:
             print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
             continue
-        if state == "running":
+        if state in ("running", "queued"):
             continue
         target = "ok" if state == "ok" else "rojo"
         rc, _ = client.set(t["id"], target, desde="lanzada", job_id=jid,
@@ -583,9 +599,9 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
             continue
         # waves: more than one (`ola` defaults to 1, so ola > 0 would take every flow)
         if any((t.get("ola") or 1) > 1 for t in by_flow.get(fl["id"], [])):
-            _wave_step(cfg, client, fl["id"])
+            _wave_step(cfg, client, fl)
             continue
-        _reconcile_tasks(cfg, client, by_flow.get(fl["id"], []))
+        _reconcile_tasks(cfg, client, fl, by_flow.get(fl["id"], []))
         for t in client.ready(fl["id"]):
             ra = t.get("run_args") or {}
             repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"], ra.get("_checkout"))
@@ -640,28 +656,13 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
 
 
 def _escalate_one(cfg, client):
-    """relevo's escalation, but at most one task per cycle and org (the rest wait for the next
-    cycle: a request is written only for the task that is actually asked). Never stops the daemon."""
-    from . import mem
+    """relevo's escalation, but at most one task per cycle (the rest wait for the next cycle).
+    Never stops the daemon."""
     try:
-        exp = relevo._export(client)
-        for tid, why in relevo.candidates(exp).items():
-            task = next(t for t in exp["tareas"] if t["id"] == tid)
-            fx = relevo._flow_export(exp, task["flujo"])
-            if not relevo._event_once(client, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why,
-                                                    "export": fx}):
-                continue
-            rc, payload = client.set(tid, "bloqueada", error=why, desde=task["estado"])
-            if rc == mem.EXIT_LEASE:
-                continue
-            if rc != mem.EXIT_OK:
-                raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
-            log = relevo.spawn(cfg, tid, relevo.brief_for(task, why, fx))
-            print(i18n.t("relevo.asked", task=tid, why=why, log=log))
-            return [tid]
+        return relevo.escalate(cfg, client, limit=1)
     except Exception as e:
         print(i18n.t("relevo.error", err=e), file=sys.stderr)
-    return []
+        return []
 
 
 def main_daemon(argv):

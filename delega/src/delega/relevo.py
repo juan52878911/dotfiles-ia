@@ -30,9 +30,9 @@ MAX_REDS = 2
 MODEL = "sonnet"
 CAP_USD = 3
 EVENT_TAIL = 50
-FORBIDDEN_TOOLS = ("Bash(git push:*)", "Bash(git merge:*)", "Bash(gh pr merge:*)")
-# the escalated Claude only reads and talks to the database: a deny list is bypassed by `git -C x push`,
-# `cd r && git push`, `git update-ref`, `gh api …/merges`; a closed allow list in plan mode is not
+FORBIDDEN_TOOLS = ("Bash(git *)", "Bash(gh *)", "Edit", "Write")
+# what guarantees that the escalated Claude never pushes or merges (see `claude_argv`):
+# the closed allow list below; the deny list only adds a second lock.
 ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Bash(delega mem *)")
 STRIPPED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK")
 # profile keys that make sense on a node (paths and secrets of the Mac are left out)
@@ -225,10 +225,21 @@ def _ws_in_org(org):
 
 
 def claude_argv(brief, org=None):
+    """argv of the escalated Claude. What guarantees what:
+
+    * `--permission-mode default` + the CLOSED `--allowedTools` list (read tools + `Bash(delega mem *)`):
+      in `-p` nobody can answer a permission prompt, so any tool outside the list is refused. THIS is
+      what stops a push or a merge (a deny list alone is bypassed by `git -C x push`, `cd r && git push`,
+      `git update-ref`, `gh api …/merges`).
+    * `--disallowedTools` (`git`, `gh`, `Edit`, `Write`): a second lock that wins over the allow list.
+    * `claude_env()`: only removes the GitHub tokens / ssh agent; it is not the guarantee (a Mac user
+      may have other credentials).
+    Plan mode is NOT used: it could not be shown that it lets `Bash(delega mem *)` run, and without
+    that command the Claude cannot write its decision. (Not verified live: the node has no login.)"""
     base = ["ws", "exec", "claude"] if _ws_in_org(org) else ["claude"]
     return base + ["-p", brief, "--model", MODEL, "--max-budget-usd", str(CAP_USD),
-                   "--output-format", "json", "--permission-mode", "plan",
-                   "--allowedTools", *ALLOWED_TOOLS, "--disallowed-tools", *FORBIDDEN_TOOLS]
+                   "--output-format", "json", "--permission-mode", "default",
+                   "--allowedTools", *ALLOWED_TOOLS, "--disallowedTools", *FORBIDDEN_TOOLS]
 
 
 def claude_env():
@@ -236,7 +247,21 @@ def claude_env():
     return {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
 
 
-def spawn(cfg, task_id, brief, org=None):
+def escalation_profile(cfg, org, task=None, repo=None):
+    """Profile the escalated Claude is accounted to: the task's own (if it belongs to the org), else the
+    one whose `repo_match.git_remote` matches the flow's repo, else the first of the org."""
+    mine = [n for n in cfg.profiles if cfg.profile_org(n) == org] if org else []
+    want = ((task or {}).get("run_args") or {}).get("profile")
+    if want in mine:
+        return want
+    for n in mine:
+        rx = (cfg.profiles[n].get("repo_match") or {}).get("git_remote")
+        if rx and repo and re.search(rx, repo):
+            return n
+    return mine[0] if mine else None
+
+
+def spawn(cfg, task_id, brief, org=None, profile=None):
     """Start the Claude orchestrator in the background; returns its log path.
 
     The run is a spend entry of its own (`<state>/<ts>-esc-<task>/`): its JSON result lands in
@@ -247,7 +272,7 @@ def spawn(cfg, task_id, brief, org=None):
     log = os.path.join(d, task_id + ".log")
     with open(os.path.join(d, task_id + ".md"), "w", encoding="utf-8") as f:
         f.write(brief)
-    prof = next((n for n in cfg.profiles if cfg.profile_org(n) == org), None) if org else None
+    prof = profile or escalation_profile(cfg, org)
     run_dir = os.path.join(cfg.state_dir, time.strftime("%Y%m%d-%H%M%S") + "-esc-" + re.sub(r"[^\w.-]", "_", task_id))
     os.makedirs(run_dir, exist_ok=True)
     util.write_json(os.path.join(run_dir, "escalado.json"),
@@ -259,15 +284,18 @@ def spawn(cfg, task_id, brief, org=None):
     return log
 
 
-def escalate(cfg, client):
+def escalate(cfg, client, limit=None):
     """Block the tasks that need a decision and ask one Claude orchestrator per task. Returns the task ids asked.
 
     Order matters: the task is blocked and the Claude started first, the `once` request event is written
-    last, so a failure in between leaves the task retryable (event `escalado_fallido`) instead of dead."""
+    last, so a failure in between leaves the task retryable (event `escalado_fallido`) instead of dead.
+    `limit`: at most that many tasks are attempted per call (the rest wait for the next cycle)."""
     from . import mem
     exp = _export(client)
-    asked = []
+    asked, tried = [], 0
     for tid, why in candidates(exp).items():
+        if limit and tried >= limit:
+            break
         task = next(t for t in exp["tareas"] if t["id"] == tid)
         fx = _flow_export(exp, task["flujo"])
         if task["estado"] != "bloqueada":
@@ -276,8 +304,10 @@ def escalate(cfg, client):
                 continue
             if rc != mem.EXIT_OK:
                 raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
+        tried += 1
         try:
-            log = spawn(cfg, tid, brief_for(task, why, fx), client.org)
+            prof = escalation_profile(cfg, client.org, task, ((fx.get("flujo") or {}).get("repo")))
+            log = spawn(cfg, tid, brief_for(task, why, fx), client.org, prof)
         except Exception as e:
             print(i18n.t("relevo.error", err=e), file=sys.stderr)
             _event(client, SPAWN_FAILED, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why, "error": str(e)})
