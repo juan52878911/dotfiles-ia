@@ -23,6 +23,7 @@ COMMANDS = {
     "scan":      ("scan",      "look for forbidden terms in a branch, a brief or a text"),
     "queue":     ("queue",     "queue a brief with a priority / list the queue"),
     "mem":       ("mem",       "central orchestration memory in SQLite: flows, tasks, leases, log"),
+    "wave":      ("wave",      "a wave of tasks in the memory: plan, step (idempotent), status"),
     "tick":      ("queue",     "reconcile leases and launch queued jobs when there is room"),
     "integrate": ("integrate", "dry-run merge of a job branch and run the project's verify commands"),
     "sync":      ("sync",      "push the profile's rules bundle (CLAUDE.md, hooks, agents) to nodes"),
