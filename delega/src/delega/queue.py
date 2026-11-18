@@ -96,7 +96,9 @@ def pending(items):
 
 def launch(cfg, item):
     """Start `delega run` in the background. Returns ("launched"|"failed", detail)."""
-    log = os.path.join(cfg.state_dir, "queue", item["id"] + ".log")
+    log = item.get("log_path") or os.path.join(cfg.state_dir, "queue", item["id"] + ".log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() - 5))
     env = dict(os.environ)
     root = os.path.dirname(util.PKG_DIR)            # checkout src/ or the .pyz itself
     env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
@@ -106,6 +108,7 @@ def launch(cfg, item):
                              stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                              start_new_session=True, env=env, cwd=item["repo"])
     item["pid"], item["log"] = p.pid, log
+    item["job_id"] = f"pend:{p.pid}:{stamp}"          # provisional, as wave does: job_state resolves it
     try:
         rc = p.wait(timeout=LAUNCH_GRACE_S)
     except subprocess.TimeoutExpired:
@@ -383,7 +386,7 @@ class MemClient:
         rc, payload = self._call(lambda: self._remote("next", flow))
         return payload.get("tareas", [])
 
-    def set(self, task, estado, error=None, desde=None, force=False):
+    def set(self, task, estado, error=None, desde=None, force=False, job_id=None, rama=None, nodo=None):
         """(rc, payload) of `set`: rc 9 when the compare-and-set found another state (somebody
         else moved the task first), rc 10 when the database stayed locked."""
         from . import mem
@@ -391,7 +394,8 @@ class MemClient:
             def op():
                 try:
                     payload = self._local(lambda c: mem.set_task(c, task, estado, error=error,
-                                                                desde=desde, force=force, org=self.org))
+                                                                desde=desde, force=force, org=self.org,
+                                                                job_id=job_id, rama=rama, nodo=nodo))
                 except mem.MemConflict as e:
                     return mem.EXIT_LEASE, {"error": str(e)}
                 except sqlite3.OperationalError as e:
@@ -403,6 +407,9 @@ class MemClient:
         extra = ["--error", error] if error else []
         if desde:
             extra += ["--desde", desde]
+        for flag, val in (("--job-id", job_id), ("--rama", rama), ("--nodo", nodo)):
+            if val:
+                extra += [flag, val]
         if force:
             extra += ["--forzar"]
         return self._call(lambda: self._remote("set", task, "--estado", estado, *extra))
@@ -465,35 +472,91 @@ def _checkout(m, remote, hint=None):
 
 
 def migrate_legacy(cfg, client):
-    """Copy the still-queued items of queue.jsonl into the database (queue.jsonl is only read).
+    """Copy the still-queued items of queue.jsonl into the database and mark them `migrated` in the
+    file, in the same pass and under the lock, so a normal `delega tick` does not launch them again.
     Idempotent: the task id derives from the queue id, an existing one is skipped."""
     import hashlib
     from . import mem
     n = 0
-    for it in pending(read_items(cfg)):
-        tid = "q-" + it["id"]
-        try:
-            remote = config._git(it["repo"], "remote", "get-url", "origin")
-            if not remote:
-                raise mem.MemError("repo without an origin remote")
-            with open(it["brief"], encoding="utf-8") as f:
-                brief = f.read()
-            run_args = args_to_dict(it.get("args", []))
-            run_args.setdefault("profile", cfg.profile_for(it["repo"]))
-            run_args["_checkout"] = it["repo"]
-            fid = "mig-" + hashlib.sha1(remote.encode()).hexdigest()[:8]
-            if fid not in {f["id"] for f in client.flows()}:
-                client.add_flow(remote, fid)
-            client.add_task(fid, brief, tid, run_args)
-            n += 1
-            print(i18n.t("tick.migrated", id=it["id"], task=tid))
-        except mem.MemError as e:
-            if str(e) == i18n.t("mem.task_exists", id=tid):      # migrated by an earlier pass
-                continue
-            print(i18n.t("tick.migrate_skip", id=it["id"], err=e), file=sys.stderr)
-        except OSError as e:
-            print(i18n.t("tick.migrate_skip", id=it["id"], err=e), file=sys.stderr)
+    with lock(cfg):
+        items = read_items(cfg)
+        changed = False
+        for it in pending(items):
+            tid = "q-" + it["id"]
+            try:
+                remote = config._git(it["repo"], "remote", "get-url", "origin")
+                if not remote:
+                    raise mem.MemError("repo without an origin remote")
+                with open(it["brief"], encoding="utf-8") as f:
+                    brief = f.read()
+                run_args = args_to_dict(it.get("args", []))
+                run_args.setdefault("profile", cfg.profile_for(it["repo"]))
+                run_args["_checkout"] = it["repo"]
+                fid = "mig-" + hashlib.sha1(remote.encode()).hexdigest()[:8]
+                if fid not in {f["id"] for f in client.flows()}:
+                    client.add_flow(remote, fid)
+                client.add_task(fid, brief, tid, run_args)
+                n += 1
+                it["state"], changed = "migrated", True
+                print(i18n.t("tick.migrated", id=it["id"], task=tid))
+            except mem.MemError as e:
+                if str(e) == i18n.t("mem.task_exists", id=tid):      # migrated by an earlier pass
+                    it["state"], changed = "migrated", True
+                    continue
+                print(i18n.t("tick.migrate_skip", id=it["id"], err=e), file=sys.stderr)
+            except OSError as e:
+                print(i18n.t("tick.migrate_skip", id=it["id"], err=e), file=sys.stderr)
+        if changed:
+            write_items(cfg, items)
     return n
+
+
+def _safe(text):
+    import re
+    return re.sub(r"[^\w.-]", "_", str(text))
+
+
+def _wave_step(cfg, client, flow):
+    """A flow with waves is driven by wave.step (it launches one wave at a time, with --par)."""
+    from . import wave
+    if not client.m["local"]:
+        print(i18n.t("tick.wave_remote", flow=flow), file=sys.stderr)
+        return
+    prev = os.environ.get("DELEGA_MEM_OWNER")
+    os.environ["DELEGA_MEM_OWNER"] = client.owner
+    try:
+        conn = client._conn()
+        try:
+            wave.step(conn, flow, wave.Env(os.getcwd()), org=client.org, say=lambda m: print(m))
+        finally:
+            conn.close()
+    finally:
+        if prev is None:
+            os.environ.pop("DELEGA_MEM_OWNER", None)
+        else:
+            os.environ["DELEGA_MEM_OWNER"] = prev
+
+
+def _reconcile_tasks(cfg, client, tasks):
+    """lanzada -> ok/rojo from the state of the task's job (compare-and-set on `lanzada`)."""
+    from . import wave
+    env = None
+    for t in tasks:
+        if t["estado"] != "lanzada" or not t.get("job_id"):
+            continue
+        env = env or wave.Env(os.getcwd())
+        try:
+            state, jid = env.job_state(t)
+        except Exception as e:
+            print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
+            continue
+        if state == "running":
+            continue
+        target = "ok" if state == "ok" else "rojo"
+        rc, _ = client.set(t["id"], target, desde="lanzada", job_id=jid,
+                           error=None if target == "ok" else "job failed")
+        if rc == 0:
+            print(i18n.t("tick.task_reconciled", id=t["id"], estado=target))
 
 
 def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
@@ -505,27 +568,54 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
     _reconcile(cfg, adopt)
     migrate_legacy(cfg, client)
     items, tasks = [], {}
-    os.makedirs(os.path.join(cfg.state_dir, "queue"), exist_ok=True)
+    qdir = os.path.join(cfg.state_dir, "queue", _safe(client.org))
+    os.makedirs(qdir, exist_ok=True)
+    try:
+        exp = relevo._export(client)
+    except mem.MemError as e:
+        print(i18n.t("tick.daemon_error", err=e), file=sys.stderr)
+        exp = {"tareas": []}
+    by_flow = {}
+    for t in exp["tareas"]:
+        by_flow.setdefault(t["flujo"], []).append(t)
     for fl in client.flows():
         if fl.get("estado") != "activo":
             continue
+        # waves: more than one (`ola` defaults to 1, so ola > 0 would take every flow)
+        if any((t.get("ola") or 1) > 1 for t in by_flow.get(fl["id"], [])):
+            _wave_step(cfg, client, fl["id"])
+            continue
+        _reconcile_tasks(cfg, client, by_flow.get(fl["id"], []))
         for t in client.ready(fl["id"]):
             ra = t.get("run_args") or {}
             repo = relevo.origin(cfg, fl["repo"]) or _checkout(client.m, fl["repo"], ra.get("_checkout"))
             if not repo:
                 print(i18n.t("tick.no_checkout", id=t["id"], repo=fl["repo"]), file=sys.stderr)
                 continue
-            brief = os.path.join(cfg.state_dir, "queue", t["id"] + ".md")
+            try:
+                pname = cfg.profile(ra.get("profile") or cfg.profile_for(repo))["name"]
+                if cfg.profile_org(pname) != client.org:
+                    raise config.ConfigError(i18n.t("tick.wrong_org", profile=pname, org=client.org))
+            except config.ConfigError as e:
+                print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
+                continue
+            base = f"{_safe(fl['id'])}-{_safe(t['id'])}"
+            brief = os.path.join(qdir, base + ".md")
             with open(brief, "w", encoding="utf-8") as f:
                 f.write(t["brief"])
-            it = {"id": t["id"], "repo": repo, "brief": brief, "args": dict_to_args(ra)}
+            rama = str(ra.get("branch") or f"delega/q-{base}")[:100]
+            ra = dict(ra, profile=pname, branch=rama)
+            it = {"id": t["id"], "repo": repo, "brief": brief, "args": dict_to_args(ra),
+                  "log_path": os.path.join(qdir, base + ".log"), "rama": rama,
+                  "nodo": str(ra.get("node") or "auto")}
             items.append(it)
             tasks[t["id"]] = it
 
     def reserve(it):
         """Take the task with a compare-and-set (`set --desde pendiente`): the daemon that moves
         it out of `pendiente` is the one that launches it; the others get rc 9 and skip it."""
-        rc, payload = client.set(it["id"], "lanzada", desde="pendiente")
+        rc, payload = client.set(it["id"], "lanzada", desde="pendiente", rama=it.get("rama"),
+                                 nodo=it.get("nodo"))
         if rc == mem.EXIT_OK:
             return True
         print(i18n.t("tick.bad_item", id=it["id"], err=mem_reason(rc, payload, it["id"])), file=sys.stderr)
@@ -539,12 +629,39 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
     def mark(it, state, detail):
         if state != "launched":               # 'lanzada' -> 'rojo': the worker never started
             client.set(it["id"], "rojo", error=detail)
+        else:
+            client.set(it["id"], "lanzada", desde="lanzada", job_id=it.get("job_id"))
 
     started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl),
                            reserve=reserve, unreserve=unreserve)
     print(i18n.t("tick.summary", n=started, left=len(items) - started))
-    relevo.after_cycle(cfg, client)
+    _escalate_one(cfg, client)
     return True
+
+
+def _escalate_one(cfg, client):
+    """relevo's escalation, but at most one task per cycle and org (the rest wait for the next
+    cycle: a request is written only for the task that is actually asked). Never stops the daemon."""
+    from . import mem
+    try:
+        exp = relevo._export(client)
+        for tid, why in relevo.candidates(exp).items():
+            task = next(t for t in exp["tareas"] if t["id"] == tid)
+            fx = relevo._flow_export(exp, task["flujo"])
+            if not relevo._event_once(client, tid, {"tarea": tid, "flujo": task["flujo"], "motivo": why,
+                                                    "export": fx}):
+                continue
+            rc, payload = client.set(tid, "bloqueada", error=why, desde=task["estado"])
+            if rc == mem.EXIT_LEASE:
+                continue
+            if rc != mem.EXIT_OK:
+                raise mem.MemError(payload.get("error") or f"set {tid}: rc={rc}")
+            log = relevo.spawn(cfg, tid, relevo.brief_for(task, why, fx))
+            print(i18n.t("relevo.asked", task=tid, why=why, log=log))
+            return [tid]
+    except Exception as e:
+        print(i18n.t("relevo.error", err=e), file=sys.stderr)
+    return []
 
 
 def main_daemon(argv):
