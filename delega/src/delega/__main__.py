@@ -23,6 +23,7 @@ COMMANDS = {
     "scan":      ("scan",      "look for forbidden terms in a branch, a brief or a text"),
     "queue":     ("queue",     "queue a brief with a priority / list the queue"),
     "mem":       ("mem",       "central orchestration memory in SQLite: flows, tasks, leases, log"),
+    "relevo-mem": ("relevo_mem", "internal: the escalated Claude's only door to the org's base (log/export/next/set/event)"),
     "wave":      ("wave",      "a wave of tasks in the memory: plan, step (idempotent), status"),
     "job-state": ("jobstate",  "read-only state of a task's job (asked by another daemon over ssh)"),
     "tick":      ("queue",     "reconcile leases and launch queued jobs when there is room"),

@@ -349,7 +349,20 @@ class Env:
                 continue
             if tail:
                 out.append(f"--- {name} ---\n" + "\n".join(tail))
-        return "\n".join(out)[-LOG_TAIL:]
+        return self._redacted(task, d, "\n".join(out))[-LOG_TAIL:]
+
+    def _redacted(self, task, job_dir, text):
+        """`text` through `broker.redact` with the task's profile terms (and the job's own forbidden.txt)."""
+        from . import broker, nod
+        terms = []
+        try:
+            name = (task.get("run_args") or {}).get("profile") or None
+            terms += nod.terms_of(self.cfg().profile(name).get("forbidden_terms_file"))
+        except Exception:      # noqa: BLE001 — unknown profile: only the job's own terms
+            pass
+        if job_dir:
+            terms += nod.job_terms(job_dir)
+        return broker.redact(text, sorted(set(terms)))
 
     def job_state(self, task, write=True):
         """Returns (state, job_id, sha): state is running | ok | fail | queued | no_encontrado (a real
@@ -648,6 +661,8 @@ def step(conn, flow, env, par=DEFAULT_PAR, into=None, node=None, say=print, org=
                 continue
             st.event("wave.lanzamiento_rechazado", {"flujo": flow, "tarea": t["id"]}, task=t["id"])
             if refused >= MAX_REFUSED:
+                # a task that is refused again and again is blocked (ok/arreglo -> bloqueada): no more retries
+                st.set(t["id"], "bloqueada", "ok", error="launch refused")
                 st.event("necesita_decision", {"flujo": flow, "tarea": t["id"], "motivo": "lanzamiento_rechazado",
                                                "registro": _known(env, t, lanzador)}, task=t["id"], once=True)
             say(i18n.t("wave.fix_refused", id=t["id"], n=refused))

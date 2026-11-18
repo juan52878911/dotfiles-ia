@@ -733,13 +733,15 @@ def release_lease(conn, rol, owner=None, org=None):
 
 
 # ── the log and the export ──────────────────────────────────────────────────
-def log_events(conn, limit=50, flow=None):
+def log_events(conn, limit=50, flow=None, task=None):
     """The last events of the append-only log (the newest last)."""
     rows = conn.execute("SELECT ts, quien, que, datos FROM eventos ORDER BY id").fetchall()
     out = []
     for r in rows:
         datos = json.loads(r["datos"] or "{}")
         if flow and datos.get("flujo") != flow:
+            continue
+        if task and datos.get("tarea") != task:
             continue
         out.append({"ts": r["ts"], "quien": r["quien"], "que": r["que"], "datos": datos})
     return out[-int(limit):] if limit else out
@@ -1035,12 +1037,12 @@ def cmd_release(args, db, as_json):
 
 
 def cmd_log(args, db, as_json):
-    _, _, vals = _parse(args, values=("limit", "flow", "org"))
+    _, _, vals = _parse(args, values=("limit", "flow", "task", "org"))
     org = _org(vals)
     limit = _number(vals.get("limit", 50), "--limit", int)
     conn = connect(db_path(db, org=org))
     try:
-        events = log_events(conn, limit=limit, flow=vals.get("flow"))
+        events = log_events(conn, limit=limit, flow=vals.get("flow"), task=vals.get("task"))
     finally:
         conn.close()
     payload = {"ok": True, "cmd": "log", "eventos": events}
@@ -1457,36 +1459,7 @@ def main(argv):
     fn = ORDERS.get(cmd)
     if fn is None:
         return _fail(i18n.t("mem.unknown_cmd", cmd=cmd), as_json)
-    prev_owner = os.environ.get("DELEGA_MEM_OWNER")
-    owner_opt = None
-    if cmd not in OWNER_OPTION_ORDERS:      # a common option: who writes (an escalated Claude over ssh)
-        args, owner_opt = _take_owner(args)
-    if owner_opt:
-        os.environ["DELEGA_MEM_OWNER"] = owner_opt
-    try:
-        return _run(fn, args, db, as_json)
-    finally:
-        if prev_owner is None:
-            os.environ.pop("DELEGA_MEM_OWNER", None)
-        else:
-            os.environ["DELEGA_MEM_OWNER"] = prev_owner
-
-
-OWNER_OPTION_ORDERS = ("claim", "heartbeat", "release", "promote", "install-daemon")   # `--owner` is theirs
-
-
-def _take_owner(args):
-    """(args without `--owner <id>` / `--owner=<id>`, the id or None)."""
-    out, owner, i = [], None, 0
-    while i < len(args):
-        if args[i] == "--owner" and i + 1 < len(args):
-            owner, i = args[i + 1], i + 2
-        elif args[i].startswith("--owner="):
-            owner, i = args[i][8:], i + 1
-        else:
-            out.append(args[i])
-            i += 1
-    return out, owner
+    return _run(fn, args, db, as_json)
 
 
 def _run(fn, args, db, as_json):

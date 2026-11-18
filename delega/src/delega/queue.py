@@ -375,6 +375,15 @@ class MemClient:
         else:
             self._call(lambda: self._remote("release", self.role))
 
+    def log(self, task, limit):
+        """The last `limit` events of one task (a bounded query, not an export)."""
+        from . import mem
+        if self.m["local"]:
+            rc, res = self._call(lambda: self._local_rc(lambda c: mem.log_events(c, limit=limit, task=task)))
+            return res if rc == mem.EXIT_OK else []
+        rc, payload = self._call(lambda: self._remote("log", "--task", task, "--limit", str(limit)))
+        return payload.get("eventos", [])
+
     def flows(self):
         from . import mem
         if self.m["local"]:
@@ -668,13 +677,15 @@ def _decide(client, fl, t, motivo, env=None, **extra):
     _event_once(client, t, dict({"flujo": fl["id"], "motivo": motivo, "job_id": t.get("job_id")}, **extra))
 
 
+FALLOS_WINDOW = 100      # events of the task read to count the cycles without an answer
+
+
 def _fallos(client, t):
-    """Consecutive cycles without an answer of the task's launcher, counted in the database."""
-    from . import relevo
+    """Consecutive cycles without an answer of the task's launcher: the events of THAT task since the last
+    `lanzador_responde`, from a bounded query of the database (no export). Asked once per task and
+    process, then counted in memory (`client._fallos_n`)."""
     n = 0
-    for e in relevo._export(client)["eventos"]:
-        if (e.get("datos") or {}).get("tarea") != t["id"]:
-            continue
+    for e in client.log(t["id"], FALLOS_WINDOW):
         if e["que"] == FALLO_EVENT:
             n += 1
         elif e["que"] == RESPONDE_EVENT:
@@ -684,11 +695,15 @@ def _fallos(client, t):
 
 def _count_failure(client, fl, t, host, motivo, env=None):
     """One more cycle without an answer from the launcher (an event, so a restart does not lose it);
-    at LANZADOR_MAX_FALLOS ask for a decision (once)."""
+    at LANZADOR_MAX_FALLOS ask for a decision (once). No event beyond the cap."""
     from . import relevo
+    counts = client.__dict__.setdefault("_fallos_n", {})
     try:
-        relevo._event(client, FALLO_EVENT, t["id"], {"lanzador": host, "motivo": motivo})
-        n = _fallos(client, t)
+        n = counts[t["id"]] if t["id"] in counts else _fallos(client, t)
+        if n < LANZADOR_MAX_FALLOS:
+            relevo._event(client, FALLO_EVENT, t["id"], {"lanzador": host, "motivo": motivo, "flujo": fl["id"]})
+            n += 1
+        counts[t["id"]] = n
     except Exception as e:
         print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
         return
@@ -733,9 +748,11 @@ def _foreign_state(cfg, client, fl, env, t, host):
         _count_failure(client, fl, t, host, "lanzador_caido", env=env)
         return None
     try:
-        if _fallos(client, t):
+        counts = client.__dict__.get("_fallos_n", {})
+        if counts.get(t["id"]):            # known failures of this process: the launcher is back, count again
             from . import relevo
-            relevo._event(client, RESPONDE_EVENT, t["id"], {"lanzador": host})
+            relevo._event(client, RESPONDE_EVENT, t["id"], {"lanzador": host, "flujo": fl["id"]})
+            counts.pop(t["id"], None)
     except Exception as e:
         print(i18n.t("tick.bad_item", id=t["id"], err=e), file=sys.stderr)
     state, jid = ans["estado"], ans.get("job_id") or t.get("job_id")

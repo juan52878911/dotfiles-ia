@@ -34,7 +34,7 @@ LOG_TAIL = 6000
 FORBIDDEN_TOOLS = ("Bash(git *)", "Bash(gh *)", "Edit", "Write")
 # what guarantees that the escalated Claude never pushes or merges (see `claude_argv`):
 # the closed allow list below; the deny list only adds a second lock.
-ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Bash(delega mem *)")
+ALLOWED_TOOLS = ("Read", "Grep", "Glob", "Bash(delega relevo-mem *)")
 STRIPPED_ENV = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK")
 # profile keys that make sense on a node (paths and secrets of the Mac are left out)
 PROFILE_KEYS = ("owner", "org", "model", "launcher", "nodes", "identity", "git", "policy", "roles", "repo_match")
@@ -279,21 +279,11 @@ def candidates(exp):
 
 
 def mem_access(cfg, org, owner):
-    """How the escalated Claude (it runs on THIS host) reaches the org's database: {cmd, tool, owner}.
-    `cmd` is the exact command prefix of the brief, `tool` the only `Bash(...)` the Claude may run.
-    A local base: `delega mem … --db <path> --org <org>`; a remote one: `ssh <host> .local/bin/delega mem …` with
-    the same options (`--owner` carries the identity the writes need to pass the fence)."""
-    import shlex
-    from . import mem
-    m = cfg.memoria_for(org)
-    opts = f"--db {shlex.quote(m['path'] or mem.db_path(None, org=org))} --org {shlex.quote(org)} --owner {shlex.quote(owner)}"
-    if m["local"]:
-        return {"cmd": "delega mem", "opts": opts, "tool": "Bash(delega mem *)", "owner": owner, "host": ""}
-    # `.local/bin/delega`, relative to the remote HOME (where ssh starts): a non-interactive ssh does not
-    # read the profile, so `delega` alone is not on its PATH; the wrapper `install_on_node` leaves is there
-    host = m["host"]
-    return {"cmd": f"ssh {host} .local/bin/delega mem", "opts": opts,
-            "tool": f"Bash(ssh {host} .local/bin/delega mem *)", "owner": owner, "host": host}
+    """How the escalated Claude reaches the org's database: {cmd, tool, owner, org}. It gets NO ssh: only
+    `delega relevo-mem <order>` (`relevo_mem`), which runs here, fixes `--db/--org/--owner` itself and
+    talks to the base through `MemClient`. `owner` is the daemon's (the one holding the lease)."""
+    cfg.memoria_for(org)            # an org without a base is an error here, not later
+    return {"cmd": "delega relevo-mem", "opts": "", "tool": "Bash(delega relevo-mem *)", "owner": owner, "org": org}
 
 
 def brief_for(task, why, flow_export, access=None, registro=""):
@@ -333,14 +323,14 @@ def _allowed(tool):
 def claude_argv(brief, org=None, tool=None):
     """argv of the escalated Claude. What guarantees what:
 
-    * `--permission-mode default` + the CLOSED `--allowedTools` list (read tools + `Bash(delega mem *)`):
+    * `--permission-mode default` + the CLOSED `--allowedTools` list (read tools + `Bash(delega relevo-mem *)`):
       in `-p` nobody can answer a permission prompt, so any tool outside the list is refused. THIS is
       what stops a push or a merge (a deny list alone is bypassed by `git -C x push`, `cd r && git push`,
       `git update-ref`, `gh api …/merges`).
     * `--disallowedTools` (`git`, `gh`, `Edit`, `Write`): a second lock that wins over the allow list.
     * `claude_env()`: only removes the GitHub tokens / ssh agent; it is not the guarantee (a Mac user
       may have other credentials).
-    Plan mode is NOT used: it could not be shown that it lets `Bash(delega mem *)` run, and without
+    Plan mode is NOT used: it could not be shown that it lets `Bash(delega relevo-mem *)` run, and without
     that command the Claude cannot write its decision. (Not verified live: the node has no login.)"""
     base = ["ws", "exec", "claude"] if _ws_in_org(org) else ["claude"]
     return base + ["-p", brief, "--model", MODEL, "--max-budget-usd", str(CAP_USD),
@@ -348,11 +338,14 @@ def claude_argv(brief, org=None, tool=None):
                    "--allowedTools", *_allowed(tool), "--disallowedTools", *FORBIDDEN_TOOLS]
 
 
-def claude_env(owner=None):
-    """The environment of the escalated Claude: no way to push or open a PR; its own mem identity."""
-    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV}
+def claude_env(owner=None, org=None):
+    """The environment of the escalated Claude: no way to push or open a PR. It carries the daemon's
+    owner (the lease holder) and the org for `relevo-mem`, which is who writes in its name."""
+    env = {k: v for k, v in os.environ.items() if k not in STRIPPED_ENV and k != "DELEGA_MEM_OWNER"}
     if owner:
-        env["DELEGA_MEM_OWNER"] = owner
+        env["DELEGA_RELEVO_OWNER"] = owner
+    if org:
+        env["DELEGA_RELEVO_ORG"] = org
     return env
 
 
@@ -388,7 +381,7 @@ def spawn(cfg, task_id, brief, org=None, profile=None, access=None):
                     {"OWNER": "relevo", "PROFILE": prof or "", "PROJECT": "", "TASK": task_id, "CAP_USD": CAP_USD})
     with open(log, "ab") as out, open(os.path.join(run_dir, "result.json"), "wb") as res:
         subprocess.Popen(claude_argv(brief, org, (access or {}).get("tool")), stdout=res, stderr=out,
-                         stdin=subprocess.DEVNULL, env=claude_env((access or {}).get("owner")), start_new_session=True)
+                         stdin=subprocess.DEVNULL, env=claude_env((access or {}).get("owner"), org), start_new_session=True)
     audit.record(cfg, "escalate", task=task_id, org=org, profile=prof, cap_usd=CAP_USD, dir=run_dir, log=log)
     return log
 
@@ -416,7 +409,7 @@ def escalate(cfg, client, limit=None):
         tried += 1
         try:
             prof = escalation_profile(cfg, client.org, task, ((fx.get("flujo") or {}).get("repo")))
-            access = mem_access(cfg, client.org, client.owner + "-claude")
+            access = mem_access(cfg, client.org, client.owner)
             log = spawn(cfg, tid, brief_for(task, why, fx, access, registro_of(exp, tid)), client.org, prof, access)
         except Exception as e:
             print(i18n.t("relevo.error", err=e), file=sys.stderr)
