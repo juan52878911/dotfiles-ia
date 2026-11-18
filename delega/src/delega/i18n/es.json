@@ -385,5 +385,14 @@
  "jobs.gc.why.unknown": "trabajo desconocido aquí",
  "jobs.gc.why.frozen": "congelada",
  "jobs.gc.why.stale": "lease caducado",
- "jobs.gc.why.no_lease": "sin lease"
+ "jobs.gc.why.no_lease": "sin lease",
+ "tick.not_owner": "no soy dueño de la lease {role}: no hago nada",
+ "tick.migrated": "elemento {id} de la cola migrado a la base como {task}",
+ "tick.migrate_skip": "elemento {id} de la cola sin migrar: {err}",
+ "tick.no_checkout": "la tarea {id} espera: no hay copia local de {repo} (define repos en [memoria.<org>])",
+ "tick.daemon_start": "daemon: org {org}, dueño {owner}, cada {interval} s",
+ "tick.daemon_error": "falló el ciclo del daemon: {err}",
+ "tick.install_usage": "uso: delega mem install-daemon [--org <org>] [--owner <nombre>] [--interval <s>] [--lease-ttl <s>] [--out <dir>] [--yes]",
+ "tick.install_dry": "no se instaló nada (añade --yes para escribir los ficheros; actívalos con systemctl --user enable --now delega-tick o launchctl load)",
+ "tick.install_done": "ficheros escritos; actívalos con systemctl --user enable --now delega-tick o launchctl load"
 }
