@@ -478,9 +478,9 @@
  "sync.branch_no_checkout": "{repo}: no checkout on this machine, branch not pushed",
  "sync.branch_dry": "  would push {branch} -> {repo}.git",
  "sync.branch_pushed": "{node}: {branch} -> {repo}.git pushed",
+ "sync.branch_ahead": "{node}: {branch} of {repo}.git is ahead at the node (not fast-forward): NOT overwritten, continuing",
  "sync.branch_failed": "{node}: {branch} -> {repo}.git FAILED: {err}",
  "relevo.push_failed": "could not push {ref} to the node's bare repo: {err}",
- "jobstate.not_found": "task {id}: job {job} not found on this host",
  "n2.no_alias": "task {id} was launched by '{host}', which is not a host reachable by ssh: not asking it ({n}/{max})",
  "wave.integrate_push_failed": "task {id}: merged into {into}, but it could not be pushed to the node's bare repo: {err}",
  "sync.fetch_failed": "branch {branch} of {repo}: `git fetch origin` failed, not pushing it to {node}: {err}"

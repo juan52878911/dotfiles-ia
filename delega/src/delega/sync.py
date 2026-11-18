@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import re
 import sys
 import tarfile
 import tempfile
@@ -172,8 +173,10 @@ def push_branch(node, repo, branch, checkout):
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "").strip()
     r = sp.run(["git", "-C", checkout, "push", "-q", f"{remote.alias(node)}:{remote.bare_rel(node, repo)}",
-                f"+{ref}:refs/heads/{branch}"], capture_output=True, text=True, env=remote._git_env())
+                f"{ref}:refs/heads/{branch}"], capture_output=True, text=True, env=remote._git_env())
     if r.returncode != 0:
+        if re.search(r"non-fast-forward|fetch first|\[rejected\]", (r.stderr or "") + (r.stdout or "")):
+            return True, i18n.t("sync.branch_ahead", node=node.get("name", ""), branch=branch, repo=repo)
         return False, (r.stderr or r.stdout or "").strip()
     r = remote.ssh(node, f"git -C {bare} rev-parse -q --verify HEAD >/dev/null 2>&1 || "
                          f"git -C {bare} symbolic-ref HEAD {q('refs/heads/' + branch)}")
@@ -262,6 +265,9 @@ def main(argv):
                         pok, perr = push_branch(node, repo, br, co)
                     except (OSError, subprocess.SubprocessError) as e:
                         pok, perr = False, str(e)
+                    if pok and perr:
+                        print(perr, file=sys.stderr)
+                        continue
                     print(i18n.t("sync.branch_pushed", node=node["name"], branch=br, repo=repo) if pok
                           else i18n.t("sync.branch_failed", node=node["name"], branch=br, repo=repo, err=perr))
                     ok = ok and pok

@@ -292,7 +292,7 @@ class MemClient:
         self.org, self.owner, self.m = org, owner, cfg.memoria_for(org)
         # `host`: the name other hosts reach this one by over ssh (what `lanzador` records). Not the
         # owner of the lease: that one is only an identity. A node's is its relevo node name; the Mac has none.
-        self.host = host or relevo.node_name(cfg)
+        self.host = host or relevo.node_name(cfg) or _local_id()
         self.role = ROLE_PREFIX + org
 
     # local ----------------------------------------------------------------------------------
@@ -582,6 +582,12 @@ LANZADOR_MAX_FALLOS = 10     # consecutive cycles without an answer from the lau
 _LANZADOR_FALLOS = {}        # (org, task) -> consecutive cycles without an answer
 
 
+def _local_id():
+    """What the Mac (no `[relevo] node`) records as `lanzador`: an explicit id that is not a node."""
+    import socket
+    return socket.gethostname() or "local"
+
+
 def _ask_lanzador(host, t):
     """The state of a task's job as the host that launched it sees it: the dict of
     `delega job-state --json`, or None when it did not answer (ssh rc 255, timeout, garbage)."""
@@ -662,7 +668,7 @@ def task_state(cfg, client, fl, env, t):
       a decision `job_sin_directorio` (once), never a failure of the job.
     The state of the job of ANOTHER host is never judged from this host's disk."""
     host = (t.get("lanzador") or "").strip()
-    if env._job_dir(t) is None and host and host != client.host:
+    if env._job_dir(t) is None and host != client.host:
         return _foreign_state(cfg, client, fl, env, t, host)
     res = env.job_state(t)
     if res[0] == wave_not_found():
@@ -673,10 +679,15 @@ def task_state(cfg, client, fl, env, t):
 
 def _foreign_state(cfg, client, fl, env, t, host):
     key = (client.org, t["id"])
-    if not _is_alias(host):
-        _count_failure(client, fl, t, host, "lanzador_sin_alias")
+    nodes = getattr(cfg, "nodes", None) or {}
+    if host in nodes:
+        alias = (cfg.node(host).get("ssh") or host)
+    elif not nodes and _is_alias(host):
+        alias = host
+    else:                                  # a Mac (or an old/empty `lanzador`): nobody to ask
+        _decide(client, fl, t, "lanzador_sin_ssh", lanzador=host)
         return None
-    ans = _ask_lanzador(host, dict(t, flujo=fl["id"]))
+    ans = _ask_lanzador(alias, dict(t, flujo=fl["id"]))
     if ans is None:
         _count_failure(client, fl, t, host, "lanzador_caido")
         return None

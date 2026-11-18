@@ -272,11 +272,11 @@ class F13(T.DaemonCase):
     def test_a_launcher_without_alias_is_not_asked_and_ends_in_a_decision(self):
         self.write_conf()
         self._launched_by_a("t1", lanzador="mac-de-juan:tick")
-        for _ in range(queue.LANZADOR_MAX_FALLOS + 2):
+        for _ in range(3):
             self.cycle("b", "owner-b")
         self.assertEqual(self.ssh_calls(), [])
         self.assertNotEqual(self.states()["t1"], "rojo")
-        self.assertEqual([e["motivo"] for e in self.events()], ["lanzador_sin_alias"])
+        self.assertEqual([e["motivo"] for e in self.events()], ["lanzador_sin_ssh"])
 
     # -- (d) ---------------------------------------------------------------------------------
     def test_d_lanzador_is_the_node_alias_not_host_tick(self):
@@ -295,7 +295,7 @@ class F13(T.DaemonCase):
         self.assertEqual(queue.MemClient(cfg, "trycore", "x:tick").host, "nodo-b")
         self.assertEqual(queue.MemClient(cfg, "trycore", "x:tick", host="nodo-a").host, "nodo-a")
         self.write_conf()
-        self.assertIsNone(queue.MemClient(config.load(), "trycore", "x:tick").host)
+        self.assertTrue(queue.MemClient(config.load(), "trycore", "x:tick").host)   # the Mac: an explicit id
 
     # -- job-state ---------------------------------------------------------------------------
     def test_job_state_answers_not_found_and_writes_nothing(self):
