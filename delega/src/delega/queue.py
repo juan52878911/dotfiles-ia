@@ -2,9 +2,13 @@
 
 queue.jsonl lives in the state dir; every read-modify-write holds an flock on queue.jsonl.lock.
 `tick` = reconcile jobs, then start queued items (highest priority first, oldest first) while the
-profile's quota, the day's budget and the nodes' capacity allow."""
+profile's quota, the day's budget and the nodes' capacity allow.
+`tick --daemon` drives the memory database instead: it takes the org's lease and then takes every
+ready task with a compare-and-set (`set --desde pendiente`) before launching it, so two daemons
+never launch the same task."""
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -188,9 +192,12 @@ def _reconcile(cfg, adopt):
                 print(i18n.t("tick.adopt_failed", job=os.path.basename(job_dir), err=e), file=sys.stderr)
 
 
-def launch_round(cfg, items, on_result, keep_going=None):
+def launch_round(cfg, items, on_result, keep_going=None, reserve=None, unreserve=None):
     """Start the (ordered) items while the profiles' quota, budget and nodes have room.
-    on_result(item, state, detail) is called for every launch tried; returns how many started."""
+    reserve(item) is called right before the launch: when it returns False the item is skipped
+    (another daemon took it first). unreserve(item) is called when the launch did not happen after
+    all (the node turned out to be full). on_result(item, state, detail) is called for every
+    launch tried; returns how many started."""
     started, today, cache, blocked = 0, time.strftime("%Y%m%d"), {}, set()
     for it in items:
         if keep_going is not None and not keep_going():
@@ -205,9 +212,16 @@ def launch_round(cfg, items, on_result, keep_going=None):
             blocked.add(name)
             print(i18n.t("tick.wait", id=it["id"], profile=name, why=why))
             continue
-        state, detail = launch(cfg, it)
+        if reserve is not None and not reserve(it):
+            continue                     # another daemon took the task first: it is not ours to launch
+        try:
+            state, detail = launch(cfg, it)
+        except OSError as e:
+            state, detail = "failed", str(e)   # the worker never started: the task stays ours
         if state == "full":               # room() said yes but the node had none: keep it queued
             blocked.add(name)
+            if unreserve is not None:
+                unreserve(it)
             print(i18n.t("tick.wait", id=it["id"], profile=name, why="node full"))
             continue
         on_result(it, state, detail)
@@ -246,11 +260,29 @@ def main_tick(argv):
 ROLE_PREFIX = "orquestador:"
 LEASE_TTL_S = 90.0
 INTERVAL_S = 30.0
+BUSY_RETRIES = 3          # a locked database is a lock, not a failure: it is retried
+BUSY_WAIT_S = 0.2
+
+
+def mem_reason(rc, payload, task=""):
+    """The reason of a failed `mem` call, in the words of mem itself."""
+    from . import mem
+    if payload.get("error"):
+        return payload["error"]
+    if rc == mem.EXIT_BUSY:
+        return i18n.t("mem.db_busy", err="locked")
+    if rc == mem.EXIT_LEASE:
+        return i18n.t("mem.state_conflict", task=task, expected="pendiente", current="?")
+    return f"rc={rc}"
 
 
 class MemClient:
     """The org's memory database: opened directly when [memoria.<org>] is this machine, through
-    `ssh host delega mem … --json` when it is not. Every call is one short transaction."""
+    `ssh host delega mem … --json` when it is not. Every call is one short transaction.
+
+    Every call carries the org and the owner (`mem` refuses a write without them) and the
+    compare-and-set of `set`: a task is only launched by the daemon that moved it out of
+    `pendiente`. A busy database (rc 10) is retried a few times before giving up."""
 
     def __init__(self, cfg, org, owner):
         self.org, self.owner, self.m = org, owner, cfg.memoria_for(org)
@@ -259,7 +291,7 @@ class MemClient:
     # local ----------------------------------------------------------------------------------
     def _conn(self):
         from . import mem
-        return mem.connect(mem.db_path(self.m["path"] or None))
+        return mem.connect(mem.db_path(self.m["path"] or None, org=self.org))
 
     def _local(self, fn):
         conn = self._conn()
@@ -268,11 +300,21 @@ class MemClient:
         finally:
             conn.close()
 
+    def _local_rc(self, fn):
+        """(rc, value) of a local call: a locked database is rc 10 (the caller retries it)."""
+        from . import mem
+        try:
+            return mem.EXIT_OK, self._local(fn)
+        except sqlite3.OperationalError as e:
+            if mem._db_is_busy(e):
+                return mem.EXIT_BUSY, {}
+            raise
+
     # remote ---------------------------------------------------------------------------------
     def _ssh(self, *args):
         """(rc, payload) of `delega mem <args> --json` on the host; rc 255 = ssh itself failed."""
         import shlex
-        cmd = f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} delega mem " + " ".join(shlex.quote(a) for a in args)
+        cmd = (f"DELEGA_MEM_OWNER={shlex.quote(self.owner)} DELEGA_MEM_ORG={shlex.quote(self.org)} delega mem ") + " ".join(shlex.quote(a) for a in args)
         if self.m["path"]:
             cmd += f" --db {shlex.quote(self.m['path'])}"
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", self.m["host"], cmd + " --json"],
@@ -287,10 +329,23 @@ class MemClient:
         return r.returncode, payload
 
     def _remote(self, *args):
+        """(rc, payload) of a remote call: rc 9 (conflict) and rc 10 (busy) are answers, not errors."""
         from . import mem
         rc, payload = self._ssh(*args)
-        if rc not in (0, mem.EXIT_LEASE):
+        if rc not in (mem.EXIT_OK, mem.EXIT_LEASE, mem.EXIT_BUSY):
             raise mem.MemError(payload.get("error") or f"ssh {self.m['host']} delega mem {args[0]}: rc={rc}")
+        return rc, payload
+
+    def _call(self, op):
+        """(rc, payload) of op(): a busy database (rc 10) is retried a few times."""
+        from . import mem
+        rc, payload = mem.EXIT_BUSY, {}
+        for attempt in range(BUSY_RETRIES):
+            rc, payload = op()
+            if rc != mem.EXIT_BUSY:
+                return rc, payload
+            if attempt < BUSY_RETRIES - 1:
+                time.sleep(BUSY_WAIT_S * (attempt + 1))
         return rc, payload
 
     # operations -----------------------------------------------------------------------------
@@ -298,49 +353,79 @@ class MemClient:
         """True when this owner holds the lease after the call (taken or renewed)."""
         from . import mem
         if self.m["local"]:
-            return self._local(lambda c: mem.claim_lease(c, self.role, ttl, owner=self.owner))["estado"] != "ocupada"
-        return self._remote("claim", self.role, "--ttl", str(ttl))[0] == mem.EXIT_OK
+            rc, res = self._call(lambda: self._local_rc(
+                lambda c: mem.claim_lease(c, self.role, ttl, owner=self.owner, org=self.org)))
+            return rc == mem.EXIT_OK and res.get("estado") != "ocupada"
+        rc, _ = self._call(lambda: self._remote("claim", self.role, "--ttl", str(ttl)))
+        return rc == mem.EXIT_OK
 
     def release(self):
         from . import mem
         if self.m["local"]:
-            self._local(lambda c: mem.release_lease(c, self.role, owner=self.owner))
+            self._call(lambda: self._local_rc(
+                lambda c: mem.release_lease(c, self.role, owner=self.owner, org=self.org)))
         else:
-            self._remote("release", self.role)
+            self._call(lambda: self._remote("release", self.role))
 
     def flows(self):
         from . import mem
         if self.m["local"]:
-            return self._local(mem.list_flows)
-        return self._remote("flows")[1].get("flujos", [])
+            rc, res = self._call(lambda: self._local_rc(mem.list_flows))
+            return res if rc == mem.EXIT_OK else []
+        rc, payload = self._call(lambda: self._remote("flows"))
+        return payload.get("flujos", [])
 
     def ready(self, flow):
         from . import mem
         if self.m["local"]:
-            return self._local(lambda c: mem.next_tasks(c, flow))[0]
-        return self._remote("next", flow)[1].get("tareas", [])
+            rc, res = self._call(lambda: self._local_rc(lambda c: mem.next_tasks(c, flow)))
+            return res[0] if rc == mem.EXIT_OK else []
+        rc, payload = self._call(lambda: self._remote("next", flow))
+        return payload.get("tareas", [])
 
-    def set(self, task, estado, error=None):
+    def set(self, task, estado, error=None, desde=None, force=False):
+        """(rc, payload) of `set`: rc 9 when the compare-and-set found another state (somebody
+        else moved the task first), rc 10 when the database stayed locked."""
         from . import mem
         if self.m["local"]:
-            return self._local(lambda c: mem.set_task(c, task, estado, error=error))
+            def op():
+                try:
+                    payload = self._local(lambda c: mem.set_task(c, task, estado, error=error,
+                                                                desde=desde, force=force, org=self.org))
+                except mem.MemConflict as e:
+                    return mem.EXIT_LEASE, {"error": str(e)}
+                except sqlite3.OperationalError as e:
+                    if mem._db_is_busy(e):
+                        return mem.EXIT_BUSY, {}
+                    raise
+                return mem.EXIT_OK, payload
+            return self._call(op)
         extra = ["--error", error] if error else []
-        return self._remote("set", task, "--estado", estado, *extra)[1]
+        if desde:
+            extra += ["--desde", desde]
+        if force:
+            extra += ["--forzar"]
+        return self._call(lambda: self._remote("set", task, "--estado", estado, *extra))
 
     def add_flow(self, repo, flow_id, branch=None):
         from . import mem
         if self.m["local"]:
-            return self._local(lambda c: mem.add_flow(c, repo, branch=branch, flow_id=flow_id, org=self.org))
+            rc, res = self._call(lambda: self._local_rc(
+                lambda c: mem.add_flow(c, repo, branch=branch, flow_id=flow_id, org=self.org)))
+            return res
         extra = ["--branch", branch] if branch else []
-        return self._remote("add-flow", "--repo", repo, "--id", flow_id, *extra)[1]
+        rc, payload = self._call(lambda: self._remote("add-flow", "--repo", repo, "--id", flow_id, *extra))
+        return payload
 
     def add_task(self, flow, brief, task_id, run_args):
         from . import mem
         if self.m["local"]:
-            return self._local(lambda c: mem.add_task(c, flow, brief, task_id=task_id, run_args=run_args,
-                                                      org=self.org))
-        return self._remote("add-task", "--flow", flow, "--brief", brief, "--id", task_id,
-                            "--run-args", json.dumps(run_args))[1]
+            rc, res = self._call(lambda: self._local_rc(
+                lambda c: mem.add_task(c, flow, brief, task_id=task_id, run_args=run_args, org=self.org)))
+            return res
+        rc, payload = self._call(lambda: self._remote("add-task", "--flow", flow, "--brief", brief,
+                                                       "--id", task_id, "--run-args", json.dumps(run_args)))
+        return payload
 
 
 def args_to_dict(args):
@@ -413,6 +498,7 @@ def migrate_legacy(cfg, client):
 
 def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
     """One pass: take or renew the lease; without it do nothing. Returns True when it acted."""
+    from . import mem
     if not client.claim(ttl):
         print(i18n.t("tick.not_owner", role=client.role))
         return False
@@ -436,11 +522,26 @@ def daemon_cycle(cfg, client, ttl=LEASE_TTL_S, adopt=False):
             items.append(it)
             tasks[t["id"]] = it
 
-    def mark(it, state, detail):
-        client.set(it["id"], "lanzada" if state == "launched" else "rojo",
-                   error=None if state == "launched" else detail)
+    def reserve(it):
+        """Take the task with a compare-and-set (`set --desde pendiente`): the daemon that moves
+        it out of `pendiente` is the one that launches it; the others get rc 9 and skip it."""
+        rc, payload = client.set(it["id"], "lanzada", desde="pendiente")
+        if rc == mem.EXIT_OK:
+            return True
+        print(i18n.t("tick.bad_item", id=it["id"], err=mem_reason(rc, payload, it["id"])), file=sys.stderr)
+        return False
 
-    started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl))
+    def unreserve(it):
+        """The node turned out to be full after all: the task was not launched, it goes back to
+        `pendiente` (only while it is still the one we took)."""
+        client.set(it["id"], "pendiente", desde="lanzada", force=True)
+
+    def mark(it, state, detail):
+        if state != "launched":               # 'lanzada' -> 'rojo': the worker never started
+            client.set(it["id"], "rojo", error=detail)
+
+    started = launch_round(cfg, items, mark, keep_going=lambda: client.claim(ttl),
+                           reserve=reserve, unreserve=unreserve)
     print(i18n.t("tick.summary", n=started, left=len(items) - started))
     return True
 

@@ -19,29 +19,34 @@ open a database that lives in one (mount point of type nfs, cifs, sshfs…).
 The interface (stable: the daemon with leases and the handover are built on top of it)
 --------------------------------------------------------------------------------------------------
     delega mem init       --org <org> [--db <ruta>]
-    delega mem add-flow   --repo <remoto git> [--branch <rama destino>] [--plan <texto>] [--id <id>]
-    delega mem add-task   --flow <flujo> --brief <texto> [--wave <n>] [--zone <zona>]
+    delega mem add-flow   --org <org> --repo <remoto git> [--branch <rama destino>] [--plan <texto>] [--id <id>]
+    delega mem add-task   --org <org> --flow <flujo> --brief <texto> [--wave <n>] [--zone <zona>]
                            [--deps <a,b>] [--run-args <json>] [--id <id>]
     delega mem next       <flujo>
-    delega mem set        <tarea> --estado <estado> [--job-id <id>] [--nodo <n>] [--rama <r>] [--intentos <n>]
-    delega mem claim      <rol> --ttl <segundos>
-    delega mem heartbeat  <rol> [--ttl <segundos>]
-    delega mem release    <rol>
+    delega mem set        <tarea> --estado <estado> --org <org> [--desde <estado>] [--forzar]
+                           [--job-id <id>] [--nodo <n>] [--rama <r>] [--intentos <n>]
+    delega mem claim      <rol> --owner <id> --org <org> --ttl <segundos>
+    delega mem heartbeat  <rol> --owner <id> --org <org> [--ttl <segundos>]
+    delega mem release    <rol> --owner <id> --org <org>
     delega mem log        [--limit <n>] [--flow <flujo>]
     delega mem export     [--out <fichero>]
 
 Common options (accepted before or after the order): `--db <ruta>` (default `$DELEGA_MEM_DB`
-or `~/.local/state/delega/memoria.db`) and `--json` (exactly one JSON object on stdout).
-The brief of a task is stored as text, never as a path of the machine that wrote it, and the
-repo of a flow is a git remote (`git@host:owner/repo`, `https://host/owner/repo` or
-`owner/name`): a local path is refused (rc 2), because the worker will clone it on the node.
+or `~/.local/state/delega/memoria-<org>.db`) and `--json` (exactly one JSON object on stdout).
+Every order that writes requires `--org <org>` or `$DELEGA_MEM_ORG`; lease orders also require
+`--owner <id>` or `$DELEGA_MEM_OWNER`. The owner must stay stable across the separate SSH
+processes that claim, renew and release one lease. The brief of a task is stored as text,
+never as a path of the machine that wrote it, and the repo of a flow is a git remote
+(`git@host:owner/repo`, `https://host/owner/repo` or `owner/name`): a local path is refused
+(rc 2), because the worker will clone it on the node.
 
 Exit codes
 ----------
     0  done
     2  usage or validation error (unknown order, unknown flow or task, a local path instead
-       of a git remote, an org that is not the one of the database, an unknown state)
-    9  the lease is held by someone else and has not expired yet
+       of a git remote, a missing or mismatched org, an unknown or invalid task transition)
+    9  the lease is held by someone else, or a compare-and-set found a different task state
+   10  the database is busy or locked; the caller should retry
 
 Concurrency
 -----------
@@ -57,10 +62,11 @@ Schema (`PRAGMA user_version`; the migration is idempotent, so `init` can be rep
     tareas   id, flujo, ola, brief, zona, deps, run_args, estado, intentos, job_id, nodo,
              rama, creado, actualizado             estado ∈ pendiente|lanzada|ok|rojo|arreglo|
              bloqueada|hecha; deps and run_args are JSON
-    leases   rol, dueno (host:pid), vence_en, latido
+    leases   rol, dueno (stable owner id), vence_en, latido
     eventos  id, ts, quien, que, datos (JSON)      only INSERT (triggers)
 """
 import json
+import math
 import os
 import re
 import socket
@@ -72,12 +78,23 @@ import time
 from . import i18n
 
 SCHEMA_VERSION = 1
-DEFAULT_DB = "~/.local/state/delega/memoria.db"
+DEFAULT_DB_DIR = "~/.local/state/delega"
+DEFAULT_DB_TEMPLATE = DEFAULT_DB_DIR + "/memoria-{org}.db"
 BUSY_TIMEOUT_MS = 5000
 DEFAULT_TTL_S = 30.0
+MAX_TTL_S = 3600.0
 STATES = ("pendiente", "lanzada", "ok", "rojo", "arreglo", "bloqueada", "hecha")
 DONE = "hecha"
-EXIT_OK, EXIT_USAGE, EXIT_LEASE = 0, 2, 9
+TRANSITIONS = {
+    "pendiente": frozenset(("lanzada", "bloqueada")),
+    "lanzada": frozenset(("ok", "rojo", "bloqueada")),
+    "ok": frozenset(("hecha",)),
+    "rojo": frozenset(("arreglo", "bloqueada")),
+    "arreglo": frozenset(("lanzada", "bloqueada")),
+    "bloqueada": frozenset(("pendiente",)),
+    "hecha": frozenset(),
+}
+EXIT_OK, EXIT_USAGE, EXIT_LEASE, EXIT_BUSY = 0, 2, 9, 10
 NET_FS = ("nfs", "nfs4", "cifs", "smbfs", "smb3", "sshfs", "webdav", "davfs", "afpfs", "9p",
           "ftpfs", "glusterfs", "ceph", "fuse.sshfs")
 
@@ -139,13 +156,20 @@ class MemError(Exception):
     """A refused order (the message is already translated)."""
 
 
+class MemConflict(MemError):
+    """A compare-and-set or lease conflict; the caller may retry with fresh state."""
+
+
 # ── helpers ─────────────────────────────────────────────────────────────────
-def db_path(path=None):
-    """Where the memory database lives: --db, then $DELEGA_MEM_DB, then the default."""
-    for cand in (path, os.environ.get("DELEGA_MEM_DB"), DEFAULT_DB):
+def db_path(path=None, org=None):
+    """Where the memory database lives: --db, then $DELEGA_MEM_DB, then the org's default."""
+    for cand in (path, os.environ.get("DELEGA_MEM_DB")):
         if cand:
             return os.path.abspath(os.path.expanduser(os.path.expandvars(cand)))
-    return os.path.abspath(os.path.expanduser(DEFAULT_DB))
+    org = (org or os.environ.get("DELEGA_MEM_ORG") or "").strip()
+    if not org:
+        raise MemError(i18n.t("mem.org_required"))
+    return os.path.abspath(os.path.expanduser(DEFAULT_DB_TEMPLATE.format(org=org)))
 
 
 def owner_id():
@@ -182,6 +206,11 @@ def is_remote(repo):
         return False
     if repo.startswith(("/", "~", ".")) or os.path.isabs(repo) or re.match(r"^[A-Za-z]:[\\/]", repo):
         return False
+    try:
+        if os.path.exists(repo) or os.path.exists(os.path.expanduser(repo)):
+            return False
+    except OSError:
+        pass
     if SCP_RE.match(repo) or URL_RE.match(repo):
         return True
     if SHORT_RE.match(repo):
@@ -346,19 +375,20 @@ def add_flow(conn, repo, branch=None, plan=None, flow_id=None, org=None):
     """Add a flow: a plan over a git remote. The org of the database is the org of the flow."""
     if not is_remote(repo):
         raise MemError(i18n.t("mem.repo_local", repo=repo))
-    base = _check_org(conn, org)
     now = time.time()
     fid = flow_id or _new_id("f")
 
     def op(c):
+        base = _check_org(c, org)
         if c.execute("SELECT 1 FROM flujos WHERE id = ?", (fid,)).fetchone():
             raise MemError(i18n.t("mem.flow_exists", id=fid))
         c.execute("INSERT INTO flujos (id, org, repo, rama_destino, estado, plan, creado, actualizado)"
                   " VALUES (?,?,?,?,?,?,?,?)",
                   (fid, base, repo, branch, "activo", plan, now, now))
         _event(c, "flow.add", {"flujo": fid, "org": base, "repo": repo, "rama_destino": branch})
+        return base
 
-    write(conn, op)
+    base = write(conn, op)
     return {"id": fid, "org": base, "repo": repo, "rama_destino": branch, "estado": "activo", "plan": plan}
 
 
@@ -426,42 +456,69 @@ def next_tasks(conn, flow):
     return ready, blocked
 
 
-def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=None, error=None):
-    """Move a task to another state (and note where it runs). Going to `lanzada` counts an attempt."""
+def set_task(conn, task, estado, job_id=None, nodo=None, rama=None, intentos=None, error=None,
+             desde=None, force=False, org=None):
+    """Move a task to another state (and note where it runs).
+
+    The current row is read inside the write transaction. `desde` is an optional
+    compare-and-set: when it does not match the current state the order conflicts (rc 9).
+    Invalid transitions are refused; `force=True` bypasses that check (including moving a
+    completed task backwards). Going to `lanzada` counts one attempt in the same transaction.
+    """
     if estado not in STATES:
         raise MemError(i18n.t("mem.bad_state", estado=estado, states=", ".join(STATES)))
-    row = conn.execute("SELECT * FROM tareas WHERE id = ?", (task,)).fetchone()
-    if row is None:
-        raise MemError(i18n.t("mem.unknown_task", task=task))
-    now = time.time()
-    if intentos is None:
-        intentos = row["intentos"] + 1 if estado == "lanzada" else row["intentos"]
-    job_id = job_id if job_id is not None else row["job_id"]
-    nodo = nodo if nodo is not None else row["nodo"]
-    rama = rama if rama is not None else row["rama"]
+    if desde is not None and desde not in STATES:
+        raise MemError(i18n.t("mem.bad_state", estado=desde, states=", ".join(STATES)))
 
     def op(c):
+        _check_org(c, org)
+        row = c.execute("SELECT * FROM tareas WHERE id = ?", (task,)).fetchone()
+        if row is None:
+            raise MemError(i18n.t("mem.unknown_task", task=task))
+        current = row["estado"]
+        if desde is not None and current != desde:
+            raise MemConflict(i18n.t("mem.state_conflict", expected=desde, current=current, task=task))
+        if not force and current != estado and estado not in TRANSITIONS.get(current, frozenset()):
+            raise MemError(i18n.t("mem.bad_transition", current=current, target=estado))
+        new_attempts = row["intentos"] + (1 if estado == "lanzada" and current != estado else 0)
+        if intentos is not None:
+            new_attempts = int(intentos)
+        new_job_id = job_id if job_id is not None else row["job_id"]
+        new_nodo = nodo if nodo is not None else row["nodo"]
+        new_rama = rama if rama is not None else row["rama"]
+        now = time.time()
         c.execute("UPDATE tareas SET estado = ?, intentos = ?, job_id = ?, nodo = ?, rama = ?,"
                   " actualizado = ? WHERE id = ?",
-                  (estado, int(intentos), job_id, nodo, rama, now, task))
+                  (estado, int(new_attempts), new_job_id, new_nodo, new_rama, now, task))
         _event(c, "task.set", {"tarea": task, "flujo": row["flujo"], "estado": estado,
-                               "intentos": int(intentos), "job_id": job_id, "nodo": nodo,
-                               "rama": rama, "error": error})
+                               "estado_anterior": current, "intentos": int(new_attempts),
+                               "job_id": new_job_id, "nodo": new_nodo,
+                               "rama": new_rama, "error": error})
+        return {"id": task, "flujo": row["flujo"], "estado": estado, "intentos": int(new_attempts),
+                "job_id": new_job_id, "nodo": new_nodo, "rama": new_rama, "actualizado": now}
 
-    write(conn, op)
-    return {"id": task, "flujo": row["flujo"], "estado": estado, "intentos": int(intentos),
-            "job_id": job_id, "nodo": nodo, "rama": rama, "actualizado": now}
+    return write(conn, op)
 
 
 # ── leases ──────────────────────────────────────────────────────────────────
-def claim_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None):
+def _validate_ttl(ttl):
+    """A lease TTL must be a finite number of seconds in the interval (0, 3600]."""
+    ttl = float(ttl)
+    if not math.isfinite(ttl) or ttl <= 0 or ttl > MAX_TTL_S:
+        raise MemError(i18n.t("mem.bad_ttl", val=ttl, max=MAX_TTL_S))
+    return ttl
+
+
+def claim_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None, org=None):
     """Take (or renew) the lease of a role. The lease of another owner that has not expired is
     never taken: the caller gets `estado = ocupada` and exit code 9."""
     owner = owner or owner_id()
+    ttl = _validate_ttl(ttl)
     now = time.time()
-    vence = now + float(ttl)
+    vence = now + ttl
 
     def op(c):
+        _check_org(c, org)
         row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
         if row is None:
             c.execute("INSERT INTO leases (rol, dueno, vence_en, latido) VALUES (?,?,?,?)",
@@ -482,23 +539,40 @@ def claim_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None):
     return write(conn, op)
 
 
-def heartbeat_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None):
+def heartbeat_lease(conn, rol, ttl=DEFAULT_TTL_S, owner=None, org=None):
     """Renew a lease. An expired lease is taken over; a live lease of another owner is not."""
     owner = owner or owner_id()
-    row = conn.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
-    if row is None:
-        raise MemError(i18n.t("mem.lease_missing", rol=rol))
-    if row["dueno"] != owner and row["vence_en"] > time.time():
+    ttl = _validate_ttl(ttl)
+    now = time.time()
+    vence = now + ttl
+
+    def op(c):
+        _check_org(c, org)
+        row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
+        if row is None:
+            raise MemError(i18n.t("mem.lease_missing", rol=rol))
+        if row["dueno"] == owner:
+            c.execute("UPDATE leases SET vence_en = ?, latido = ? WHERE rol = ?", (vence, now, rol))
+            _event(c, "lease.renew", {"rol": rol, "dueno": owner, "vence_en": vence})
+            return {"rol": rol, "dueno": owner, "estado": "renovada", "vence_en": vence}
+        if row["vence_en"] <= now:
+            c.execute("UPDATE leases SET dueno = ?, vence_en = ?, latido = ? WHERE rol = ?",
+                      (owner, vence, now, rol))
+            _event(c, "lease.take", {"rol": rol, "dueno": owner, "vence_en": vence,
+                                     "antes": row["dueno"]})
+            return {"rol": rol, "dueno": owner, "estado": "tomada", "vence_en": vence}
         return {"rol": rol, "dueno": row["dueno"], "estado": "ocupada", "vence_en": row["vence_en"]}
-    return claim_lease(conn, rol, ttl, owner=owner)
+
+    return write(conn, op)
 
 
-def release_lease(conn, rol, owner=None):
+def release_lease(conn, rol, owner=None, org=None):
     """Give a lease back. The lease of another owner that has not expired is never released."""
     owner = owner or owner_id()
     now = time.time()
 
     def op(c):
+        _check_org(c, org)
         row = c.execute("SELECT * FROM leases WHERE rol = ?", (rol,)).fetchone()
         if row is None:
             return {"rol": rol, "estado": "nada"}
@@ -591,12 +665,24 @@ def _number(val, opt, cast=float):
         raise MemError(i18n.t("mem.bad_number", opt=opt, val=val))
 
 
+def _org(vals, required=False):
+    org = (vals.get("org") or os.environ.get("DELEGA_MEM_ORG") or "").strip()
+    if required and not org:
+        raise MemError(i18n.t("mem.org_required"))
+    return org
+
+
+def _owner(vals):
+    owner = (vals.get("owner") or os.environ.get("DELEGA_MEM_OWNER") or "").strip()
+    if not owner:
+        raise MemError(i18n.t("mem.owner_required"))
+    return owner
+
+
 def cmd_init(args, db, as_json):
     _, _, vals = _parse(args, values=("org",))
-    org = vals.get("org") or os.environ.get("DELEGA_MEM_ORG")
-    if not org:
-        raise MemError(i18n.t("mem.org_required"))
-    path = db_path(db)
+    org = _org(vals, required=True)
+    path = db_path(db, org=org)
     conn = connect(path, create=True)
     try:
         created = init_db(conn, org)
@@ -610,13 +696,14 @@ def cmd_init(args, db, as_json):
 
 def cmd_add_flow(args, db, as_json):
     pos, _, vals = _parse(args, values=("repo", "branch", "rama", "plan", "id", "org"))
+    org = _org(vals, required=True)
     repo = vals.get("repo") or (pos.pop(0) if pos else None)
     if not repo:
         raise MemError(i18n.t("mem.needs_repo"))
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
         flow = add_flow(conn, repo=repo, branch=vals.get("branch") or vals.get("rama"), plan=vals.get("plan"),
-                        flow_id=vals.get("id"), org=vals.get("org"))
+                        flow_id=vals.get("id"), org=org)
     finally:
         conn.close()
     payload = {"ok": True, "cmd": "add-flow", "flujo": flow}
@@ -640,6 +727,7 @@ def cmd_add_task(args, db, as_json):
             raise MemError(i18n.t("mem.bad_file", path=vals["brief-file"], err=e))
     if not brief and pos:
         brief = pos.pop(0)
+    org = _org(vals, required=True)
     deps = []
     for chunk in ([vals["deps"]] if vals.get("deps") else []) + list(vals.get("dep") or []):
         deps += [d.strip() for d in str(chunk).split(",") if d.strip()]
@@ -650,10 +738,10 @@ def cmd_add_task(args, db, as_json):
         except ValueError as e:
             raise MemError(i18n.t("mem.bad_json", opt="--run-args", err=e))
     wave = _number(vals.get("wave") or vals.get("ola") or 1, "--wave", int)
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
         task = add_task(conn, flow=flow, brief=brief, wave=wave, zone=vals.get("zone") or vals.get("zona"),
-                        deps=deps, run_args=run_args, task_id=vals.get("id"), org=vals.get("org"))
+                        deps=deps, run_args=run_args, task_id=vals.get("id"), org=org)
     finally:
         conn.close()
     payload = {"ok": True, "cmd": "add-task", "tarea": task}
@@ -662,11 +750,12 @@ def cmd_add_task(args, db, as_json):
 
 
 def cmd_next(args, db, as_json):
-    pos, _, vals = _parse(args, values=("flow",))
+    pos, _, vals = _parse(args, values=("flow", "org"))
+    org = _org(vals)
     flow = vals.get("flow") or (pos.pop(0) if pos else None)
     if not flow:
         raise MemError(i18n.t("mem.needs_flow"))
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
         ready, blocked = next_tasks(conn, flow)
     finally:
@@ -681,8 +770,10 @@ def cmd_next(args, db, as_json):
 
 
 def cmd_set(args, db, as_json):
-    pos, _, vals = _parse(args, values=("estado", "state", "job-id", "nodo", "node", "rama", "branch",
-                                        "intentos", "error", "id"))
+    pos, flags, vals = _parse(args, flags=("forzar",),
+                               values=("estado", "state", "desde", "job-id", "nodo", "node", "rama",
+                                       "branch", "intentos", "error", "id", "org"))
+    org = _org(vals, required=True)
     task = vals.get("id") or (pos.pop(0) if pos else None)
     if not task:
         raise MemError(i18n.t("mem.needs_task"))
@@ -690,10 +781,11 @@ def cmd_set(args, db, as_json):
     if not estado:
         raise MemError(i18n.t("mem.needs_state"))
     intentos = _number(vals["intentos"], "--intentos", int) if vals.get("intentos") is not None else None
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
         res = set_task(conn, task, estado, job_id=vals.get("job-id"), nodo=vals.get("nodo") or vals.get("node"),
-                       rama=vals.get("rama") or vals.get("branch"), intentos=intentos, error=vals.get("error"))
+                       rama=vals.get("rama") or vals.get("branch"), intentos=intentos, error=vals.get("error"),
+                       desde=vals.get("desde"), force="forzar" in flags, org=org)
     finally:
         conn.close()
     payload = {"ok": True, "cmd": "set", "tarea": res}
@@ -702,14 +794,16 @@ def cmd_set(args, db, as_json):
 
 
 def cmd_claim(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner"))
+    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner", "org"))
+    org = _org(vals, required=True)
+    owner = _owner(vals)
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
     ttl = _number(vals.get("ttl", DEFAULT_TTL_S), "--ttl", float)
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
-        res = claim_lease(conn, rol, ttl, owner=vals.get("owner"))
+        res = claim_lease(conn, rol, ttl, owner=owner, org=org)
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -727,14 +821,16 @@ def cmd_claim(args, db, as_json):
 
 
 def cmd_heartbeat(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner"))
+    pos, _, vals = _parse(args, values=("rol", "role", "ttl", "owner", "org"))
+    org = _org(vals, required=True)
+    owner = _owner(vals)
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
     ttl = _number(vals.get("ttl", DEFAULT_TTL_S), "--ttl", float)
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
-        res = heartbeat_lease(conn, rol, ttl, owner=vals.get("owner"))
+        res = heartbeat_lease(conn, rol, ttl, owner=owner, org=org)
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -764,13 +860,15 @@ def cmd_flows(args, db, as_json):
 
 
 def cmd_release(args, db, as_json):
-    pos, _, vals = _parse(args, values=("rol", "role", "owner"))
+    pos, _, vals = _parse(args, values=("rol", "role", "owner", "org"))
+    org = _org(vals, required=True)
+    owner = _owner(vals)
     rol = vals.get("rol") or vals.get("role") or (pos.pop(0) if pos else None)
     if not rol:
         raise MemError(i18n.t("mem.needs_role"))
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
-        res = release_lease(conn, rol, owner=vals.get("owner"))
+        res = release_lease(conn, rol, owner=owner, org=org)
     finally:
         conn.close()
     if res["estado"] == "ocupada":
@@ -787,9 +885,10 @@ def cmd_release(args, db, as_json):
 
 
 def cmd_log(args, db, as_json):
-    _, _, vals = _parse(args, values=("limit", "flow"))
+    _, _, vals = _parse(args, values=("limit", "flow", "org"))
+    org = _org(vals)
     limit = _number(vals.get("limit", 50), "--limit", int)
-    conn = connect(db_path(db))
+    conn = connect(db_path(db, org=org))
     try:
         events = log_events(conn, limit=limit, flow=vals.get("flow"))
     finally:
@@ -804,8 +903,9 @@ def cmd_log(args, db, as_json):
 
 
 def cmd_export(args, db, as_json):
-    _, _, vals = _parse(args, values=("out",))
-    conn = connect(db_path(db))
+    _, _, vals = _parse(args, values=("out", "org"))
+    org = _org(vals)
+    conn = connect(db_path(db, org=org))
     try:
         payload = export(conn)
     finally:
@@ -835,8 +935,22 @@ ORDERS = {
 }
 
 
+def _db_is_busy(exc):
+    """True for SQLite's retryable busy/locked operational errors."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None and (code & 0xFF) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return True
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 def main(argv):
-    """`delega mem <order> [--db <path>] [--json]`. Returns the exit code (0 ok, 2 refused, 9 lease taken)."""
+    """`delega mem <order> [--db <path>] [--json]`.
+
+    Exit codes: 0 done, 2 invalid, 9 lease/CAS conflict, 10 database busy (retry).
+    """
     argv = list(argv or [])
     db, as_json, rest = None, False, []
     i = 0
@@ -867,8 +981,14 @@ def main(argv):
         return _fail(i18n.t("mem.unknown_cmd", cmd=cmd), as_json)
     try:
         return fn(args, db, as_json)
+    except MemConflict as e:
+        return _fail(str(e), as_json, EXIT_LEASE)
     except MemError as e:
         return _fail(str(e), as_json)
+    except sqlite3.OperationalError as e:
+        if _db_is_busy(e):
+            return _fail(i18n.t("mem.db_busy", err=e), as_json, EXIT_BUSY)
+        return _fail(i18n.t("mem.db_error", err=e), as_json)
     except sqlite3.Error as e:
         return _fail(i18n.t("mem.db_error", err=e), as_json)
 
