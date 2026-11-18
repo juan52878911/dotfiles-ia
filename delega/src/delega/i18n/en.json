@@ -467,6 +467,7 @@
  "engine.pi.cap_turns": "turn cap reached ({turns}): Pi was stopped",
  "engine.pi.no_kindling": "node '{node}' is kindling: --engine pi needs a plain node or --node local",
  "kindling.gc.legacy_label": "{host}: {vm} kept: old label (delega.owner={owner}, no delega.orch); delete it by hand with `kling rm {vm}` on {host} if it is yours",
+ "mem.stale_epoch": "the connection was opened at epoch {epoca} but the memory is at epoch {actual}: a promotion replaced the database; reopen the connection",
  "mem.fenced": "the owner {owner} is fenced since epoch {epoca} (memory at epoch {actual}): a promotion fenced it; readmit it with `mem unfence {owner} --yes`",
  "mem.unfence_usage": "usage: mem unfence <owner> --yes --org <org>",
  "mem.unfence_dry": "nothing done: unfence would readmit the owner {owner}; repeat with --yes",

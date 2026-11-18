@@ -374,7 +374,7 @@ def _retry(fn):
 
 
 def _event(conn, que, datos):
-    _retry(lambda: mem.write(conn, lambda c: mem._event(c, que, datos)))
+    _retry(lambda: mem.add_event(conn, que, datos, quien=mem.owner_id()))
 
 
 def _set(conn, org, task, estado, desde, force=False, **kw):
