@@ -956,9 +956,13 @@ def daemon_files(argv_tail, owner=None):
     """{name: text}: the systemd --user unit and the launchd plist that run `delega tick --daemon`."""
     root = os.path.dirname(util.PKG_DIR)
     cmd = [sys.executable, "-m", "delega", "tick", "--daemon", *argv_tail]
+    # a service gets no login PATH: `~/.local/bin` holds `claude` (escalation) and the `delega` wrapper
+    # (the escalated Claude's `delega relevo-mem`); without it both fail silently
+    path = ":".join([os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"])
     unit = ("[Unit]\nDescription=delega orchestrator daemon (acts only with the org lease)\n"
             "After=network-online.target\n\n[Service]\n"
-            f"Environment=PYTHONPATH={root}\n" + (f"Environment=DELEGA_MEM_OWNER={owner}\n" if owner else "")
+            f"Environment=PYTHONPATH={root}\nEnvironment=PATH={path}\nEnvironment=PYTHONUNBUFFERED=1\n"
+            + (f"Environment=DELEGA_MEM_OWNER={owner}\n" if owner else "")
             + "ExecStart=" + " ".join(cmd) + "\nRestart=always\nRestartSec=10\n\n"
             "[Install]\nWantedBy=default.target\n")
     args = "".join(f"    <string>{a}</string>\n" for a in cmd)
@@ -966,7 +970,9 @@ def daemon_files(argv_tail, owner=None):
              '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n'
              '  <key>Label</key><string>com.delega.tick</string>\n  <key>ProgramArguments</key>\n  <array>\n'
              f'{args}  </array>\n  <key>EnvironmentVariables</key>\n  <dict>\n'
-             f'    <key>PYTHONPATH</key><string>{root}</string>\n  </dict>\n'
+             f'    <key>PYTHONPATH</key><string>{root}</string>\n    <key>PATH</key><string>{path}</string>\n'
+             '    <key>PYTHONUNBUFFERED</key><string>1</string>\n'
+             + (f'    <key>DELEGA_MEM_OWNER</key><string>{owner}</string>\n' if owner else "") + '  </dict>\n'
              '  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict>\n</plist>\n')
     return {"delega-tick.service": unit, "com.delega.tick.plist": plist}
 
@@ -996,6 +1002,9 @@ def cmd_install_daemon(args, db, as_json):
                "com.delega.tick.plist": os.path.join(home, "Library", "LaunchAgents")}
     if out:
         targets = {k: os.path.abspath(os.path.expanduser(out)) for k in files}
+    else:                       # only the one this system runs: no LaunchAgents plist on Linux, no unit on macOS
+        mine = "com.delega.tick.plist" if sys.platform == "darwin" else "delega-tick.service"
+        files = {mine: files[mine]}
     written = []
     for name, text in files.items():
         path = os.path.join(targets[name], name)

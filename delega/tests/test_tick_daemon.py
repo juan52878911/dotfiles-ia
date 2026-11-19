@@ -565,7 +565,22 @@ class Install(DaemonCase):
         self.assertFalse(os.path.exists(out))
         rc, _, _ = mem_cli("install-daemon", "--out", out, "--owner", "mac", "--yes")
         self.assertEqual(sorted(os.listdir(out)), ["com.delega.tick.plist", "delega-tick.service"])
-        self.assertIn("DELEGA_MEM_OWNER=mac", open(os.path.join(out, "delega-tick.service")).read())
+        unit = open(os.path.join(out, "delega-tick.service")).read()
+        self.assertIn("DELEGA_MEM_OWNER=mac", unit)
+        self.assertIn("Environment=PATH=" + os.path.expanduser("~/.local/bin") + ":", unit)   # claude, delega
+        plist = open(os.path.join(out, "com.delega.tick.plist")).read()
+        self.assertIn("<key>PATH</key><string>" + os.path.expanduser("~/.local/bin") + ":", plist)
+        self.assertIn("<key>DELEGA_MEM_OWNER</key><string>mac</string>", plist)
+
+    def test_install_daemon_without_out_shows_only_this_systems_file(self):
+        rc, text, _ = mem_cli("install-daemon", "--owner", "n")
+        self.assertEqual(rc, 0)
+        if sys.platform == "darwin":
+            self.assertIn("com.delega.tick", text)
+            self.assertNotIn("[Service]", text)
+        else:
+            self.assertIn("[Service]", text)
+            self.assertNotIn("LaunchAgents", text)
 
 
 if __name__ == "__main__":
